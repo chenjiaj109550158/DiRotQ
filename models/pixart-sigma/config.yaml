@@ -1,0 +1,42 @@
+model: pixart-sigma
+model_id: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
+pipeline_class: "diffusers.PixArtSigmaPipeline"
+
+dims:
+  hidden: 1152
+  head: 72
+  intermediate: 4608
+  num_heads: 16
+  num_layers: 28
+
+rotation:
+  high_fraction: 0.125  # 1/8
+  output_path: "models/pixart-sigma/basis/R-pixart-sigma.pt"
+
+basis:
+  output_path: "models/pixart-sigma/basis/U-pixart-sigma.pt"
+  cache_dir: "models/pixart-sigma/calibration_dataset/caches"
+
+quantization:
+  w_bits: 4
+  a_bits: 4
+  high_bits: 16
+  w_groupsize: 64
+  skip_layers:
+    - "pos_embed"
+    - "adaln_single"
+    - "caption_projection"
+    - "norm_out"
+    - "proj_out"
+    - "attn2.to_k"
+    - "attn2.to_v"
+    - "norm1"
+    - "norm2"
+    - "norm3"
+
+calib:
+  cache_dir: "models/pixart-sigma/calibration_dataset/caches"
+  output_dir: "models/pixart-sigma/calibration_dataset"
+  prompts: "models/pixart-sigma/calib_prompts.yaml"
+  collect_script: "models/pixart-sigma/collect_calibration_dataset.py"
+  num_files: 5120 # 128 (examples) x 20 (steps)

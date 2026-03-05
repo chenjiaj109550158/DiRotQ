@@ -1,0 +1,14 @@
+# Large generated artifacts
+models/*/basis/
+models/*/calibration_dataset/
+models/*/quantized_cache/
+models/*/generated_images_*/
+
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
