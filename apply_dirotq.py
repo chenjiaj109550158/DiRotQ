@@ -1,12 +1,13 @@
 """
 apply_dirotq.py
 
-DiRotQ: PCA-based rotation + GPTQ/RTN mixed-precision W4A4 quantization for PixArt-Sigma.
+DiRotQ: PCA-based rotation + GPTQ/RTN mixed-precision W4A4 quantization.
 
-The high-precision (16-bit) branch stays in the PCA basis (R_high = Identity).
-The low-precision (4-bit) branch uses PCA + random rotation.
+Model-specific logic (rotation assignment, quantizer config, generation params)
+is loaded from models/<model>/model_utils.py.
 
 Supports:
+  --model NAME: model name (subdirectory under models/)
   --gptq: GPTQ weight quantization (default: RTN)
   --max-images N: generate only N images (for testing)
 """
@@ -52,64 +53,7 @@ def hash_str_to_int(s: str) -> int:
     return hash_int
 
 
-def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
-    """Assign online PCA rotation matrices to each ActQuantWrapper."""
-    num_heads = cfg["dims"]["num_heads"]
-    head_dim = cfg["dims"]["head"]
-
-    R1     = rotation_dict["R1"].float()      # [1152, 1152]
-    R2     = rotation_dict["R2"].float()      # [72, 72]
-    R_down = rotation_dict["R_down"].float()  # [4608, 4608]
-
-    assigned = 0
-    for name, module in transformer.named_modules():
-        if not isinstance(module, ActQuantWrapper):
-            continue
-
-        parts = name.split(".")
-        if "transformer_blocks" not in parts:
-            continue
-        try:
-            block_idx = int(parts[parts.index("transformer_blocks") + 1])
-        except (ValueError, IndexError):
-            continue
-
-        layer_suffix = ".".join(parts[parts.index("transformer_blocks") + 2:])
-
-        if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
-            evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
-            module.rotation = evec @ R1
-            assigned += 1
-        elif layer_suffix == "attn2.to_q":
-            evec = basis_dict[f"layer.{block_idx}.cross_attn_q"].float()
-            module.rotation = evec @ R1
-            assigned += 1
-        elif layer_suffix == "attn1.to_out.0":
-            evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
-            module.rotation_per_head = torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
-            assigned += 1
-        elif layer_suffix == "attn2.to_out.0":
-            evec_val_ca = basis_dict[f"layer.{block_idx}.cross_attn_q.value"].float()
-            module.rotation_per_head = torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
-            assigned += 1
-        elif "ff.net" in layer_suffix and layer_suffix.endswith(".proj"):
-            evec = basis_dict[f"layer.{block_idx}.ffn"].float()
-            module.rotation = evec @ R1
-            assigned += 1
-        elif "ff.net" in layer_suffix and layer_suffix.endswith(".2"):
-            evec = basis_dict[f"layer.{block_idx}.ffn.down_proj"].float()
-            module.rotation = evec @ R_down
-            assigned += 1
-
-    print(f"Assigned rotations to {assigned} ActQuantWrapper layers.")
-    return assigned
-
-
-def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg):
+def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_online_rotations):
     """Wrap linear layers with ActQuantWrapper and assign online PCA rotations."""
     skip_layers = cfg["quantization"]["skip_layers"]
     transformer.eval()
@@ -122,54 +66,7 @@ def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg):
     return transformer
 
 
-def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg):
-    """Configure mixed-precision activation quantizers by layer type."""
-    a_bits = cfg["quantization"]["a_bits"]
-    high_bits = cfg["quantization"]["high_bits"]
-    head_dim = cfg["dims"]["head"]
-
-    for name, module in transformer.named_modules():
-        if not isinstance(module, ActQuantWrapper):
-            continue
-
-        is_self_attn_qkv = (".attn1.to_q" in name or ".attn1.to_k" in name
-                             or ".attn1.to_v" in name or ".attn2.to_q" in name)
-        is_attn_out  = ".attn1.to_out" in name or ".attn2.to_out" in name
-        is_ffn_up    = ".ff." in name and ".net." in name and name.endswith(".proj")
-        is_ffn_down  = ".ff." in name and ".net." in name and name.endswith(".2")
-
-        if is_self_attn_qkv:
-            module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
-                high_bits_length=high_len_hidden, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
-            )
-        elif is_attn_out:
-            module.quantizer.configure(
-                bits=a_bits, groupsize=head_dim, sym=False,
-                high_bits_length=high_len_head, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
-            )
-        elif is_ffn_up:
-            module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
-                high_bits_length=high_len_hidden, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
-            )
-        elif is_ffn_down:
-            module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
-                high_bits_length=0, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
-            )
-        else:
-            module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
-                high_bits_length=0, high_bits=high_bits,
-            )
-
-
-def generate_images(pipeline, output_dir, dataset_json, max_images=None):
+def generate_images(pipeline, output_dir, dataset_json, generation_params, max_images=None):
     """Generate images with deterministic seeding, skipping existing ones."""
     with open(dataset_json) as f:
         samples = json.load(f)
@@ -205,11 +102,8 @@ def generate_images(pipeline, output_dir, dataset_json, max_images=None):
         with torch.no_grad():
             image = pipeline(
                 prompt=prompt,
-                num_inference_steps=20,
-                guidance_scale=4.5,
-                height=1024,
-                width=1024,
                 generator=generator,
+                **generation_params,
             ).images[0]
 
         image.save(out_path)
@@ -246,6 +140,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = load_model_config(args.model)
+
+    _spec = importlib.util.spec_from_file_location(
+        "model_utils", _ROOT / "models" / args.model / "model_utils.py")
+    model_utils = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(model_utils)
+    assign_online_rotations = model_utils.assign_online_rotations
+    configure_quantizers_by_name = model_utils.configure_quantizers_by_name
+    generation_params = model_utils.generation_params
+
     model_id      = cfg["model_id"]
     basis_path    = str(_ROOT / cfg["basis"]["output_path"])
     rotation_path = str(_ROOT / cfg["rotation"]["output_path"])
@@ -290,7 +193,7 @@ if __name__ == "__main__":
         model_id, torch_dtype=torch.float16, use_safetensors=True
     )
 
-    apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg)
+    apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations)
 
     high_len_hidden = rotation_dict["high_len_hidden"]
     high_len_head   = rotation_dict["high_len_head"]
@@ -301,7 +204,10 @@ if __name__ == "__main__":
     if cache_path.exists():
         print(f"Loading quantized weights from cache: {cache_path}")
         state = torch.load(cache_path, map_location="cpu", weights_only=False)
-        pipe.transformer.load_state_dict(state)
+        pipe.transformer.load_state_dict(state, strict=False)
+        for _, mod in pipe.transformer.named_modules():
+            if isinstance(mod, ActQuantWrapper) and (mod.rotation is not None or mod.rotation_per_head is not None):
+                mod._unrot_fused = True
     else:
         if args.gptq:
             print("Moving transformer to CUDA for GPTQ calibration...")
@@ -343,6 +249,6 @@ if __name__ == "__main__":
     if args.generate:
         print("Moving pipeline to CUDA...")
         pipe = pipe.to("cuda")
-        generate_images(pipe, args.output_dir, args.dataset, max_images=args.max_images)
+        generate_images(pipe, args.output_dir, args.dataset, generation_params, max_images=args.max_images)
 
     print("All done.")
