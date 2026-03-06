@@ -276,6 +276,8 @@ if __name__ == "__main__":
     parser.add_argument("--output",         required=True,
                         help="Output directory for caches/ and samples/")
     parser.add_argument("--num-samples",    type=int, default=128)
+    parser.add_argument("--prompt-id",      type=str, default=None,
+                        help="Regenerate only this prompt ID (e.g. '0960')")
     parser.add_argument("--num-steps",      type=int, default=20)
     parser.add_argument("--guidance-scale", type=float, default=4.5)
     parser.add_argument("--batch-size",     type=int, default=1)
@@ -283,6 +285,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     prompts, filenames = load_prompts(args.prompts, args.num_samples)
+    if args.prompt_id:
+        pairs = [(p, f) for p, f in zip(prompts, filenames) if f.startswith(args.prompt_id + "-")]
+        if not pairs:
+            raise ValueError(f"Prompt ID '{args.prompt_id}' not found in {args.prompts}")
+        prompts, filenames = zip(*pairs)
+        prompts, filenames = list(prompts), list(filenames)
     print(f"Loaded {len(prompts)} prompts from {args.prompts}")
 
     print(f"Loading {args.model_id} in fp16...")

@@ -224,7 +224,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="pixart-sigma",
                         help="Model name (subdirectory under models/, default: pixart-sigma)")
-    parser.add_argument("--dataset", default="datasets/mjhq_5000_samples.json",
+    parser.add_argument("--dataset", default=str(_ROOT / "datasets" / "mjhq_5000_samples.json"),
                         help="Path to dataset JSON (default: datasets/mjhq_5000_samples.json)")
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: models/pixart-sigma/generated_images_gptq or models/pixart-sigma/generated_images_rtn)")
