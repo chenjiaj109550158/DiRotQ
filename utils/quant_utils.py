@@ -9,6 +9,46 @@ import torch.nn as nn
 from . import hadamard_utils
 
 
+# ---------------------------------------------------------------------------
+# NF4 (FP4 E2M1) codebook — matches deepcompressor's sfp4_e2m1_all
+# ---------------------------------------------------------------------------
+NF4_CODEBOOK_VALUES = [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+                        0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0]
+NF4_MAX = 6.0  # max absolute codebook value
+
+_nf4_codebook_cache = {}  # (device, dtype) -> tensor
+
+
+def _get_nf4_codebook(device, dtype):
+    key = (device, dtype)
+    if key not in _nf4_codebook_cache:
+        _nf4_codebook_cache[key] = torch.tensor(
+            NF4_CODEBOOK_VALUES, dtype=dtype, device=device)
+    return _nf4_codebook_cache[key]
+
+
+def round_to_nf4_codebook(x):
+    """Round each element to the nearest NF4 codebook value (binary search)."""
+    cb = _get_nf4_codebook(x.device, x.dtype)
+    midpoints = (cb[:-1] + cb[1:]) / 2  # 14 midpoints
+    indices = torch.bucketize(x.contiguous(), midpoints)
+    return cb[indices]
+
+
+class NF4STEQuantize(torch.autograd.Function):
+    """STE quantize for NF4: normalize by scale, round to codebook, rescale."""
+    @staticmethod
+    def forward(ctx, x, scale):
+        scale = scale.to(x.device)
+        x_norm = x / scale
+        x_q = round_to_nf4_codebook(x_norm)
+        return x_q * scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+
 def get_minq_maxq(bits, sym):
     if sym:
         maxq = torch.tensor(2 ** (bits - 1) - 1)
@@ -98,6 +138,7 @@ class ActQuantizer(nn.Module):
         self.low_bits = 16
         self.high_bits_length = 0
         self.low_bits_length = 0
+        self.quant_dtype = "int"  # "int" or "nvfp4"
 
     def free(self):
         self.zero = None
@@ -113,6 +154,10 @@ class ActQuantizer(nn.Module):
         if self.bits == 16:
             return x
 
+        # NF4 with groupsize: mixed-precision split is across GROUPS, not within
+        if self.quant_dtype == "nvfp4" and self.groupsize > 0:
+            return self._forward_nvfp4_grouped(x, x_dtype)
+
         if self.groupsize > 0:
             init_shape = x.shape
             x = x.reshape(
@@ -123,10 +168,20 @@ class ActQuantizer(nn.Module):
         high_dim = x.shape[-1] - self.high_bits_length
         x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
 
-        if self.sym:
+        if self.quant_dtype == "nvfp4":
+            # NF4 without groupsize (per-token)
+            x = NF4STEQuantize.apply(x_m, self.scale)
+            if self.high_bits_length != 0:
+                if self.high_bits < 16:
+                    x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h)
+                x = torch.cat([x, x_h], dim=-1).to(x_dtype)
+            if self.low_bits_length != 0:
+                if self.low_bits < 16:
+                    x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l)
+                x = torch.cat([x_l, x], dim=-1).to(x_dtype)
+        elif self.sym:
             x = STEQuantize.apply(x_m, self.scale, self.maxq)
             if self.high_bits_length != 0:
-                # Skip quantization if high_bits=16 (keep at full precision)
                 if self.high_bits < 16:
                     x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h)
                 x = torch.cat([x, x_h], dim=-1).to(x_dtype)
@@ -137,7 +192,6 @@ class ActQuantizer(nn.Module):
         else:
             x = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
             if self.high_bits_length != 0:
-                # Skip quantization if high_bits=16 (keep at full precision)
                 if self.high_bits < 16:
                     x_h = AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
                 x = torch.cat([x, x_h], dim=-1).to(x_dtype)
@@ -151,6 +205,33 @@ class ActQuantizer(nn.Module):
 
         return x
 
+    def _forward_nvfp4_grouped(self, x, x_dtype):
+        """NF4 quantization with groupsize: mixed-precision split across groups."""
+        init_shape = x.shape
+        gs = self.groupsize
+        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] // gs, gs)
+        n_groups = x.shape[-2]
+        n_high = self.high_bits_length // gs if self.high_bits_length > 0 else 0
+
+        if n_high > 0 and n_high < n_groups:
+            # Split groups: first (n_groups - n_high) are NF4, last n_high are 16-bit
+            x_m = x[..., :n_groups - n_high, :]  # NF4 groups
+            x_h = x[..., n_groups - n_high:, :]  # high-precision groups (16-bit)
+
+            # NF4 quantize the main groups
+            scale = torch.amax(x_m.abs(), dim=-1, keepdim=True) * self.clip_ratio
+            scale = (scale / NF4_MAX).clamp(min=1e-8)
+            x_m_q = round_to_nf4_codebook(x_m / scale) * scale
+
+            x = torch.cat([x_m_q, x_h], dim=-2).to(x_dtype)
+        else:
+            # All groups quantized with NF4
+            scale = torch.amax(x.abs(), dim=-1, keepdim=True) * self.clip_ratio
+            scale = (scale / NF4_MAX).clamp(min=1e-8)
+            x = (round_to_nf4_codebook(x / scale) * scale).to(x_dtype)
+
+        return x.reshape(init_shape)
+
     def configure(
         self,
         bits,
@@ -161,7 +242,11 @@ class ActQuantizer(nn.Module):
         high_bits=16,
         low_bits_length=0,
         low_bits=16,
+        quant_dtype="int",
     ):
+        self.quant_dtype = quant_dtype
+        if quant_dtype == "nvfp4":
+            sym = True  # NF4 is always symmetric
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
@@ -176,7 +261,15 @@ class ActQuantizer(nn.Module):
         self.low_bits = low_bits
         _, self.maxq_l = get_minq_maxq(low_bits, sym)
 
-    def find_params_per_token_groupwise(self, x, maxq):
+    def find_params_per_token_groupwise(self, x, maxq, use_nvfp4=False):
+        if use_nvfp4:
+            # NF4: scale = max(|x|) / 6.0 (symmetric, codebook range [-6, 6])
+            xmax = torch.amax(x.abs(), dim=3, keepdim=True) * self.clip_ratio
+            tmp = xmax == 0
+            scale = xmax / NF4_MAX
+            scale[tmp] = 1
+            return scale, torch.zeros_like(scale)
+
         xmax = torch.amax(x, dim=3, keepdim=True) * self.clip_ratio
         xmin = torch.amin(x, dim=3, keepdim=True) * self.clip_ratio
         if self.sym:
@@ -194,6 +287,12 @@ class ActQuantizer(nn.Module):
         return scale, zero
 
     def find_params(self, x):
+        is_nvfp4 = (self.quant_dtype == "nvfp4")
+
+        # NF4 with groupsize: scale computation is done inline in _forward_nvfp4_grouped
+        if is_nvfp4 and self.groupsize > 0:
+            return  # No pre-computed params needed; done in forward
+
         if self.groupsize > 0:
             init_shape = x.shape
             x_reshaped = x.reshape(
@@ -216,7 +315,10 @@ class ActQuantizer(nn.Module):
         high_dim = x.shape[-1] - self.high_bits_length
         x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
 
-        self.scale, self.zero = self._find_params(x_m, self.maxq)
+        if is_nvfp4:
+            self.scale, self.zero = self._find_params_nvfp4(x_m)
+        else:
+            self.scale, self.zero = self._find_params(x_m, self.maxq)
         if self.high_bits_length != 0 and self.high_bits < 16:
             self.scale_h, self.zero_h = self._find_params(x_h, self.maxq_h)
         if self.low_bits_length != 0 and self.low_bits < 16:
@@ -249,6 +351,23 @@ class ActQuantizer(nn.Module):
             scale = scale.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
             zero = zero.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
 
+        return scale, zero
+
+    def _find_params_nvfp4(self, x):
+        """Compute per-token NF4 scale: max(|x|) / 6.0."""
+        if self.bits == 16:
+            return torch.zeros(1), torch.zeros(1)
+
+        dev = x.device
+        init_shape = x.shape
+        reshaped_x = x.reshape((-1, x.shape[-1]))
+
+        xmax = reshaped_x.abs().max(1)[0] * self.clip_ratio
+        tmp = xmax == 0
+        scale = (xmax / NF4_MAX).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
+        scale[tmp] = 1
+        scale = scale.reshape(init_shape)
+        zero = torch.zeros_like(scale)
         return scale, zero
 
 
@@ -537,3 +656,38 @@ def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None)
             quantizer.configure(bits, perchannel=True, sym=sym)
             quantizer.find_params(W)
             qlayer.module.weight.data = quantizer.quantize(W)
+
+
+def nvfp4_rtn_quantize_weights(model, groupsize=16, skip_names=None):
+    """
+    Apply NF4 (FP4 E2M1) RTN weight quantization to all ActQuantWrapper layers.
+
+    For each group of `groupsize` weights:
+      scale = max(|W_group|) / 6.0
+      W_norm = W / scale
+      W_q = round_to_nf4_codebook(W_norm)
+      W_dq = W_q * scale
+    """
+    if skip_names is None:
+        skip_names = []
+
+    qlayers = find_qlayers(model, layers=[ActQuantWrapper])
+    for name, qlayer in qlayers.items():
+        if any(skip in name for skip in skip_names):
+            continue
+
+        W = qlayer.module.weight.data.clone().float()
+        if groupsize > 0 and W.shape[1] % groupsize == 0:
+            W_groups = W.reshape(W.shape[0], -1, groupsize)
+            scale = W_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+            W_norm = W_groups / scale
+            W_q = round_to_nf4_codebook(W_norm)
+            W_dq = (W_q * scale).reshape(W.shape)
+            qlayer.module.weight.data = W_dq.to(qlayer.module.weight.dtype)
+        else:
+            # Per-channel fallback
+            scale = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+            W_norm = W / scale
+            W_q = round_to_nf4_codebook(W_norm)
+            W_dq = W_q * scale
+            qlayer.module.weight.data = W_dq.to(qlayer.module.weight.dtype)

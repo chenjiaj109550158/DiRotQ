@@ -89,17 +89,32 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
     return assigned
 
 
-def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg):
+def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
+                                 nvfp4=False):
     """Configure mixed-precision activation quantizers by PixArt-Sigma layer type.
 
-    Groupsize choices:
-      - QKV and FFN up-proj: groupsize=-1 (per-token)
-      - attn to_out: groupsize=head_dim (per head per token)
+    When nvfp4=False (INT4):
+      - QKV and FFN up-proj: groupsize=-1 (per-token), asymmetric
+      - attn to_out: groupsize=head_dim (per head per token), asymmetric
       - FFN down-proj: groupsize=-1, no mixed-precision
+
+    When nvfp4=True (NF4):
+      - All layers: groupsize=16 (except to_out: groupsize=72/head_dim), symmetric
+      - NF4 codebook quantization
     """
     a_bits = cfg["quantization"]["a_bits"]
     high_bits = cfg["quantization"]["high_bits"]
     head_dim = cfg["dims"]["head"]
+
+    if nvfp4:
+        nvfp4_cfg = cfg.get("nvfp4", {})
+        a_gs = nvfp4_cfg.get("a_groupsize", 16)
+        a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
+        qdt = "nvfp4"
+    else:
+        a_gs = -1
+        a_gs_out = head_dim
+        qdt = "int"
 
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
@@ -113,30 +128,35 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
 
         if is_self_attn_qkv:
             module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden, high_bits=high_bits,
                 low_bits_length=0, low_bits=high_bits,
+                quant_dtype=qdt,
             )
         elif is_attn_out:
             module.quantizer.configure(
-                bits=a_bits, groupsize=head_dim, sym=False,
+                bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
                 high_bits_length=high_len_head, high_bits=high_bits,
                 low_bits_length=0, low_bits=high_bits,
+                quant_dtype=qdt,
             )
         elif is_ffn_up:
             module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden, high_bits=high_bits,
                 low_bits_length=0, low_bits=high_bits,
+                quant_dtype=qdt,
             )
         elif is_ffn_down:
             module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=0, high_bits=high_bits,
                 low_bits_length=0, low_bits=high_bits,
+                quant_dtype=qdt,
             )
         else:
             module.quantizer.configure(
-                bits=a_bits, groupsize=-1, sym=False,
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=0, high_bits=high_bits,
+                quant_dtype=qdt,
             )

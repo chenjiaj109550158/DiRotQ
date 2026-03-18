@@ -34,6 +34,23 @@ quantization:
     - "norm2"
     - "norm3"
 
+# NF4 (NVFP4) quantization config — matches SVDQuant sfp4_e2m1_all
+nvfp4:
+  w_groupsize: 16
+  a_groupsize: 16
+  a_groupsize_attn_out: 72  # head_dim (72 not divisible by 16)
+  skip_layers:
+    - "pos_embed"
+    - "adaln_single"
+    - "caption_projection"
+    - "norm_out"
+    - "proj_out"
+    - "attn2.to_k"
+    - "attn2.to_v"
+    - "norm1"
+    - "norm2"
+    - "norm3"
+
 calib:
   cache_dir: "models/pixart-sigma/calibration_dataset/caches"
   output_dir: "models/pixart-sigma/calibration_dataset"

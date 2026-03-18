@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from .quant_utils import ActQuantWrapper, find_qlayers
+from .quant_utils import ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,8 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
 
 @torch.no_grad()
 def _gptq_quantize_layer(W, H, bits, groupsize, sym,
-                          damp_pct, block_size, num_inv_tries, device):
+                          damp_pct, block_size, num_inv_tries, device,
+                          nvfp4=False):
     """
     Apply GPTQ to a single weight matrix.
 
@@ -143,6 +144,7 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
         block_size: GPTQ column-block size.
         num_inv_tries: max Cholesky retry attempts.
         device: compute device.
+        nvfp4: if True, use NF4 codebook rounding instead of INT4.
 
     Returns:
         W_q: [out_features, in_features] float32 dequantized weight,
@@ -152,13 +154,19 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
     H = H.clone().float().to(device)
     out_features, in_features = W.shape
 
+    if nvfp4:
+        sym = True  # NF4 is always symmetric
+
     maxq = (2 ** (bits - 1) - 1) if sym else (2 ** bits - 1)
 
     # Pre-compute per-group scales from the original (unpermuted) W.
     # These scales are kept fixed throughout the GPTQ loop.
     if groupsize > 0 and in_features % groupsize == 0:
         W_g = W.reshape(out_features, in_features // groupsize, groupsize)
-        if sym:
+        if nvfp4:
+            scales = W_g.abs().amax(dim=-1).clamp(min=1e-5) / NF4_MAX
+            zeros  = torch.zeros_like(scales)
+        elif sym:
             scales = W_g.abs().amax(dim=-1).clamp(min=1e-5) / maxq  # [out, n_groups]
             zeros  = torch.zeros_like(scales)
         else:
@@ -168,7 +176,10 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
             zeros  = torch.round(-wmin / scales)
     else:
         # Per-channel fallback (rarely hit; guard)
-        if sym:
+        if nvfp4:
+            scales = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+            zeros  = torch.zeros_like(scales)
+        elif sym:
             scales = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / maxq
             zeros  = torch.zeros_like(scales)
         else:
@@ -183,7 +194,11 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
         g = orig_col_idx // groupsize
         s = scales[:, g]  # [out_features]
         z = zeros[:, g]
-        if sym:
+        if nvfp4:
+            w_norm = w_col / s
+            w_q = round_to_nf4_codebook(w_norm)
+            return w_q * s
+        elif sym:
             q = torch.clamp(torch.round(w_col / s), -(maxq + 1), maxq)
             return q * s
         else:
@@ -258,7 +273,7 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
 def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                            skip_names=None,
                            damp_pct=0.01, block_size=128, num_inv_tries=250,
-                           device="cuda"):
+                           device="cuda", nvfp4=False):
     """
     Apply GPTQ weight quantization to all ActQuantWrapper layers.
 
@@ -272,6 +287,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
         skip_names: list of name substrings to skip.
         damp_pct, block_size, num_inv_tries: GPTQ hyperparameters.
         device:    Compute device for GPTQ arithmetic.
+        nvfp4:     If True, use NF4 codebook rounding instead of INT4.
     """
     if skip_names is None:
         skip_names = []
@@ -293,7 +309,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
         if H is not None:
             W_q = _gptq_quantize_layer(
                 W_fp32, H, bits, groupsize, sym,
-                damp_pct, block_size, num_inv_tries, device
+                damp_pct, block_size, num_inv_tries, device,
+                nvfp4=nvfp4,
             )
 
         if W_q is not None:
@@ -305,25 +322,32 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 print(f"  WARNING: no Hessian for {name}, falling back to RTN")
             else:
                 print(f"  WARNING: GPTQ inversion failed for {name}, falling back to RTN")
-            _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype)
+            _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype,
+                                nvfp4=nvfp4)
             n_rtn += 1
 
     print(f"GPTQ: {n_gptq} layers quantized with GPTQ, {n_rtn} with RTN fallback.")
 
 
-def _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype):
+def _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype,
+                         nvfp4=False):
     """RTN quantization fallback for a single layer."""
     out_features, in_features = W_fp32.shape
     if groupsize > 0 and in_features % groupsize == 0:
         W_g  = W_fp32.reshape(out_features, -1, groupsize)
-        maxq = (2 ** (bits - 1) - 1) if sym else (2 ** bits - 1)
-        if sym:
-            scale = W_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / maxq
-            W_q   = torch.clamp(torch.round(W_g / scale), -(maxq + 1), maxq) * scale
+        if nvfp4:
+            scale = W_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+            W_norm = W_g / scale
+            W_q = round_to_nf4_codebook(W_norm) * scale
         else:
-            wmin  = torch.minimum(W_g.amin(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
-            wmax  = torch.maximum(W_g.amax(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
-            scale = (wmax - wmin).clamp(min=1e-5) / maxq
-            zero  = torch.round(-wmin / scale)
-            W_q   = scale * (torch.clamp(torch.round(W_g / scale) + zero, 0, maxq) - zero)
+            maxq = (2 ** (bits - 1) - 1) if sym else (2 ** bits - 1)
+            if sym:
+                scale = W_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / maxq
+                W_q   = torch.clamp(torch.round(W_g / scale), -(maxq + 1), maxq) * scale
+            else:
+                wmin  = torch.minimum(W_g.amin(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
+                wmax  = torch.maximum(W_g.amax(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
+                scale = (wmax - wmin).clamp(min=1e-5) / maxq
+                zero  = torch.round(-wmin / scale)
+                W_q   = scale * (torch.clamp(torch.round(W_g / scale) + zero, 0, maxq) - zero)
         qlayer.module.weight.data = W_q.reshape(out_features, in_features).to(orig_dtype)

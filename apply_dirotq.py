@@ -25,7 +25,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(__file__))
 
 from utils.quant_utils import (
-    ActQuantWrapper, add_actquant, find_qlayers, rtn_quantize_weights
+    ActQuantWrapper, add_actquant, find_qlayers,
+    rtn_quantize_weights, nvfp4_rtn_quantize_weights,
 )
 from dirotq_fused_unrotation import fuse_unrotation_into_weights, patch_forward
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
@@ -53,9 +54,11 @@ def hash_str_to_int(s: str) -> int:
     return hash_int
 
 
-def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_online_rotations):
+def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
+                           skip_layers=None):
     """Wrap linear layers with ActQuantWrapper and assign online PCA rotations."""
-    skip_layers = cfg["quantization"]["skip_layers"]
+    if skip_layers is None:
+        skip_layers = cfg["quantization"]["skip_layers"]
     transformer.eval()
     print("Wrapping linear layers with ActQuantWrapper...")
     add_actquant(transformer, skip_names=skip_layers)
@@ -128,6 +131,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-generate", action="store_false", dest="generate")
     parser.add_argument("--gptq", action="store_true", default=False,
                         help="Use GPTQ weight quantization instead of RTN")
+    parser.add_argument("--nvfp4", action="store_true", default=False,
+                        help="Use NF4 (FP4 E2M1) quantization instead of INT4")
     parser.add_argument("--gptq-calib-files", type=int, default=5120) # 128 samples x 20 steps
     parser.add_argument("--gptq-batch-size", type=int, default=1)
     parser.add_argument("--gptq-block-size", type=int, default=128)
@@ -154,18 +159,30 @@ if __name__ == "__main__":
     rotation_path = str(_ROOT / cfg["rotation"]["output_path"])
     calib_dir     = str(_ROOT / cfg["calib"]["cache_dir"])
     w_bits        = cfg["quantization"]["w_bits"]
-    w_groupsize   = cfg["quantization"]["w_groupsize"]
-    skip_layers   = cfg["quantization"]["skip_layers"]
 
+    # Select skip layers and weight groupsize based on quant format
+    if args.nvfp4:
+        nvfp4_cfg   = cfg.get("nvfp4", {})
+        w_groupsize = nvfp4_cfg.get("w_groupsize", 16)
+        skip_layers = nvfp4_cfg.get("skip_layers", cfg["quantization"]["skip_layers"])
+        fmt_tag     = "nvfp4"
+    else:
+        w_groupsize = cfg["quantization"]["w_groupsize"]
+        skip_layers = cfg["quantization"]["skip_layers"]
+        fmt_tag     = "int4"
+
+    # Cache path encodes quant format + group size + method for exact-match reuse
     if args.quantized_cache is None:
-        cache_name = "gptq_model.pt" if args.gptq else "rtn_model.pt"
+        method = "gptq" if args.gptq else "rtn"
+        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}_model.pt"
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if args.output_dir is None: 
-        args.output_dir = str(_ROOT / "models" / args.model / ("generated_images_gptq" if args.gptq else "generated_images_rtn"))
+    if args.output_dir is None:
+        method = "gptq" if args.gptq else "rtn"
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}")
 
     if not os.path.exists(rotation_path):
         print(f"Rotation file not found at {rotation_path}, generating...")
@@ -193,12 +210,14 @@ if __name__ == "__main__":
         model_id, torch_dtype=torch.float16, use_safetensors=True
     )
 
-    apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations)
+    apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
+                           skip_layers=skip_layers)
 
     high_len_hidden = rotation_dict["high_len_hidden"]
     high_len_head   = rotation_dict["high_len_head"]
 
-    configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg)
+    configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg,
+                                 nvfp4=args.nvfp4)
 
     cache_path = Path(args.quantized_cache)
     if cache_path.exists():
@@ -222,7 +241,7 @@ if __name__ == "__main__":
                 batch_size=args.gptq_batch_size,
             )
 
-            print("Applying GPTQ weight quantization (W4, group_size=64)...")
+            print(f"Applying GPTQ weight quantization (W4, {fmt_tag}, group_size={w_groupsize})...")
             gptq_quantize_weights(
                 pipe.transformer, hessians,
                 bits=w_bits, groupsize=w_groupsize, sym=True,
@@ -230,10 +249,15 @@ if __name__ == "__main__":
                 damp_pct=args.gptq_damp_pct,
                 block_size=args.gptq_block_size,
                 device="cuda",
+                nvfp4=args.nvfp4,
             )
             del hessians
+        elif args.nvfp4:
+            print(f"Applying NF4 RTN weight quantization (group_size={w_groupsize})...")
+            nvfp4_rtn_quantize_weights(pipe.transformer, groupsize=w_groupsize,
+                                       skip_names=skip_layers)
         else:
-            print("Applying RTN weight quantization (W4, group_size=64)...")
+            print(f"Applying INT4 RTN weight quantization (group_size={w_groupsize})...")
             rtn_quantize_weights(pipe.transformer, bits=w_bits, groupsize=w_groupsize,
                                  sym=True, skip_names=skip_layers)
 

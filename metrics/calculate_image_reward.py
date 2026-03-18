@@ -224,7 +224,7 @@ def main():
         f.write(f"\n{'='*80}\n")
         f.write(f"Image Reward Results\n")
         f.write(f"{'='*80}\n")
-        f.write(f"Metadata: {args.metadata}")
+        f.write(f"Metadata: {args.metadata}\n")
         f.write(f"Generated images: {args.gen_dir}\n")
         f.write(f"Image Reward Score: {results['image_reward']:.4f}\n")
         f.write(f"Processed: {results['total_processed']}/{results['total_requested']} images\n")

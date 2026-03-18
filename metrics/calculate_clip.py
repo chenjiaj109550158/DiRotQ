@@ -124,7 +124,7 @@ def main():
     with open(output_path, "a") as f:
         for k, v in results.items():
             f.write(f"{k.upper():12s}: {v:.4f}\n")
-        f.write(f"  Metadata: {args.metadata}")
+        f.write(f"  Metadata: {args.metadata}\n")
         f.write(f"  Generated: {args.gen_dir}\n")
         f.write("=" * 70 + "\n")
 
