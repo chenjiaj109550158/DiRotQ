@@ -19,15 +19,12 @@ activation quantization calibration (find_params) needs the rotated activations.
 
 import os
 import sys
-import json
 import torch
-import torch.nn as nn
-from pathlib import Path
-from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from utils.quant_utils import ActQuantWrapper, rtn_quantize_weights
+from utils.quant_utils import ActQuantWrapper
+from utils.hadamard_utils import fast_hadamard_transform
 
 # ---------------------------------------------------------------------------
 # Weight fusion
@@ -79,6 +76,37 @@ def fuse_unrotation_into_weights(transformer):
             mod._unrot_fused = True
             n += 1
 
+        elif getattr(mod, 'use_hadamard', False) and mod.quantizer.bits < 16:
+            # Hadamard fusion: build dense inverse-Hadamard matrix for the low_dim part,
+            # then fuse into weights.  Forward rotation uses fast O(D log D) transform;
+            # only this one-time fusion uses the dense matrix.
+            #
+            # Inverse Hadamard = diag(sign_flips) @ H_dense  (H is self-inverse)
+            # W_fused = W @ BlockDiag(inv_H_low, I_high)
+            low_dim = mod.hadamard_low_dim
+            D = W.shape[1]
+            high_dim = D - low_dim
+
+            # Build dense normalized Hadamard matrix for low_dim (power of 2)
+            H_dense = torch.eye(low_dim, dtype=torch.float32, device=W.device)
+            H_dense = fast_hadamard_transform(H_dense)  # each row is H @ e_i
+
+            # Apply sign flips: inv_H = diag(s) @ H
+            if mod.hadamard_sign_flips is not None:
+                sf = mod.hadamard_sign_flips.to(W.device, dtype=torch.float32)
+                H_dense = sf.unsqueeze(0) * H_dense  # broadcast: [low, low]
+
+            # Fuse: W_low_fused = W[:, :low_dim] @ H_dense.T
+            W_f = W.float()
+            W_low = W_f[:, :low_dim] @ H_dense.T
+            if high_dim > 0:
+                W_fused = torch.cat([W_low, W_f[:, low_dim:]], dim=1)
+            else:
+                W_fused = W_low
+            mod.module.weight.data = W_fused.to(W.dtype)
+            mod._unrot_fused = True
+            n += 1
+
     print(f"Fused unrotation into weights for {n} layers.")
     return n
 
@@ -122,6 +150,36 @@ def _fused_forward(self, x):
             x = self.quantizer(x_rot_flat).to(x_dtype)         # single fp16 cast
             self.quantizer.free()
             # per-head einsum unrotation removed — W already contains BlockDiag(U_ph)
+
+        elif getattr(self, 'use_hadamard', False):
+            # Hadamard forward rotation → quantize → (inverse SKIPPED, absorbed in W)
+            # O(D log D) via fast Walsh-Hadamard on the low_dim part
+            init_shape = x.shape
+            D = init_shape[-1]
+            low_dim = self.hadamard_low_dim
+            x_fp32 = x.float()
+
+            if low_dim < D:
+                x_low = x_fp32[..., :low_dim]
+                x_high = x_fp32[..., low_dim:]
+            else:
+                x_low = x_fp32
+                x_high = None
+
+            if self.hadamard_sign_flips is not None:
+                sf = self.hadamard_sign_flips.to(x_low.device, dtype=x_low.dtype)
+                x_low = x_low * sf
+            x_rot_low = fast_hadamard_transform(x_low)
+
+            if x_high is not None:
+                x_rot = torch.cat([x_rot_low, x_high], dim=-1)
+            else:
+                x_rot = x_rot_low
+
+            self.quantizer.find_params(x_rot)
+            x = self.quantizer(x_rot).to(x_dtype)
+            self.quantizer.free()
+            # Inverse Hadamard removed — W already contains it
 
     else:
         # No fusion (bits=16, or no rotation): standard activation quantization
