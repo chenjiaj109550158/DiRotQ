@@ -47,9 +47,9 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     """
     qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
 
-    # H accumulators and token counters (kept on CPU to save GPU memory)
+    # H accumulators and token counters (on GPU for fast matmul)
     layer_H = {name: torch.zeros(
-        ql.module.in_features, ql.module.in_features, dtype=torch.float32
+        ql.module.in_features, ql.module.in_features, dtype=torch.float32, device=device
     ) for name, ql in qlayers.items()}
     layer_n = {name: 0 for name in qlayers}
 
@@ -62,7 +62,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
             def _hook(module, inp, out):
                 x = inp[0].detach().float().reshape(-1, d)  # [B*tokens, in_features]
                 layer_n[n] += x.shape[0]
-                layer_H[n] += (x.cpu().T @ x.cpu())
+                layer_H[n] += (x.T @ x)
             return _hook
 
         hooks.append(ql.register_forward_hook(_make_hook(name, in_features)))
@@ -113,15 +113,17 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     for h in hooks:
         h.remove()
 
-    # Normalize: H = 2/n * Σ X^T X
+    # Normalize: H = 2/n * Σ X^T X, then move to CPU
     for name in layer_H:
         n = layer_n[name]
         if n > 0:
-            layer_H[name] = (2.0 / n) * layer_H[name]
+            layer_H[name] = ((2.0 / n) * layer_H[name]).cpu()
         else:
+            layer_H[name] = layer_H[name].cpu()
             print(f"WARNING: no calibration data collected for layer {name}")
 
     gc.collect()
+    torch.cuda.empty_cache()
     return layer_H
 
 
