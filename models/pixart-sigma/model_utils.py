@@ -12,6 +12,7 @@ import torch
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from utils.quant_utils import ActQuantWrapper
+from utils.hadamard_utils import generate_sign_flips
 
 
 # PixArt-Sigma generation parameters (passed to generate_images)
@@ -23,7 +24,8 @@ generation_params = dict(
 )
 
 
-def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
+def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
+                             hadamard_layers=None, sign_flips_dict=None):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     PixArt-Sigma layer mapping:
@@ -33,15 +35,29 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
       - attn2.to_out.0:    cross-attn out proj  -> per-head rotation (U @ R2)
       - ff.net.0.proj:     FFN up projection    -> hidden-dim rotation (U @ R1)
       - ff.net.2:          FFN down projection  -> intermediate-dim rotation (U @ R_down)
+                            OR Hadamard if in hadamard_layers
+
+    Args:
+        hadamard_layers: list of layer suffix patterns to use Hadamard instead of PCA.
+                         e.g. ["ff.net.2"] for FFN down projection only.
+        sign_flips_dict: optional dict {block_idx: tensor} of optimized sign flips.
+                         If provided, uses these instead of random sign flips.
     """
+    if hadamard_layers is None:
+        hadamard_layers = []
+    if sign_flips_dict is None:
+        sign_flips_dict = {}
+
     num_heads = cfg["dims"]["num_heads"]
     head_dim = cfg["dims"]["head"]
+    intermediate_dim = cfg["dims"]["intermediate"]
 
     R1     = rotation_dict["R1"].float()
     R2     = rotation_dict["R2"].float()
     R_down = rotation_dict["R_down"].float()
 
     assigned = 0
+    hadamard_count = 0
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
@@ -55,6 +71,9 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
             continue
 
         layer_suffix = ".".join(parts[parts.index("transformer_blocks") + 2:])
+
+        # Check if this layer should use Hadamard
+        use_had = any(pat in layer_suffix for pat in hadamard_layers)
 
         if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
             evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
@@ -81,16 +100,30 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg):
             module.rotation = evec @ R1
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".2"):
-            evec = basis_dict[f"layer.{block_idx}.ffn.down_proj"].float()
-            module.rotation = evec @ R_down
+            if use_had:
+                # Hadamard rotation: O(D log D) instead of O(D²)
+                # low_dim = largest power of 2 <= D (here 4096 for D=4608)
+                low_dim = 1 << (intermediate_dim.bit_length() - 1)  # 4096
+                module.use_hadamard = True
+                module.hadamard_low_dim = low_dim
+                if block_idx in sign_flips_dict:
+                    module.hadamard_sign_flips = sign_flips_dict[block_idx]
+                else:
+                    module.hadamard_sign_flips = generate_sign_flips(low_dim, seed=42 + block_idx)
+                hadamard_count += 1
+            else:
+                evec = basis_dict[f"layer.{block_idx}.ffn.down_proj"].float()
+                module.rotation = evec @ R_down
             assigned += 1
 
-    print(f"Assigned rotations to {assigned} ActQuantWrapper layers.")
+    print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
+          f"({hadamard_count} Hadamard, {assigned - hadamard_count} PCA).")
     return assigned
 
 
 def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
-                                 nvfp4=False):
+                                 nvfp4=False, hadamard_layers=None, a_groupsize=None,
+                                 high_len_down=0, skip_quant_layers=None):
     """Configure mixed-precision activation quantizers by PixArt-Sigma layer type.
 
     When nvfp4=False (INT4):
@@ -116,8 +149,45 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         a_gs_out = head_dim
         qdt = "int"
 
+    if a_groupsize is not None:
+        a_gs = a_groupsize
+        # Keep to_out at per-head groupsize — PCA rotation is per-head,
+        # so groups must not cross head boundaries
+        a_gs_out = head_dim
+        # Round up high_bits_length to nearest multiple of groupsize
+        # so 4-bit portion is divisible by groupsize
+        if a_groupsize > 0:
+            def _ceil_to_gs(high, gs):
+                if high == 0:
+                    return 0
+                return ((high + gs - 1) // gs) * gs
+            high_len_hidden = _ceil_to_gs(high_len_hidden, a_groupsize)
+            high_len_head = _ceil_to_gs(high_len_head, a_gs_out)
+            high_len_down = _ceil_to_gs(high_len_down, a_groupsize)
+            print(f"Adjusted high_bits_length for groupsize={a_groupsize}: "
+                  f"hidden={high_len_hidden} ({high_len_hidden}/{cfg['dims']['hidden']}="
+                  f"{high_len_hidden/cfg['dims']['hidden']*100:.1f}%), "
+                  f"head={high_len_head} (to_out gs={a_gs_out}, "
+                  f"{high_len_head}/{cfg['dims']['hidden']}="
+                  f"{high_len_head/cfg['dims']['hidden']*100:.1f}%), "
+                  f"down={high_len_down} ({high_len_down}/{cfg['dims']['intermediate']}="
+                  f"{high_len_down/cfg['dims']['intermediate']*100:.1f}%)")
+
+    if hadamard_layers is None:
+        hadamard_layers = []
+    if skip_quant_layers is None:
+        skip_quant_layers = []
+    intermediate_dim = cfg["dims"]["intermediate"]
+
+    n_skipped = 0
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
+            continue
+
+        # Skip activation quantization for specified layers (bits=16 = no-op)
+        if any(pat in name for pat in skip_quant_layers):
+            module.quantizer.configure(bits=16, groupsize=-1, sym=True)
+            n_skipped += 1
             continue
 
         is_self_attn_qkv = (".attn1.to_q" in name or ".attn1.to_k" in name
@@ -148,9 +218,17 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 quant_dtype=qdt,
             )
         elif is_ffn_down:
+            use_had = any(pat in name for pat in hadamard_layers)
+            if use_had:
+                # Hadamard: split = [low_dim (4096, quantized) | high_dim (512, 16-bit)]
+                low_dim = 1 << (intermediate_dim.bit_length() - 1)
+                had_high_len = intermediate_dim - low_dim  # 512
+            else:
+                # PCA: last high_len_down channels (576 = 1/8 of 4608) kept at 16-bit
+                had_high_len = high_len_down
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=0, high_bits=high_bits,
+                high_bits_length=had_high_len, high_bits=high_bits,
                 low_bits_length=0, low_bits=high_bits,
                 quant_dtype=qdt,
             )
@@ -160,3 +238,6 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 high_bits_length=0, high_bits=high_bits,
                 quant_dtype=qdt,
             )
+
+    if n_skipped:
+        print(f"Skipped activation quantization for {n_skipped} layers (bits=16).")

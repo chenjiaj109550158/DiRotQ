@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from . import hadamard_utils
+from .hadamard_utils import fast_hadamard_transform
 
 
 # ---------------------------------------------------------------------------
@@ -158,50 +159,84 @@ class ActQuantizer(nn.Module):
         if self.quant_dtype == "nvfp4" and self.groupsize > 0:
             return self._forward_nvfp4_grouped(x, x_dtype)
 
-        if self.groupsize > 0:
+        # Two strategies for groupsize > 0:
+        #   A) high_bits_length <= groupsize: group first, split within each group.
+        #   B) high_bits_length > groupsize: split on full dim first, group the 4-bit part.
+        #   When groupsize <= 0: no grouping, just split on full dim (per-token).
+        if self.groupsize > 0 and self.high_bits_length <= self.groupsize:
+            # Strategy A: group → split within group
             init_shape = x.shape
             x = x.reshape(
                 x.shape[0], x.shape[1], x.shape[2] // self.groupsize, self.groupsize
             )
 
+            low_dim = self.low_bits_length
+            high_dim = x.shape[-1] - self.high_bits_length
+            x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
+
+            if self.sym:
+                x_m = STEQuantize.apply(x_m, self.scale, self.maxq)
+            else:
+                x_m = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
+
+            parts = []
+            if self.low_bits_length != 0:
+                if self.low_bits < 16:
+                    x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l) if self.sym else \
+                          AsymSTEQuantize.apply(x_l, self.scale_l, self.zero_l, self.maxq_l)
+                parts.append(x_l)
+            parts.append(x_m)
+            if self.high_bits_length != 0:
+                if self.high_bits < 16:
+                    x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h) if self.sym else \
+                          AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
+                parts.append(x_h)
+
+            if len(parts) == 1:
+                x = parts[0].to(x_dtype)
+            else:
+                x = torch.cat(parts, dim=-1).to(x_dtype)
+            return x.reshape(init_shape)
+
+        # Strategy B (groupsize > 0, high > groupsize) or per-token (groupsize <= 0):
+        # Split mixed-precision on full channel dim, then group the 4-bit portion.
         low_dim = self.low_bits_length
         high_dim = x.shape[-1] - self.high_bits_length
         x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
 
+        if self.groupsize > 0:
+            init_shape_m = x_m.shape
+            x_m = x_m.reshape(
+                x_m.shape[0], x_m.shape[1], x_m.shape[2] // self.groupsize, self.groupsize
+            )
+
         if self.quant_dtype == "nvfp4":
-            # NF4 without groupsize (per-token)
-            x = NF4STEQuantize.apply(x_m, self.scale)
-            if self.high_bits_length != 0:
-                if self.high_bits < 16:
-                    x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h)
-                x = torch.cat([x, x_h], dim=-1).to(x_dtype)
-            if self.low_bits_length != 0:
-                if self.low_bits < 16:
-                    x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l)
-                x = torch.cat([x_l, x], dim=-1).to(x_dtype)
+            x_m = NF4STEQuantize.apply(x_m, self.scale)
         elif self.sym:
-            x = STEQuantize.apply(x_m, self.scale, self.maxq)
-            if self.high_bits_length != 0:
-                if self.high_bits < 16:
-                    x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h)
-                x = torch.cat([x, x_h], dim=-1).to(x_dtype)
-            if self.low_bits_length != 0:
-                if self.low_bits < 16:
-                    x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l)
-                x = torch.cat([x_l, x], dim=-1).to(x_dtype)
+            x_m = STEQuantize.apply(x_m, self.scale, self.maxq)
         else:
-            x = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
-            if self.high_bits_length != 0:
-                if self.high_bits < 16:
-                    x_h = AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
-                x = torch.cat([x, x_h], dim=-1).to(x_dtype)
-            if self.low_bits_length != 0:
-                if self.low_bits < 16:
-                    x_l = AsymSTEQuantize.apply(x_l, self.scale_l, self.zero_l, self.maxq_l)
-                x = torch.cat([x_l, x], dim=-1).to(x_dtype)
+            x_m = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
 
         if self.groupsize > 0:
-            x = x.reshape(init_shape)
+            x_m = x_m.reshape(init_shape_m)
+
+        parts = []
+        if self.low_bits_length != 0:
+            if self.low_bits < 16:
+                x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l) if self.sym else \
+                      AsymSTEQuantize.apply(x_l, self.scale_l, self.zero_l, self.maxq_l)
+            parts.append(x_l)
+        parts.append(x_m)
+        if self.high_bits_length != 0:
+            if self.high_bits < 16:
+                x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h) if self.sym else \
+                      AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
+            parts.append(x_h)
+
+        if len(parts) == 1:
+            x = parts[0].to(x_dtype)
+        else:
+            x = torch.cat(parts, dim=-1).to(x_dtype)
 
         return x
 
@@ -293,22 +328,46 @@ class ActQuantizer(nn.Module):
         if is_nvfp4 and self.groupsize > 0:
             return  # No pre-computed params needed; done in forward
 
-        if self.groupsize > 0:
-            init_shape = x.shape
+        if self.groupsize > 0 and self.high_bits_length <= self.groupsize:
+            # Strategy A: group → split within each group (matches forward Strategy A).
+            # Each group's high-bits slice gets independent scale computation.
             x_reshaped = x.reshape(
                 x.shape[0], x.shape[1], x.shape[2] // self.groupsize, self.groupsize
             )
             low_dim = self.low_bits_length
             high_dim = x_reshaped.shape[-1] - self.high_bits_length
-            x_l = x_reshaped[..., :low_dim]
             x_m = x_reshaped[..., low_dim:high_dim]
             x_h = x_reshaped[..., high_dim:]
+            x_l = x_reshaped[..., :low_dim]
 
             self.scale, self.zero = self.find_params_per_token_groupwise(x_m, self.maxq)
             if self.high_bits_length != 0 and self.high_bits < 16:
                 self.scale_h, self.zero_h = self.find_params_per_token_groupwise(x_h, self.maxq_h)
             if self.low_bits_length != 0 and self.low_bits < 16:
                 self.scale_l, self.zero_l = self.find_params_per_token_groupwise(x_l, self.maxq_l)
+            return
+
+        if self.groupsize > 0:
+            # Strategy B: split on full dim first, group the 4-bit part.
+            low_dim = self.low_bits_length
+            high_dim = x.shape[-1] - self.high_bits_length
+            x_m = x[..., low_dim:high_dim]
+            x_m_grouped = x_m.reshape(
+                x_m.shape[0], x_m.shape[1], x_m.shape[2] // self.groupsize, self.groupsize
+            )
+            self.scale, self.zero = self.find_params_per_token_groupwise(x_m_grouped, self.maxq)
+            if self.high_bits_length != 0 and self.high_bits < 16:
+                x_h = x[..., high_dim:]
+                x_h_grouped = x_h.reshape(
+                    x_h.shape[0], x_h.shape[1], x_h.shape[2] // self.groupsize, self.groupsize
+                )
+                self.scale_h, self.zero_h = self.find_params_per_token_groupwise(x_h_grouped, self.maxq_h)
+            if self.low_bits_length != 0 and self.low_bits < 16:
+                x_l = x[..., :low_dim]
+                x_l_grouped = x_l.reshape(
+                    x_l.shape[0], x_l.shape[1], x_l.shape[2] // self.groupsize, self.groupsize
+                )
+                self.scale_l, self.zero_l = self.find_params_per_token_groupwise(x_l_grouped, self.maxq_l)
             return
 
         low_dim = self.low_bits_length
@@ -377,9 +436,8 @@ class ActQuantWrapper(nn.Module):
     Supports optional online rotation for DiRotQ mixed-precision quantization.
 
     Online rotation (DiRotQ):
-      - rotation: [D, D] matrix for hidden-dim input rotation (Q, K, V, FFN up)
-      - rotation_per_head: [H, d, d] matrix for per-head input rotation (to_out[0])
-      - rotation_down: [D_down, D_down] matrix for down-proj input rotation (ff.net[2])
+      - rotation: [D, D] matrix for hidden-dim input rotation
+      - rotation_per_head: [H, d, d] matrix for per-head input rotation
     The rotation is applied online (x_rot = x @ U), quantization happens in the
     rotated basis, then the input is unrotated (x_unrot = x_rot_quant @ U.T) before
     the linear layer. This keeps the model weights UNCHANGED (no divergence) while
@@ -400,6 +458,11 @@ class ActQuantWrapper(nn.Module):
         self.num_heads = None
         self.head_dim = None
 
+        # Hadamard rotation (alternative to dense PCA rotation for specific layers)
+        self.use_hadamard = False
+        self.hadamard_sign_flips = None  # [D] tensor of ±1
+        self.hadamard_low_dim = None     # power-of-2 dim for FWHT
+
     def extra_repr(self):
         s = f"Input Quant: {self.quantizer.bits}b"
         if self.quantizer.high_bits_length > 0:
@@ -410,14 +473,12 @@ class ActQuantWrapper(nn.Module):
         x_dtype = x.dtype
 
         # Online rotation: rotate input to PCA basis, quantize, unrotate.
-        # Key: keep everything in fp32 through the full rotate→quantize→unrotate
-        # cycle.  The only fp16 cast is the single .to(x_dtype) at the end,
-        # which avoids the error accumulation from two intermediate fp16 casts
-        # that would otherwise be amplified by classifier-free guidance (×4.5).
+        # Keep everything in fp32 through the full rotate→quantize→unrotate
+        # cycle; the only fp16 cast is the single .to(x_dtype) at the end.
+        # This avoids error accumulation from intermediate fp16 casts that
+        # compounds across many layers and classifier-free guidance.
         if self.rotation is not None and self.quantizer.bits < 16:
-            # Rotate → quantize in rotated (PCA) basis → unrotate.
-            # Done entirely in fp32 to avoid fp16 rounding accumulation across
-            # 140 layers that gets amplified by classifier-free guidance (×4.5).
+            # Rotate → quantize in rotated basis → unrotate, all in fp32.
             # Only applied when quantization is active (bits < 16); when bits=16
             # the rotation is a mathematical no-op and we skip it entirely to
             # keep x unchanged (no fp16 precision loss at all).
@@ -432,7 +493,7 @@ class ActQuantWrapper(nn.Module):
             x = (x_quant.reshape(-1, init_shape[-1]) @ U.T).to(x_dtype).reshape(init_shape)
 
         elif self.rotation_per_head is not None and self.quantizer.bits < 16:
-            # Per-head rotation for to_out[0]: input is [B, T, H*d].
+            # Per-head rotation: input is [B, T, H*d].
             # Same strategy: all in fp32, single cast at the end.
             B_T = x.shape[:-1]
             H, d = self.num_heads, self.head_dim
@@ -446,6 +507,48 @@ class ActQuantWrapper(nn.Module):
             x_unrot = torch.einsum('...hd,hde->...he', x_quant_heads,
                                    U_ph.transpose(1, 2))                      # fp32
             x = x_unrot.to(x_dtype).reshape(*B_T, H * d)
+
+        elif self.use_hadamard and self.quantizer.bits < 16:
+            # Hadamard rotation: O(D log D) instead of O(D²).
+            # Split into [low_dim (power-of-2, quantized) | high_dim (16-bit passthrough)].
+            # FWHT applied only on the low_dim part. fp32 throughout.
+            init_shape = x.shape
+            D = init_shape[-1]
+            low_dim = self.hadamard_low_dim
+            x_fp32 = x.float()
+
+            if low_dim < D:
+                x_low = x_fp32[..., :low_dim]
+                x_high = x_fp32[..., low_dim:]  # 16-bit passthrough
+            else:
+                x_low = x_fp32
+                x_high = None
+
+            # Sign flips + FWHT on low-precision part
+            if self.hadamard_sign_flips is not None:
+                sf = self.hadamard_sign_flips.to(x_low.device, dtype=x_low.dtype)
+                x_low = x_low * sf
+            x_rot_low = fast_hadamard_transform(x_low)
+
+            # Quantize the rotated low part
+            if x_high is not None:
+                x_rot = torch.cat([x_rot_low, x_high], dim=-1)
+            else:
+                x_rot = x_rot_low
+            self.quantizer.find_params(x_rot)
+            x_quant = self.quantizer(x_rot)
+            self.quantizer.free()
+
+            # Inverse FWHT on low part (FWHT is its own inverse when normalized)
+            x_q_low = x_quant[..., :low_dim]
+            x_unrot_low = fast_hadamard_transform(x_q_low)
+            if self.hadamard_sign_flips is not None:
+                x_unrot_low = x_unrot_low * sf
+
+            if x_high is not None:
+                x = torch.cat([x_unrot_low, x_quant[..., low_dim:]], dim=-1).to(x_dtype)
+            else:
+                x = x_unrot_low.to(x_dtype)
 
         else:
             # No rotation: standard activation quantization
@@ -585,7 +688,7 @@ def add_actquant(module, name="", skip_names=None):
             if any(skip in full_name for skip in skip_names):
                 continue
             setattr(module, attr, ActQuantWrapper(tmp))
-        elif isinstance(tmp, nn.Sequential):
+        elif isinstance(tmp, (nn.Sequential, nn.ModuleList)):
             replaced = []
             for i, child in enumerate(tmp.children()):
                 child_name = f"{name}.{attr}.{i}" if name else f"{attr}.{i}"
@@ -596,7 +699,11 @@ def add_actquant(module, name="", skip_names=None):
                         replaced.append(ActQuantWrapper(child))
                 else:
                     replaced.append(child)
-            setattr(module, attr, nn.Sequential(*replaced))
+            if isinstance(tmp, nn.ModuleList):
+                new_container = nn.ModuleList(replaced)
+            else:
+                new_container = nn.Sequential(*replaced)
+            setattr(module, attr, new_container)
 
     for name1, child in module.named_children():
         child_full = f"{name}.{name1}" if name else name1

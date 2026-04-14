@@ -112,6 +112,28 @@ def fuse_unrotation_into_weights(transformer):
 
 
 # ---------------------------------------------------------------------------
+# Pre-convert rotations to fp32 on GPU (avoids redundant .to() every call)
+# ---------------------------------------------------------------------------
+
+def preconvert_rotations_to_device(transformer, device="cuda"):
+    """Convert all rotation matrices and sign flips to fp32 on GPU once."""
+    n = 0
+    for name, mod in transformer.named_modules():
+        if not isinstance(mod, ActQuantWrapper):
+            continue
+        if mod.rotation is not None:
+            mod.rotation = mod.rotation.to(device=device, dtype=torch.float32)
+            n += 1
+        elif mod.rotation_per_head is not None:
+            mod.rotation_per_head = mod.rotation_per_head.to(device=device, dtype=torch.float32)
+            n += 1
+        if getattr(mod, 'hadamard_sign_flips', None) is not None:
+            mod.hadamard_sign_flips = mod.hadamard_sign_flips.to(device=device, dtype=torch.float32)
+    print(f"Preconverted {n} rotation matrices to fp32 on {device}.")
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Patched forward (skips unrotation, uses fused weight directly)
 # ---------------------------------------------------------------------------
 
@@ -131,29 +153,28 @@ def _fused_forward(self, x):
         if self.rotation is not None:
             # Forward rotation → quantize → (unrotation SKIPPED, absorbed in W)
             init_shape = x.shape
-            U = self.rotation.to(x.device, dtype=torch.float32)
             x_fp32 = x.float().reshape(-1, init_shape[-1])
-            x_rot = (x_fp32 @ U).reshape(init_shape)          # fp32
-            self.quantizer.find_params(x_rot)
-            x = self.quantizer(x_rot).to(x_dtype)              # single fp16 cast
-            self.quantizer.free()
-            # x_quant @ U.T step removed — W already contains U
+            x_rot = (x_fp32 @ self.rotation).reshape(init_shape)
+            if self.quantizer.bits < 16:
+                self.quantizer.find_params(x_rot)
+                x = self.quantizer(x_rot).to(x_dtype)
+            else:
+                x = x_rot.to(x_dtype)
 
         elif self.rotation_per_head is not None:
             # Per-head forward rotation → quantize → (unrotation SKIPPED)
             B_T = x.shape[:-1]
             H, d = self.num_heads, self.head_dim
-            U_ph = self.rotation_per_head.to(x.device, dtype=torch.float32)
             x_heads = x.float().reshape(*B_T, H, d)
-            x_rot_flat = torch.einsum('...hd,hde->...he', x_heads, U_ph).reshape(*B_T, H * d)
-            self.quantizer.find_params(x_rot_flat)
-            x = self.quantizer(x_rot_flat).to(x_dtype)         # single fp16 cast
-            self.quantizer.free()
-            # per-head einsum unrotation removed — W already contains BlockDiag(U_ph)
+            x_rot_flat = torch.einsum('...hd,hde->...he', x_heads, self.rotation_per_head).reshape(*B_T, H * d)
+            if self.quantizer.bits < 16:
+                self.quantizer.find_params(x_rot_flat)
+                x = self.quantizer(x_rot_flat).to(x_dtype)
+            else:
+                x = x_rot_flat.to(x_dtype)
 
         elif getattr(self, 'use_hadamard', False):
             # Hadamard forward rotation → quantize → (inverse SKIPPED, absorbed in W)
-            # O(D log D) via fast Walsh-Hadamard on the low_dim part
             init_shape = x.shape
             D = init_shape[-1]
             low_dim = self.hadamard_low_dim
@@ -167,8 +188,7 @@ def _fused_forward(self, x):
                 x_high = None
 
             if self.hadamard_sign_flips is not None:
-                sf = self.hadamard_sign_flips.to(x_low.device, dtype=x_low.dtype)
-                x_low = x_low * sf
+                x_low = x_low * self.hadamard_sign_flips
             x_rot_low = fast_hadamard_transform(x_low)
 
             if x_high is not None:
@@ -176,17 +196,23 @@ def _fused_forward(self, x):
             else:
                 x_rot = x_rot_low
 
-            self.quantizer.find_params(x_rot)
-            x = self.quantizer(x_rot).to(x_dtype)
-            self.quantizer.free()
-            # Inverse Hadamard removed — W already contains it
+            if self.quantizer.bits < 16:
+                self.quantizer.find_params(x_rot)
+                x = self.quantizer(x_rot).to(x_dtype)
+            else:
+                x = x_rot.to(x_dtype)
+
+        else:
+            # Fused but no rotation assigned — just quantize if needed
+            if self.quantizer.bits < 16:
+                self.quantizer.find_params(x)
+                x = self.quantizer(x).to(x_dtype)
 
     else:
-        # No fusion (bits=16, or no rotation): standard activation quantization
+        # No fusion: standard activation quantization
         if self.quantizer.bits < 16:
             self.quantizer.find_params(x)
             x = self.quantizer(x).to(x_dtype)
-            self.quantizer.free()
 
     # Linear forward (uses fused weight when _unrot_fused=True)
     x = self.module(x).to(x_dtype)
@@ -195,7 +221,6 @@ def _fused_forward(self, x):
     if self.out_quantizer.bits < 16:
         self.out_quantizer.find_params(x)
         x = self.out_quantizer(x).to(x_dtype)
-        self.out_quantizer.free()
 
     return x
 
