@@ -394,12 +394,15 @@ class ActQuantizer(nn.Module):
         tmp = torch.zeros(reshaped_x.shape[0], device=dev, dtype=x.dtype)
         xmin = torch.minimum(reshaped_x.min(1)[0], tmp) * self.clip_ratio
         xmax = torch.maximum(reshaped_x.max(1)[0], tmp) * self.clip_ratio
+        # Store scale/zero as [..., 1] and let STEQuantize broadcast along the
+        # channel dim. 
+        bcast_shape = (*init_shape[:-1], 1)
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
-            scale = (xmax / maxq).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
+            scale = xmax / maxq
             scale[tmp] = 1
-            scale = scale.reshape(init_shape)
+            scale = scale.reshape(bcast_shape)
             zero = torch.zeros_like(scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
@@ -407,8 +410,8 @@ class ActQuantizer(nn.Module):
             xmax[tmp] = +1
             scale = (xmax - xmin) / maxq
             zero = torch.round(-xmin / scale)
-            scale = scale.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
-            zero = zero.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
+            scale = scale.reshape(bcast_shape)
+            zero = zero.reshape(bcast_shape)
 
         return scale.to(x.dtype), zero.to(x.dtype)
 
@@ -423,9 +426,9 @@ class ActQuantizer(nn.Module):
 
         xmax = reshaped_x.abs().max(1)[0] * self.clip_ratio
         tmp = xmax == 0
-        scale = (xmax / NF4_MAX).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
+        scale = xmax / NF4_MAX
         scale[tmp] = 1
-        scale = scale.reshape(init_shape)
+        scale = scale.reshape(*init_shape[:-1], 1)
         zero = torch.zeros_like(scale)
         return scale.to(x.dtype), zero.to(x.dtype)
 

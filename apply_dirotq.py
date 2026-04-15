@@ -213,13 +213,20 @@ if __name__ == "__main__":
     had_tag = "_had" if args.hadamard_layers else ""
     if args.sign_flips:
         had_tag += "_optflips"
-    skip_tag = "_noout" if args.skip_quant_layers and any("to_out" in p for p in args.skip_quant_layers) else ""
+    # Skip tag encodes --skip-quant-layers in both the cache and output names.
+    # The cache must include it because fuse_unrotation_into_weights only
+    # absorbs U into W when bits<16 — skipped layers have unfused weights, so
+    # a cache built with a different skip config can't be reused.
+    if args.skip_quant_layers:
+        import hashlib
+        key = ",".join(sorted(args.skip_quant_layers))
+        skip_tag = "_skip" + hashlib.md5(key.encode()).hexdigest()[:8]
+    else:
+        skip_tag = ""
 
-    # Cache path encodes quant format + group size + method for exact-match reuse
-    # Note: skip_quant_layers only changes activation config, same weight cache is reused.
     if args.quantized_cache is None:
         method = "gptq" if args.gptq else "rtn"
-        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}_model.pt"
+        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}_model.pt"
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
 
     torch.manual_seed(args.seed)
