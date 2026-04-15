@@ -1,6 +1,7 @@
 model: pixart-sigma
 model_id: "PixArt-alpha/PixArt-Sigma-XL-2-1024-MS"
 pipeline_class: "diffusers.PixArtSigmaPipeline"
+dtype: fp16
 
 dims:
   hidden: 1152

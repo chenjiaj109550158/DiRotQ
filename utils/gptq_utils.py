@@ -15,12 +15,36 @@ so using H_x gives the same column-importance ordering as H_{x_unrot}.
 
 import gc
 import math
+import sys
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
 
-from .quant_utils import ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX
+from .quant_utils import ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX, _match_skip
+
+
+class _NewlineStream:
+    """tqdm writes progress by overwriting with \\r, which turns log files
+    into one giant line. This stream replaces \\r with \\n so each update
+    lands on its own line — openable in any editor."""
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, s):
+        self._stream.write(s.replace("\r", "\n"))
+
+    def flush(self):
+        self._stream.flush()
+
+
+def _log_tqdm(iterable, desc, **kwargs):
+    """tqdm that stays TTY-friendly interactively, but emits newline-per-update
+    when redirected to a file (e.g. nohup log)."""
+    if sys.stdout.isatty():
+        return tqdm(iterable, desc=desc, **kwargs)
+    return tqdm(iterable, desc=desc, file=_NewlineStream(sys.stdout),
+                mininterval=10.0, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -45,27 +69,74 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     Returns:
         dict[layer_name -> torch.Tensor([in_features, in_features], float32, cpu)]
     """
+    # Enable TF32 tensor cores for the fp32 Hessian matmuls only if the GPU
+    # actually supports them (Ampere, sm_80+). On older GPUs (V100 sm_70,
+    # T4 sm_75) TF32 is a no-op/unsupported; leave strict fp32 in place.
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(
+            device if isinstance(device, int) else 0
+        )
+        if major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print(f"TF32 enabled for Hessian matmuls (compute capability sm_{major}{minor}).")
+        else:
+            print(f"TF32 unsupported on sm_{major}{minor}; using strict fp32 for Hessian matmuls.")
+
+    # Match calibration input dtype to the transformer so bf16 models
+    # (e.g. FLUX) don't silently lose dynamic range via fp16 cast.
+    model_dtype = next(transformer.parameters()).dtype
+
     qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
 
-    # H accumulators and token counters (on GPU for fast matmul)
-    layer_H = {name: torch.zeros(
-        ql.module.in_features, ql.module.in_features, dtype=torch.float32, device=device
-    ) for name, ql in qlayers.items()}
+    # Hybrid placement: layers whose Hessian fits cheaply live on GPU and use
+    # in-place addmm_ (no PCIe traffic, no per-call alloc). Big-D layers
+    # (FLUX ffn_down @12288, single_block proj_out.linears.1 @12288) accumulate
+    # on CPU to avoid eating tens of GB of GPU RAM.
+    GPU_HESSIAN_MAX_D = 4096
+
+    layer_H = {}
+    layer_on_gpu = {}
+    for name, ql in qlayers.items():
+        d = ql.module.in_features
+        if d <= GPU_HESSIAN_MAX_D:
+            layer_H[name] = torch.zeros(d, d, dtype=torch.float32, device=device)
+            layer_on_gpu[name] = True
+        else:
+            layer_H[name] = torch.zeros(d, d, dtype=torch.float32)
+            layer_on_gpu[name] = False
+
+    n_gpu = sum(layer_on_gpu.values())
+    gpu_mem_mb = sum(ql.module.in_features ** 2 * 4
+                     for name, ql in qlayers.items() if layer_on_gpu[name]) / (1024 ** 2)
+    print(f"Hessian placement: {n_gpu}/{len(qlayers)} on GPU "
+          f"(~{gpu_mem_mb:.0f} MiB), {len(qlayers) - n_gpu} on CPU (D > {GPU_HESSIAN_MAX_D}).")
+
     layer_n = {name: 0 for name in qlayers}
 
-    # Register hooks on ActQuantWrapper to capture input x
+    # Register hooks on ActQuantWrapper to capture input x.
+    # GPU layers accumulate in-place via addmm_; CPU layers compute the
+    # partial on GPU, transfer to CPU, add.
     hooks = []
     for name, ql in qlayers.items():
         in_features = ql.module.in_features
 
-        def _make_hook(n, d):
-            def _hook(module, inp, out):
-                x = inp[0].detach().float().reshape(-1, d)  # [B*tokens, in_features]
-                layer_n[n] += x.shape[0]
-                layer_H[n] += (x.T @ x)
+        def _make_hook(n, d, on_gpu):
+            if on_gpu:
+                def _hook(module, inp, out):
+                    x = inp[0].detach().float().reshape(-1, d)
+                    layer_n[n] += x.shape[0]
+                    layer_H[n].addmm_(x.T, x)
+            else:
+                def _hook(module, inp, out):
+                    x = inp[0].detach().float().reshape(-1, d)
+                    layer_n[n] += x.shape[0]
+                    layer_H[n] += (x.T @ x).cpu()
             return _hook
 
-        hooks.append(ql.register_forward_hook(_make_hook(name, in_features)))
+        hooks.append(ql.register_forward_hook(
+            _make_hook(name, in_features, layer_on_gpu[name])
+        ))
 
     # Load and batch calibration files
     calib_path = Path(calib_dir)
@@ -86,7 +157,14 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
         for k in batch_kwargs_lists:
             vals = batch_kwargs_lists[k]
             if isinstance(vals[0], torch.Tensor):
-                stacked_kwargs[k] = torch.cat(vals, dim=0).to(device)
+                # Only concat per-sample tensors (leading dim 1). Tensors
+                # without a batch dim — e.g. FLUX img_ids [L, 3] and
+                # txt_ids [512, 3] — are shared position IDs across the
+                # batch and must be passed as-is, not cat'd.
+                if vals[0].ndim >= 1 and vals[0].shape[0] == 1:
+                    stacked_kwargs[k] = torch.cat(vals, dim=0).to(device)
+                else:
+                    stacked_kwargs[k] = vals[0].to(device)
             else:
                 stacked_kwargs[k] = vals[0]  # scalar/non-tensor: use first
         with torch.no_grad():
@@ -95,14 +173,17 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
         for k in batch_kwargs_lists:
             batch_kwargs_lists[k].clear()
 
-    for f in tqdm(calib_files, desc="Calibration forward passes"):
+    for f in _log_tqdm(calib_files, desc="Calibration forward passes"):
         data = torch.load(f, map_location="cpu", weights_only=False)
-        batch_args.append([a.half() for a in data["input_args"]])
+        batch_args.append([a.to(model_dtype) if a.is_floating_point() else a
+                           for a in data["input_args"]])
         for k, v in data["input_kwargs"].items():
             if k not in batch_kwargs_lists:
                 batch_kwargs_lists[k] = []
             if isinstance(v, torch.Tensor):
-                batch_kwargs_lists[k].append(v.half())
+                batch_kwargs_lists[k].append(
+                    v.to(model_dtype) if v.is_floating_point() else v
+                )
             else:
                 batch_kwargs_lists[k].append(v)
         if len(batch_args) >= batch_size:
@@ -113,13 +194,16 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     for h in hooks:
         h.remove()
 
-    # Normalize: H = 2/n * Σ X^T X, then move to CPU
+    # Normalize H = 2/n * Σ X^T X in place, then move any GPU-resident
+    # accumulators to CPU before returning — the returned dict is saved via
+    # torch.save and consumed by _gptq_quantize_layer which handles CPU tensors.
     for name in layer_H:
         n = layer_n[name]
         if n > 0:
-            layer_H[name] = ((2.0 / n) * layer_H[name]).cpu()
+            layer_H[name].mul_(2.0 / n)
+            if layer_H[name].device.type == "cuda":
+                layer_H[name] = layer_H[name].cpu()
         else:
-            layer_H[name] = layer_H[name].cpu()
             print(f"WARNING: no calibration data collected for layer {name}")
 
     gc.collect()
@@ -298,8 +382,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
     n_gptq = 0
     n_rtn  = 0
 
-    for name, qlayer in tqdm(qlayers.items(), desc="GPTQ weight quantization"):
-        if any(skip in name for skip in skip_names):
+    for name, qlayer in _log_tqdm(qlayers.items(), desc="GPTQ weight quantization"):
+        if _match_skip(name, skip_names):
             continue
 
         W = qlayer.module.weight.data

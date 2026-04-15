@@ -3,9 +3,10 @@ dirotq_fused_unrotation_fast.py
 
 Optimized version of dirotq_fused_unrotation.py with two speed improvements:
 
-1. fp16 rotations: rotation matrices stored in fp16 on GPU, eliminating per-call
-   fp32 casts and getting ~2x faster matmuls. Safe because the fused path only does
-   forward rotation -> quantize (no unrotation accumulation).
+1. fp16/bf16 rotations: rotation matrices stored in the model's compute
+   dtype (fp16 or bf16) on GPU, eliminating per-call fp32 casts and getting
+   ~2x faster matmuls. Safe because the fused path only does forward rotation
+   -> quantize (no unrotation accumulation).
 
 2. Cached quantizer buffers: skip free() after each call so scale/zero tensors
    are reused instead of deallocated and reallocated every forward pass.
@@ -21,34 +22,40 @@ from utils.quant_utils import ActQuantWrapper
 from utils.hadamard_utils import fast_hadamard_transform
 
 
-def preconvert_rotations_to_fp16(transformer, device="cuda"):
-    """Convert all rotation matrices to fp16 on GPU once, before generation."""
+def preconvert_rotations_to_device(transformer, device="cuda", dtype=None):
+    """Convert all rotation matrices to the model's compute dtype on GPU once.
+
+    If dtype is None, infer from the transformer's parameters.
+    """
+    if dtype is None:
+        dtype = next(transformer.parameters()).dtype
+
     n = 0
     for name, mod in transformer.named_modules():
         if not isinstance(mod, ActQuantWrapper):
             continue
 
         if mod.rotation is not None:
-            mod.rotation = mod.rotation.to(device=device, dtype=torch.float16)
+            mod.rotation = mod.rotation.to(device=device, dtype=dtype)
             n += 1
         elif mod.rotation_per_head is not None:
-            mod.rotation_per_head = mod.rotation_per_head.to(device=device, dtype=torch.float16)
+            mod.rotation_per_head = mod.rotation_per_head.to(device=device, dtype=dtype)
             n += 1
 
         if getattr(mod, 'hadamard_sign_flips', None) is not None:
-            mod.hadamard_sign_flips = mod.hadamard_sign_flips.to(device=device, dtype=torch.float16)
+            mod.hadamard_sign_flips = mod.hadamard_sign_flips.to(device=device, dtype=dtype)
 
-    print(f"Preconverted {n} rotation matrices to fp16 on {device}.")
+    print(f"Preconverted {n} rotation matrices to {dtype} on {device}.")
     return n
 
 
 def _fused_forward_fast(self, x):
     """
-    Drop-in replacement for ActQuantWrapper.forward — fp16 rotations, no free().
+    Drop-in replacement for ActQuantWrapper.forward — fp16/bf16 rotations, no free().
 
     Changes vs. _fused_forward:
-      - Rotation matrices already fp16 on GPU (no .to() per call)
-      - Sign flips already fp16 on GPU (no .to() per call)
+      - Rotation matrices already in compute dtype on GPU (no .to() per call)
+      - Sign flips already in compute dtype on GPU (no .to() per call)
       - quantizer.free() removed (buffers reused across calls)
     """
     x_dtype = x.dtype
@@ -111,4 +118,4 @@ def _fused_forward_fast(self, x):
 def patch_forward_fast():
     """Monkey-patch ActQuantWrapper.forward with the fast fused version."""
     ActQuantWrapper.forward = _fused_forward_fast
-    print("Patched ActQuantWrapper.forward with fast fused version (fp16 rotations, no free).")
+    print("Patched ActQuantWrapper.forward with fast fused version (fp16/bf16 rotations, no free).")

@@ -28,7 +28,7 @@ from utils.quant_utils import (
     ActQuantWrapper, add_actquant, find_qlayers,
     rtn_quantize_weights, nvfp4_rtn_quantize_weights,
 )
-from dirotq_fused_unrotation import fuse_unrotation_into_weights, patch_forward, preconvert_rotations_to_device
+from dirotq_fused_unrotation import fuse_unrotation_into_weights
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 
 _ROOT = Path(__file__).parent
@@ -161,7 +161,18 @@ if __name__ == "__main__":
     parser.add_argument("--quantized-cache", default=None,
                         help="Path to save/load quantized transformer weights. "
                              "If file exists, skips GPTQ/RTN and loads from cache.")
+    parser.add_argument("--slow-unrotation", action="store_true",
+                        help="Use fp32 fused-unrotation path (debug/fallback). "
+                             "Default is the fast bf16/fp16 path.")
     args = parser.parse_args()
+
+    if args.slow_unrotation:
+        from dirotq_fused_unrotation import patch_forward, preconvert_rotations_to_device
+    else:
+        from dirotq_fused_unrotation_fast import (
+            patch_forward_fast as patch_forward,
+            preconvert_rotations_to_device,
+        )
 
     cfg = load_model_config(args.model)
 
@@ -172,6 +183,7 @@ if __name__ == "__main__":
     assign_online_rotations = model_utils.assign_online_rotations
     configure_quantizers_by_name = model_utils.configure_quantizers_by_name
     generation_params = model_utils.generation_params
+    preprocess_transformer = getattr(model_utils, "preprocess_transformer", None)
 
     model_id      = cfg["model_id"]
     basis_path    = str(_ROOT / cfg["basis"]["output_path"])
@@ -238,9 +250,11 @@ if __name__ == "__main__":
     mod_name, cls_name = pipeline_cls_path.rsplit(".", 1)
     PipelineClass = getattr(importlib.import_module(mod_name), cls_name)
 
-    print(f"Loading pipeline ({pipeline_cls_path}) in fp16...")
+    dtype_str = cfg.get("dtype", "fp16")
+    torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[dtype_str]
+    print(f"Loading pipeline ({pipeline_cls_path}) in {dtype_str}...")
     pipe = PipelineClass.from_pretrained(
-        model_id, torch_dtype=torch.float16, use_safetensors=True
+        model_id, torch_dtype=torch_dtype, use_safetensors=True
     )
 
     sign_flips_dict = None
@@ -248,6 +262,9 @@ if __name__ == "__main__":
         print(f"Loading optimized sign flips from {args.sign_flips}...")
         sign_flips_dict = torch.load(args.sign_flips, map_location="cpu", weights_only=False)
         print(f"Loaded optimized sign flips for {len(sign_flips_dict)} blocks.")
+
+    if preprocess_transformer is not None:
+        preprocess_transformer(pipe.transformer, cfg)
 
     apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
                            skip_layers=skip_layers, hadamard_layers=args.hadamard_layers,
@@ -326,8 +343,12 @@ if __name__ == "__main__":
     patch_forward()
 
     if args.generate:
-        print("Moving pipeline to CUDA...")
-        pipe = pipe.to("cuda")
+        print("Enabling model CPU offload (text encoders/VAE swap to CUDA on demand)...")
+        try:
+            pipe.enable_model_cpu_offload()
+        except Exception as e:
+            print(f"enable_model_cpu_offload failed ({e}); falling back to pipe.to('cuda').")
+            pipe = pipe.to("cuda")
         preconvert_rotations_to_device(pipe.transformer, device="cuda")
         generate_images(pipe, args.output_dir, args.dataset, generation_params, max_images=args.max_images, batch_size=args.batch_size)
 

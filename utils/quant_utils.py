@@ -303,7 +303,7 @@ class ActQuantizer(nn.Module):
             tmp = xmax == 0
             scale = xmax / NF4_MAX
             scale[tmp] = 1
-            return scale, torch.zeros_like(scale)
+            return scale.to(x.dtype), torch.zeros_like(scale, dtype=x.dtype)
 
         xmax = torch.amax(x, dim=3, keepdim=True) * self.clip_ratio
         xmin = torch.amin(x, dim=3, keepdim=True) * self.clip_ratio
@@ -319,7 +319,7 @@ class ActQuantizer(nn.Module):
             xmax[tmp] = +1
             scale = (xmax - xmin) / maxq
             zero = torch.round(-xmin / scale)
-        return scale, zero
+        return scale.to(x.dtype), zero.to(x.dtype)
 
     def find_params(self, x):
         is_nvfp4 = (self.quant_dtype == "nvfp4")
@@ -385,13 +385,13 @@ class ActQuantizer(nn.Module):
 
     def _find_params(self, x, maxq):
         if self.bits == 16:
-            return torch.zeros(1), torch.zeros(1)
+            return torch.zeros(1, dtype=x.dtype), torch.zeros(1, dtype=x.dtype)
 
         dev = x.device
         init_shape = x.shape
         reshaped_x = x.reshape((-1, x.shape[-1]))
 
-        tmp = torch.zeros(reshaped_x.shape[0], device=dev)
+        tmp = torch.zeros(reshaped_x.shape[0], device=dev, dtype=x.dtype)
         xmin = torch.minimum(reshaped_x.min(1)[0], tmp) * self.clip_ratio
         xmax = torch.maximum(reshaped_x.max(1)[0], tmp) * self.clip_ratio
         if self.sym:
@@ -410,12 +410,12 @@ class ActQuantizer(nn.Module):
             scale = scale.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
             zero = zero.unsqueeze(1).repeat(1, reshaped_x.shape[-1]).reshape(init_shape)
 
-        return scale, zero
+        return scale.to(x.dtype), zero.to(x.dtype)
 
     def _find_params_nvfp4(self, x):
         """Compute per-token NF4 scale: max(|x|) / 6.0."""
         if self.bits == 16:
-            return torch.zeros(1), torch.zeros(1)
+            return torch.zeros(1, dtype=x.dtype), torch.zeros(1, dtype=x.dtype)
 
         dev = x.device
         init_shape = x.shape
@@ -427,7 +427,7 @@ class ActQuantizer(nn.Module):
         scale[tmp] = 1
         scale = scale.reshape(init_shape)
         zero = torch.zeros_like(scale)
-        return scale, zero
+        return scale.to(x.dtype), zero.to(x.dtype)
 
 
 class ActQuantWrapper(nn.Module):
@@ -666,6 +666,34 @@ class WeightQuantizer(nn.Module):
         return torch.all(self.scale != 0)
 
 
+def _match_skip(full_name, patterns):
+    """Match a full module path against a list of skip patterns.
+
+    Pattern conventions:
+      "pat"    - substring match (default, backwards compatible)
+      "^pat"   - full_name.startswith("pat")
+      "pat$"   - full_name.endswith("pat")
+      "^pat$"  - full_name == "pat" (exact)
+    """
+    for p in patterns:
+        anchor_start = p.startswith("^")
+        anchor_end = p.endswith("$")
+        core = p[1 if anchor_start else 0 : -1 if anchor_end else None]
+        if anchor_start and anchor_end:
+            if full_name == core:
+                return True
+        elif anchor_start:
+            if full_name.startswith(core):
+                return True
+        elif anchor_end:
+            if full_name.endswith(core):
+                return True
+        else:
+            if core in full_name:
+                return True
+    return False
+
+
 def add_actquant(module, name="", skip_names=None):
     """
     Recursively wrap all nn.Linear layers with ActQuantWrapper.
@@ -673,7 +701,7 @@ def add_actquant(module, name="", skip_names=None):
     Args:
         module: The module to process
         name: Current path name
-        skip_names: List of substrings; if any matches, skip wrapping
+        skip_names: List of patterns; see _match_skip for supported anchors.
     """
     if skip_names is None:
         skip_names = []
@@ -685,7 +713,7 @@ def add_actquant(module, name="", skip_names=None):
         tmp = getattr(module, attr)
         if isinstance(tmp, nn.Linear):
             full_name = f"{name}.{attr}" if name else attr
-            if any(skip in full_name for skip in skip_names):
+            if _match_skip(full_name, skip_names):
                 continue
             setattr(module, attr, ActQuantWrapper(tmp))
         elif isinstance(tmp, (nn.Sequential, nn.ModuleList)):
@@ -693,7 +721,7 @@ def add_actquant(module, name="", skip_names=None):
             for i, child in enumerate(tmp.children()):
                 child_name = f"{name}.{attr}.{i}" if name else f"{attr}.{i}"
                 if isinstance(child, nn.Linear):
-                    if any(skip in child_name for skip in skip_names):
+                    if _match_skip(child_name, skip_names):
                         replaced.append(child)
                     else:
                         replaced.append(ActQuantWrapper(child))
@@ -734,7 +762,7 @@ def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None)
 
     qlayers = find_qlayers(model, layers=[ActQuantWrapper])
     for name, qlayer in qlayers.items():
-        if any(skip in name for skip in skip_names):
+        if _match_skip(name, skip_names):
             continue
 
         W = qlayer.module.weight.data.clone()
@@ -780,7 +808,7 @@ def nvfp4_rtn_quantize_weights(model, groupsize=16, skip_names=None):
 
     qlayers = find_qlayers(model, layers=[ActQuantWrapper])
     for name, qlayer in qlayers.items():
-        if any(skip in name for skip in skip_names):
+        if _match_skip(name, skip_names):
             continue
 
         W = qlayer.module.weight.data.clone().float()
