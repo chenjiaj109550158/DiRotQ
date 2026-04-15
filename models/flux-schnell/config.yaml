@@ -1,0 +1,80 @@
+model: flux-schnell
+model_id: "black-forest-labs/FLUX.1-schnell"
+pipeline_class: "diffusers.FluxPipeline"
+dtype: bf16
+
+# FLUX.1-schnell: 19 double (joint) blocks + 38 single blocks.
+# hidden = num_heads * head_dim = 24 * 128 = 3072
+# intermediate = hidden * 4 = 12288
+dims:
+  hidden: 3072
+  head: 128
+  intermediate: 12288
+  num_heads: 24
+  num_double_layers: 19
+  num_single_layers: 38
+  joint_attention_dim: 4096
+
+rotation:
+  high_fraction: 0.125  # 1/8
+  output_path: "models/flux-schnell/basis/R-flux-schnell.pt"
+
+basis:
+  output_path: "models/flux-schnell/basis/U-flux-schnell.pt"
+  cache_dir: "models/flux-schnell/calibration_dataset/caches"
+
+# Skip lists mirror deepcompressor/svdquant flux.1-schnell.yaml:
+#   wgts.skips = [embed, resblock_*, transformer_proj_in, transformer_proj_out,
+#                 down_sample, up_sample]
+#   ipts.skips = wgts.skips + [transformer_norm, transformer_add_norm]
+#
+# For a FluxTransformer2DModel (pure DiT, no resblocks / up-down-sample):
+#   "embed" key expands to input_embed + time_embed + text_embed + norm_out + proj_out,
+#   which in diffusers maps to:
+#     x_embedder, time_text_embed.*, context_embedder, norm_out.linear, proj_out
+#   "transformer_proj_in"/"transformer_proj_out" are no-ops for FluxStruct
+#   (they only apply to the legacy Transformer2DModel class).
+#   "transformer_norm" / "transformer_add_norm" are the AdaLayerNorm modulation
+#   linears inside each block (norm1.linear, norm.linear, norm1_context.linear).
+#
+# Pattern syntax: plain = substring, "^pat$" = exact full-path match
+# (needed so top-level `proj_out` doesn't also skip block-level proj_out).
+quantization:
+  w_bits: 4
+  a_bits: 4
+  high_bits: 16
+  w_groupsize: 64
+  skip_layers:
+    # embed
+    - "x_embedder"
+    - "time_text_embed"
+    - "context_embedder"
+    - "norm_out"        # top-level AdaLayerNormContinuous.linear
+    - "^proj_out$"      # top-level proj_out only (not block-level)
+    # transformer_norm (AdaLayerNormZero/ZeroSingle modulation linear)
+    - ".norm1.linear"
+    - ".norm.linear"    # FluxSingleTransformerBlock.norm.linear
+    # transformer_add_norm
+    - ".norm1_context.linear"
+
+# NF4 (NVFP4) quantization config — matches SVDQuant sfp4_e2m1_all
+nvfp4:
+  w_groupsize: 16
+  a_groupsize: 16
+  a_groupsize_attn_out: 128  # head_dim (divisible by 16, but kept for parity)
+  skip_layers:
+    - "x_embedder"
+    - "time_text_embed"
+    - "context_embedder"
+    - "norm_out"
+    - "^proj_out$"
+    - ".norm1.linear"
+    - ".norm.linear"
+    - ".norm1_context.linear"
+
+calib:
+  cache_dir: "models/flux-schnell/calibration_dataset/caches"
+  output_dir: "models/flux-schnell/calibration_dataset"
+  prompts: "models/flux-schnell/calib_prompts.yaml"
+  collect_script: "models/flux-schnell/collect_calibration_dataset.py"
+  num_files: 512  # 128 samples x 4 steps (schnell is 4-step)
