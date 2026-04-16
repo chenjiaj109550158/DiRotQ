@@ -28,7 +28,6 @@ from utils.quant_utils import (
     ActQuantWrapper, add_actquant, find_qlayers,
     rtn_quantize_weights, nvfp4_rtn_quantize_weights,
 )
-from dirotq_fused_unrotation import fuse_unrotation_into_weights
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 
 _ROOT = Path(__file__).parent
@@ -214,9 +213,9 @@ if __name__ == "__main__":
     if args.sign_flips:
         had_tag += "_optflips"
     # Skip tag encodes --skip-quant-layers in both the cache and output names.
-    # The cache must include it because fuse_unrotation_into_weights only
-    # absorbs U into W when bits<16 — skipped layers have unfused weights, so
-    # a cache built with a different skip config can't be reused.
+    # The cache must include it because weight quant only rotates+splits when
+    # bits<16 — skipped layers have unfused weights, so a cache built with a
+    # different skip config can't be reused.
     if args.skip_quant_layers:
         import hashlib
         key = ",".join(sorted(args.skip_quant_layers))
@@ -339,9 +338,6 @@ if __name__ == "__main__":
             print(f"Applying INT4 RTN weight quantization (group_size={w_groupsize})...")
             rtn_quantize_weights(pipe.transformer, bits=w_bits, groupsize=w_groupsize,
                                  sym=True, skip_names=skip_layers)
-
-        print("Fusing unrotation into weights...")
-        fuse_unrotation_into_weights(pipe.transformer)
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving quantized weights to cache: {cache_path}")

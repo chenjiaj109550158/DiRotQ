@@ -756,9 +756,189 @@ def find_qlayers(module, layers=None, name=""):
     return res
 
 
-def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None):
+# ---------------------------------------------------------------------------
+# Mixed-precision weight quantization (rotate → split → quantize-low → stitch)
+# ---------------------------------------------------------------------------
+#
+# Implements
+#
+#     y = Q(W_rot[:, :low]) @ Q(x_rot[:, :low])
+#       + W_rot[:, tail]    @ x_rot[:, tail]         (fp16 both sides)
+#
+# where W_rot = W @ U (hidden rotation) or W @ BlockDiag(U_ph) (per-head).
+# The tail columns are kept in fp16 and the fused weight sits in the rotated
+# basis, so the runtime forward (see dirotq_fused_unrotation._fused_forward)
+# skips the unrotation matmul entirely. `mod._unrot_fused = True` tells the
+# forward which layers are in the rotated basis.
+
+
+def _rotate_and_split_W(qlayer, W):
+    """Rotate W into the PCA basis and split columns into low/tail.
+
+    Returns (W_low, W_tail, stitch_fn, groupsize_override).
+
+    - For qlayer.rotation (hidden): W_rot = W @ U, contiguous tail.
+    - For qlayer.rotation_per_head: each head h has its own d×d rotation and
+      the last `high_bits_length` channels *within each head* are tail.
+      groupsize_override is forced to d_q (= head_dim - hlen) so every head
+      becomes exactly one weight RTN group (no scale contamination from
+      tail channels, and no mismatch with activation head layout).
+
+    stitch_fn(W_low_q) returns the full [out, in] weight in the original
+    contiguous layout — for per-head this interleaves quant and tail
+    channels back within each head so the activations (which stay in the
+    interleaved layout at runtime) line up column-by-column.
     """
-    Apply round-to-nearest (RTN) weight quantization to all ActQuantWrapper layers.
+    W_f32 = W.float()
+    out_f = W_f32.shape[0]
+
+    if qlayer.rotation is not None:
+        U = qlayer.rotation.to(W_f32.device, dtype=torch.float32)  # [D, D]
+        W_rot = W_f32 @ U                                           # [out, D]
+        hlen = int(qlayer.quantizer.high_bits_length)
+        if hlen > 0:
+            n_low = W_rot.shape[1] - hlen
+            W_low  = W_rot[:, :n_low].contiguous()
+            W_tail = W_rot[:, n_low:].contiguous()
+
+            def stitch(W_low_q):
+                return torch.cat([W_low_q.to(W_tail.device), W_tail], dim=1)
+        else:
+            W_low, W_tail = W_rot.contiguous(), None
+
+            def stitch(W_low_q):
+                return W_low_q
+
+        return W_low, W_tail, stitch, None
+
+    if getattr(qlayer, 'use_hadamard', False):
+        # Hadamard rotation: only the first `low_dim` input channels are
+        # FWHT-rotated; the last D-low_dim channels are an fp16 passthrough.
+        # Quantizer's high_bits_length must equal (D - low_dim); matched by
+        # configure_quantizers_by_name.
+        low_dim = int(qlayer.hadamard_low_dim)
+        D = W_f32.shape[1]
+
+        # Build the dense inverse Hadamard matrix; FWHT is self-inverse,
+        # so inv_H = diag(sign_flips) @ FWHT.
+        H_dense = torch.eye(low_dim, dtype=torch.float32, device=W_f32.device)
+        H_dense = fast_hadamard_transform(H_dense)            # rows = FWHT basis
+        if qlayer.hadamard_sign_flips is not None:
+            sf = qlayer.hadamard_sign_flips.to(W_f32.device, dtype=torch.float32)
+            H_dense = sf.unsqueeze(0) * H_dense                # diag(sf) @ FWHT
+
+        W_low = (W_f32[:, :low_dim] @ H_dense.T).contiguous()  # [out, low_dim]
+        if D > low_dim:
+            W_tail = W_f32[:, low_dim:].contiguous()           # [out, D-low_dim]
+
+            def stitch(W_low_q):
+                return torch.cat([W_low_q.to(W_tail.device), W_tail], dim=1)
+        else:
+            W_tail = None
+
+            def stitch(W_low_q):
+                return W_low_q
+
+        return W_low, W_tail, stitch, None
+
+    if qlayer.rotation_per_head is not None:
+        U_ph = qlayer.rotation_per_head.to(W_f32.device, dtype=torch.float32)  # [H, d, d]
+        H = int(qlayer.num_heads)
+        d = int(qlayer.head_dim)
+        W_3d = W_f32.reshape(out_f, H, d)
+        W_rot_3d = torch.einsum('ohd,hde->ohe', W_3d, U_ph)         # [out, H, d]
+
+        hlen = int(qlayer.quantizer.high_bits_length)  # tail within each head
+        d_q = d - hlen
+        if hlen > 0:
+            W_low_3d  = W_rot_3d[:, :, :d_q].contiguous()           # [out, H, d_q]
+            W_tail_3d = W_rot_3d[:, :, d_q:].contiguous()           # [out, H, hlen]
+            W_low  = W_low_3d.reshape(out_f, H * d_q)
+
+            def stitch(W_low_q):
+                W_low_q_3d = W_low_q.to(W_tail_3d.device).reshape(out_f, H, d_q)
+                return torch.cat([W_low_q_3d, W_tail_3d], dim=2).reshape(out_f, H * d)
+
+            W_tail_return = W_tail_3d.reshape(out_f, H * hlen)
+            return W_low, W_tail_return, stitch, d_q
+
+        W_low = W_rot_3d.reshape(out_f, H * d)
+
+        def stitch(W_low_q):
+            return W_low_q.reshape(out_f, H * d)
+
+        return W_low, None, stitch, d
+
+    # No rotation
+    def _identity(W_q):
+        return W_q
+    return W_f32.contiguous(), None, _identity, None
+
+
+def _quant_group_int(W, bits, groupsize, sym):
+    """Per-group symmetric/asymmetric INT RTN. W: [out, in] float32.
+
+    Handles partial last group by zero-padding to the next multiple of
+    groupsize, quantizing uniformly, then trimming back.
+    """
+    out_f, in_f = W.shape
+    if groupsize > 0 and groupsize < in_f:
+        pad = (-in_f) % groupsize
+        if pad > 0:
+            W = torch.nn.functional.pad(W, (0, pad))
+        Wg = W.reshape(out_f, -1, groupsize)
+        if sym:
+            maxq = 2 ** (bits - 1) - 1
+            scale = Wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / maxq
+            Wq = torch.clamp(torch.round(Wg / scale), -maxq - 1, maxq) * scale
+        else:
+            maxq = 2 ** bits - 1
+            wmin = torch.minimum(Wg.amin(dim=-1, keepdim=True), torch.zeros_like(Wg[:, :, :1]))
+            wmax = torch.maximum(Wg.amax(dim=-1, keepdim=True), torch.zeros_like(Wg[:, :, :1]))
+            scale = ((wmax - wmin) / maxq).clamp(min=1e-5)
+            zero  = torch.round(-wmin / scale)
+            Wq = scale * (torch.clamp(torch.round(Wg / scale) + zero, 0, maxq) - zero)
+        return Wq.reshape(out_f, -1)[:, :in_f]
+
+    # Per-channel (groupsize <= 0 or >= in_f)
+    if sym:
+        maxq = 2 ** (bits - 1) - 1
+        scale = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / maxq
+        return torch.clamp(torch.round(W / scale), -maxq - 1, maxq) * scale
+    maxq = 2 ** bits - 1
+    wmin = torch.minimum(W.amin(dim=1, keepdim=True), torch.zeros_like(W[:, :1]))
+    wmax = torch.maximum(W.amax(dim=1, keepdim=True), torch.zeros_like(W[:, :1]))
+    scale = ((wmax - wmin) / maxq).clamp(min=1e-5)
+    zero  = torch.round(-wmin / scale)
+    return scale * (torch.clamp(torch.round(W / scale) + zero, 0, maxq) - zero)
+
+
+def _quant_group_nvfp4(W, groupsize):
+    """Per-group NF4 codebook RTN. W: [out, in] float32.
+
+    Handles partial last group by zero-padding, same as _quant_group_int.
+    """
+    out_f, in_f = W.shape
+    if groupsize > 0 and groupsize < in_f:
+        pad = (-in_f) % groupsize
+        if pad > 0:
+            W = torch.nn.functional.pad(W, (0, pad))
+        Wg = W.reshape(out_f, -1, groupsize)
+        scale = Wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+        Wq = round_to_nf4_codebook(Wg / scale) * scale
+        return Wq.reshape(out_f, -1)[:, :in_f]
+    scale = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / NF4_MAX
+    return round_to_nf4_codebook(W / scale) * scale
+
+
+def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None):
+    """Apply RTN weight quantization to all ActQuantWrapper layers.
+
+    When a layer has a rotation and active activation quantization
+    (bits<16), the weight is rotated into the PCA basis, split at the
+    high-bits boundary, and only the low region is quantized — the tail
+    stays in fp16. The layer is then flagged `_unrot_fused=True` so the
+    patched forward knows the weight already lives in the rotated basis.
     """
     if skip_names is None:
         skip_names = []
@@ -768,43 +948,28 @@ def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None)
         if _match_skip(name, skip_names):
             continue
 
-        W = qlayer.module.weight.data.clone()
-        if groupsize > 0 and W.shape[1] % groupsize == 0:
-            # Per-group quantization
-            W_groups = W.reshape(W.shape[0], -1, groupsize)
-            if sym:
-                maxq = 2 ** (bits - 1) - 1
-                scale = W_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / maxq
-                W_q = torch.clamp(torch.round(W_groups / scale), -maxq - 1, maxq)
-                W_dq = (W_q * scale).reshape(W.shape)
-            else:
-                maxq = 2**bits - 1
-                wmin = W_groups.amin(dim=-1, keepdim=True)
-                wmax = W_groups.amax(dim=-1, keepdim=True)
-                wmin = torch.minimum(wmin, torch.zeros_like(wmin))
-                wmax = torch.maximum(wmax, torch.zeros_like(wmax))
-                scale = ((wmax - wmin) / maxq).clamp(min=1e-5)
-                zero = torch.round(-wmin / scale)
-                W_q = torch.clamp(torch.round(W_groups / scale) + zero, 0, maxq)
-                W_dq = (scale * (W_q - zero)).reshape(W.shape)
-            qlayer.module.weight.data = W_dq
+        W = qlayer.module.weight.data
+        orig_dtype = W.dtype
+        rotate = (qlayer.quantizer.bits < 16 and
+                  (qlayer.rotation is not None or
+                   qlayer.rotation_per_head is not None or
+                   getattr(qlayer, 'use_hadamard', False)))
+
+        if rotate:
+            W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)
+            gs = gs_over if gs_over is not None else groupsize
+            W_low_q = _quant_group_int(W_low, bits, gs, sym)
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
         else:
-            # Per-channel quantization fallback
-            quantizer = WeightQuantizer()
-            quantizer.configure(bits, perchannel=True, sym=sym)
-            quantizer.find_params(W)
-            qlayer.module.weight.data = quantizer.quantize(W)
+            W_q = _quant_group_int(W.float(), bits, groupsize, sym)
+            qlayer.module.weight.data = W_q.to(orig_dtype)
 
 
 def nvfp4_rtn_quantize_weights(model, groupsize=16, skip_names=None):
-    """
-    Apply NF4 (FP4 E2M1) RTN weight quantization to all ActQuantWrapper layers.
+    """Apply NF4 (FP4 E2M1) RTN weight quantization.
 
-    For each group of `groupsize` weights:
-      scale = max(|W_group|) / 6.0
-      W_norm = W / scale
-      W_q = round_to_nf4_codebook(W_norm)
-      W_dq = W_q * scale
+    Same rotate→split→quantize-low→stitch flow as rtn_quantize_weights.
     """
     if skip_names is None:
         skip_names = []
@@ -814,18 +979,19 @@ def nvfp4_rtn_quantize_weights(model, groupsize=16, skip_names=None):
         if _match_skip(name, skip_names):
             continue
 
-        W = qlayer.module.weight.data.clone().float()
-        if groupsize > 0 and W.shape[1] % groupsize == 0:
-            W_groups = W.reshape(W.shape[0], -1, groupsize)
-            scale = W_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / NF4_MAX
-            W_norm = W_groups / scale
-            W_q = round_to_nf4_codebook(W_norm)
-            W_dq = (W_q * scale).reshape(W.shape)
-            qlayer.module.weight.data = W_dq.to(qlayer.module.weight.dtype)
+        W = qlayer.module.weight.data
+        orig_dtype = W.dtype
+        rotate = (qlayer.quantizer.bits < 16 and
+                  (qlayer.rotation is not None or
+                   qlayer.rotation_per_head is not None or
+                   getattr(qlayer, 'use_hadamard', False)))
+
+        if rotate:
+            W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)
+            gs = gs_over if gs_over is not None else groupsize
+            W_low_q = _quant_group_nvfp4(W_low, gs)
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
         else:
-            # Per-channel fallback
-            scale = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / NF4_MAX
-            W_norm = W / scale
-            W_q = round_to_nf4_codebook(W_norm)
-            W_dq = W_q * scale
-            qlayer.module.weight.data = W_dq.to(qlayer.module.weight.dtype)
+            W_q = _quant_group_nvfp4(W.float(), groupsize)
+            qlayer.module.weight.data = W_q.to(orig_dtype)

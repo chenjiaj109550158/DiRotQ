@@ -7,10 +7,20 @@ Two-phase workflow:
                            Hessian matrices H = 2/n * X^T X.
   2. gptq_quantize_weights() — apply the GPTQ algorithm to each layer using its H.
 
-Correctness note: hooks capture x (pre-rotation input to ActQuantWrapper).
-Since the rotation U is orthogonal:
-  H_{x_unrot} ≈ U H_{x_rot} U^T = U (U^T H_x U) U^T = H_x
-so using H_x gives the same column-importance ordering as H_{x_unrot}.
+Rotated-basis GPTQ with weight-side high-precision tail
+-------------------------------------------------------
+Hessians are collected on pre-rotation inputs (X_pre). Before GPTQ runs on a
+layer, we fuse the rotation into both W and H:
+
+  Hidden PCA:   H_rot = U.T @ H_pre @ U
+  Per-head PCA: H_rot via einsum over BlockDiag(U_ph)
+  Hadamard:     H_rot_low = H_dense @ H_pre[:low,:low] @ H_dense.T
+
+GPTQ runs in the rotated basis on the low block only. The last
+`high_bits_length` columns (the fp16 tail) are sliced off and left exact.
+
+After GPTQ the layer weight already lives in the rotated basis; the layer
+is flagged `_unrot_fused=True` so the patched forward skips the unrotation.
 """
 
 import gc
@@ -21,7 +31,11 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from .quant_utils import ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX, _match_skip
+from .quant_utils import (
+    ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX, _match_skip,
+    _rotate_and_split_W, _quant_group_int, _quant_group_nvfp4,
+)
+from .hadamard_utils import fast_hadamard_transform
 
 
 class _NewlineStream:
@@ -247,21 +261,25 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
 
     # Pre-compute per-group scales from the original (unpermuted) W.
     # These scales are kept fixed throughout the GPTQ loop.
-    if groupsize > 0 and in_features % groupsize == 0:
-        W_g = W.reshape(out_features, in_features // groupsize, groupsize)
+    # Handles partial last group by zero-padding to next multiple of groupsize.
+    if groupsize > 0 and groupsize < in_features:
+        pad = (-in_features) % groupsize
+        W_for_scale = torch.nn.functional.pad(W, (0, pad)) if pad > 0 else W
+        n_groups = W_for_scale.shape[1] // groupsize
+        W_g = W_for_scale.reshape(out_features, n_groups, groupsize)
         if nvfp4:
             scales = W_g.abs().amax(dim=-1).clamp(min=1e-5) / NF4_MAX
             zeros  = torch.zeros_like(scales)
         elif sym:
-            scales = W_g.abs().amax(dim=-1).clamp(min=1e-5) / maxq  # [out, n_groups]
+            scales = W_g.abs().amax(dim=-1).clamp(min=1e-5) / maxq
             zeros  = torch.zeros_like(scales)
         else:
-            wmin   = torch.minimum(W_g.amin(dim=-1), torch.zeros(out_features, in_features // groupsize, device=device))
-            wmax   = torch.maximum(W_g.amax(dim=-1), torch.zeros(out_features, in_features // groupsize, device=device))
+            wmin   = torch.minimum(W_g.amin(dim=-1), torch.zeros(out_features, n_groups, device=device))
+            wmax   = torch.maximum(W_g.amax(dim=-1), torch.zeros(out_features, n_groups, device=device))
             scales = (wmax - wmin).clamp(min=1e-5) / maxq
             zeros  = torch.round(-wmin / scales)
     else:
-        # Per-channel fallback (rarely hit; guard)
+        # Per-channel (groupsize <= 0 or >= in_features)
         if nvfp4:
             scales = W.abs().amax(dim=1, keepdim=True).clamp(min=1e-5) / NF4_MAX
             zeros  = torch.zeros_like(scales)
@@ -273,7 +291,7 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
             wmax   = torch.maximum(W.amax(dim=1, keepdim=True), torch.zeros(out_features, 1, device=device))
             scales = (wmax - wmin).clamp(min=1e-5) / maxq
             zeros  = torch.round(-wmin / scales)
-        groupsize = in_features  # treat as single group
+        groupsize = in_features
 
     def _quant_col(w_col, orig_col_idx):
         """Quantize and dequantize one column vector [out_features]."""
@@ -360,27 +378,36 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                            skip_names=None,
                            damp_pct=0.01, block_size=128, num_inv_tries=250,
                            device="cuda", nvfp4=False):
-    """
-    Apply GPTQ weight quantization to all ActQuantWrapper layers.
+    """Apply GPTQ weight quantization to all ActQuantWrapper layers.
 
-    Falls back to RTN for any layer whose Hessian is missing or whose
-    Cholesky inversion fails.
+    For layers with hidden-dim rotation (bits<16): rotate H into the PCA
+    basis (H_rot = U^T H U), slice the top-left [n_low, n_low] block
+    matching the quantized column region, run GPTQ on W_rot[:, :n_low]
+    against H_rot[:n_low, :n_low], then stitch the fp16 tail back.
 
-    Args:
-        model:     Module containing ActQuantWrapper layers.
-        hessians:  dict[layer_name -> H tensor] from collect_hessians().
-        bits, groupsize, sym: quantization config.
-        skip_names: list of name substrings to skip.
-        damp_pct, block_size, num_inv_tries: GPTQ hyperparameters.
-        device:    Compute device for GPTQ arithmetic.
-        nvfp4:     If True, use NF4 codebook rounding instead of INT4.
+    For layers with per-head rotation: rotate H into per-head PCA basis
+    via einsum, extract the low-low block, run GPTQ.
+
+    For layers with Hadamard rotation: rotate H[:low,:low] into the FWHT
+    basis, run GPTQ on the rotated low block.
+
+    For layers with no rotation or bits=16 activations: plain GPTQ in
+    the original basis.
+
+    Any layer that undergoes rotate+split weight quant is flagged
+    `_unrot_fused=True` so the patched forward reads the rotated weight.
     """
     if skip_names is None:
         skip_names = []
 
     qlayers = find_qlayers(model, layers=[ActQuantWrapper])
     n_gptq = 0
-    n_rtn  = 0
+    n_rtn_fail = 0
+
+    def _rtn_low(W_low, gs):
+        if nvfp4:
+            return _quant_group_nvfp4(W_low, gs)
+        return _quant_group_int(W_low, bits, gs, sym)
 
     for name, qlayer in _log_tqdm(qlayers.items(), desc="GPTQ weight quantization"):
         if _match_skip(name, skip_names):
@@ -388,52 +415,185 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
 
         W = qlayer.module.weight.data
         orig_dtype = W.dtype
-        W_fp32 = W.float()
+        rotate_hidden = (qlayer.quantizer.bits < 16 and qlayer.rotation is not None)
+        rotate_head   = (qlayer.quantizer.bits < 16 and qlayer.rotation_per_head is not None)
+        rotate_had    = (qlayer.quantizer.bits < 16 and getattr(qlayer, 'use_hadamard', False))
 
-        H = hessians.get(name)
-        W_q = None
-        if H is not None:
-            W_q = _gptq_quantize_layer(
-                W_fp32, H, bits, groupsize, sym,
-                damp_pct, block_size, num_inv_tries, device,
-                nvfp4=nvfp4,
-            )
+        if rotate_hidden:
+            # Rotate W, slice off fp16 tail. Both W_low and W_tail live on W's
+            # current device; move W_low to `device` for GPTQ math.
+            W_low, W_tail, stitch, _ = _rotate_and_split_W(qlayer, W)
+            n_low = W_low.shape[1]
 
-        if W_q is not None:
+            H_raw = hessians.get(name)
+            W_low_q = None
+            if H_raw is not None:
+                # H_rot = U.T @ H_raw @ U, then top-left [n_low, n_low] block.
+                U = qlayer.rotation.to(device=device, dtype=torch.float32)  # [D, D]
+                H_dev = H_raw.to(device=device, dtype=torch.float32)
+                H_rot = U.T @ H_dev @ U
+                H_low = H_rot[:n_low, :n_low].contiguous()
+
+                # Rescale damping: the low block keeps small-eigenvalue PCA
+                # directions, so mean(diag(H_low)) << mean(diag(H_rot)).
+                # Scale damp_pct so absolute damping matches the full Hessian.
+                mean_full = H_rot.diagonal().mean().clamp(min=1e-12)
+                mean_low  = H_low.diagonal().mean().clamp(min=1e-12)
+                damp_scale = float(torch.clamp(mean_full / mean_low, min=1.0).item())
+
+                del H_rot, H_dev
+                W_low_q = _gptq_quantize_layer(
+                    W_low.to(device), H_low, bits, groupsize, sym,
+                    damp_pct * damp_scale, block_size, num_inv_tries, device,
+                    nvfp4=nvfp4,
+                )
+                del H_low
+
+            if W_low_q is None:
+                if H_raw is None:
+                    print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
+                else:
+                    print(f"  WARNING: GPTQ inversion failed for {name}, falling back to rotated RTN")
+                W_low_q = _rtn_low(W_low, groupsize)
+                n_rtn_fail += 1
+            else:
+                n_gptq += 1
+
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
+
+        elif rotate_head:
+            # Per-head rotation: rotate H into per-head PCA basis, extract
+            # the low-low block across all heads, run GPTQ.
+            #
+            # H_rot = BlockDiag(U_ph).T @ H_raw @ BlockDiag(U_ph)
+            # computed via einsum to avoid materializing the full BD matrix.
+            # Low block: first d_q cols of each head, grouped contiguously
+            # to match W_low layout from _rotate_and_split_W.
+            W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)
+            gs = gs_over if gs_over is not None else groupsize
+            n_low = W_low.shape[1]
+
+            H_raw = hessians.get(name)
+            W_low_q = None
+            if H_raw is not None:
+                U_ph = qlayer.rotation_per_head.to(device=device, dtype=torch.float32)
+                n_heads = int(qlayer.num_heads)
+                hd = int(qlayer.head_dim)
+                hlen = int(qlayer.quantizer.high_bits_length)
+                d_q = hd - hlen
+
+                H_dev = H_raw.to(device=device, dtype=torch.float32)
+                H_4d = H_dev.reshape(n_heads, hd, n_heads, hd)
+
+                # Step 1: contract k  →  temp[h1, i, h2, l]
+                temp = torch.einsum('aki, akbl -> aibl', U_ph, H_4d)
+                # Step 2: contract l  →  H_rot_4d[h1, i, h2, j]
+                H_rot_4d = torch.einsum('aibl, blj -> aibj', temp, U_ph)
+                del temp, H_4d, H_dev
+
+                # Extract low-low block: first d_q channels per head
+                H_rot_low = H_rot_4d[:, :d_q, :, :d_q].reshape(
+                    n_heads * d_q, n_heads * d_q
+                ).contiguous()
+
+                # Damping rescale (same logic as hidden rotation)
+                mean_full_ph = H_rot_4d.reshape(n_heads * hd, n_heads * hd).diagonal().mean().clamp(min=1e-12)
+                mean_low_ph  = H_rot_low.diagonal().mean().clamp(min=1e-12)
+                damp_scale_ph = float(torch.clamp(mean_full_ph / mean_low_ph, min=1.0).item())
+                del H_rot_4d
+
+                W_low_q = _gptq_quantize_layer(
+                    W_low.to(device), H_rot_low, bits, gs, sym,
+                    damp_pct * damp_scale_ph, block_size, num_inv_tries, device,
+                    nvfp4=nvfp4,
+                )
+                del H_rot_low
+
+            if W_low_q is None:
+                if H_raw is None:
+                    print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
+                else:
+                    print(f"  WARNING: GPTQ inversion failed for {name}, falling back to rotated RTN")
+                W_low_q = _rtn_low(W_low, gs)
+                n_rtn_fail += 1
+            else:
+                n_gptq += 1
+
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
+
+        elif rotate_had:
+            # Hadamard rotation: rotate H_raw[:low, :low] into FWHT basis,
+            # run GPTQ on the rotated low block.
+            #
+            # H_rot_low = H_dense @ H_raw[:low, :low] @ H_dense.T
+            # where H_dense = FWHT @ diag(sign_flips)  (same as weight rotation).
+            W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)
+            gs = gs_over if gs_over is not None else groupsize
+            n_low = W_low.shape[1]
+
+            H_raw = hessians.get(name)
+            W_low_q = None
+            if H_raw is not None:
+                low_dim = int(qlayer.hadamard_low_dim)
+                H_dense = torch.eye(low_dim, dtype=torch.float32, device=device)
+                H_dense = fast_hadamard_transform(H_dense)
+                if qlayer.hadamard_sign_flips is not None:
+                    sf = qlayer.hadamard_sign_flips.to(device, dtype=torch.float32)
+                    H_dense = sf.unsqueeze(0) * H_dense
+
+                H_raw_low = H_raw[:low_dim, :low_dim].to(device=device, dtype=torch.float32)
+                H_rot_low = (H_dense @ H_raw_low @ H_dense.T).contiguous()
+
+                # Damping rescale: Hadamard is orthogonal so trace is
+                # preserved, but the low block may still be ill-conditioned.
+                H_dev = H_raw.to(device=device, dtype=torch.float32)
+                mean_full_had = H_dev.diagonal().mean().clamp(min=1e-12)
+                mean_low_had  = H_rot_low.diagonal().mean().clamp(min=1e-12)
+                damp_scale_had = float(torch.clamp(mean_full_had / mean_low_had, min=1.0).item())
+                del H_raw_low, H_dense, H_dev
+
+                W_low_q = _gptq_quantize_layer(
+                    W_low.to(device), H_rot_low, bits, gs, sym,
+                    damp_pct * damp_scale_had, block_size, num_inv_tries, device,
+                    nvfp4=nvfp4,
+                )
+                del H_rot_low
+
+            if W_low_q is None:
+                if H_raw is None:
+                    print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
+                else:
+                    print(f"  WARNING: GPTQ inversion failed for {name}, falling back to rotated RTN")
+                W_low_q = _rtn_low(W_low, gs)
+                n_rtn_fail += 1
+            else:
+                n_gptq += 1
+
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
+
+        else:
+            # No rotation or bits=16: plain GPTQ in original basis.
+            W_fp32 = W.float()
+            H_raw = hessians.get(name)
+            W_q = None
+            if H_raw is not None:
+                W_q = _gptq_quantize_layer(
+                    W_fp32, H_raw, bits, groupsize, sym,
+                    damp_pct, block_size, num_inv_tries, device,
+                    nvfp4=nvfp4,
+                )
+            if W_q is None:
+                if H_raw is None:
+                    print(f"  WARNING: no Hessian for {name}, falling back to RTN")
+                else:
+                    print(f"  WARNING: GPTQ inversion failed for {name}, falling back to RTN")
+                W_q = _rtn_low(W_fp32, groupsize)
+                n_rtn_fail += 1
+            else:
+                n_gptq += 1
             qlayer.module.weight.data = W_q.to(orig_dtype)
-            n_gptq += 1
-        else:
-            # Fallback: RTN
-            if H is None:
-                print(f"  WARNING: no Hessian for {name}, falling back to RTN")
-            else:
-                print(f"  WARNING: GPTQ inversion failed for {name}, falling back to RTN")
-            _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype,
-                                nvfp4=nvfp4)
-            n_rtn += 1
 
-    print(f"GPTQ: {n_gptq} layers quantized with GPTQ, {n_rtn} with RTN fallback.")
-
-
-def _rtn_quantize_layer(qlayer, W_fp32, bits, groupsize, sym, orig_dtype,
-                         nvfp4=False):
-    """RTN quantization fallback for a single layer."""
-    out_features, in_features = W_fp32.shape
-    if groupsize > 0 and in_features % groupsize == 0:
-        W_g  = W_fp32.reshape(out_features, -1, groupsize)
-        if nvfp4:
-            scale = W_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / NF4_MAX
-            W_norm = W_g / scale
-            W_q = round_to_nf4_codebook(W_norm) * scale
-        else:
-            maxq = (2 ** (bits - 1) - 1) if sym else (2 ** bits - 1)
-            if sym:
-                scale = W_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5) / maxq
-                W_q   = torch.clamp(torch.round(W_g / scale), -(maxq + 1), maxq) * scale
-            else:
-                wmin  = torch.minimum(W_g.amin(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
-                wmax  = torch.maximum(W_g.amax(dim=-1, keepdim=True), torch.zeros_like(W_g[:, :, :1]))
-                scale = (wmax - wmin).clamp(min=1e-5) / maxq
-                zero  = torch.round(-wmin / scale)
-                W_q   = scale * (torch.clamp(torch.round(W_g / scale) + zero, 0, maxq) - zero)
-        qlayer.module.weight.data = W_q.reshape(out_features, in_features).to(orig_dtype)
+    print(f"GPTQ: {n_gptq} GPTQ, {n_rtn_fail} RTN fallback (Cholesky failure).")
