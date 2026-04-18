@@ -77,4 +77,4 @@ calib:
   output_dir: "models/flux-schnell/calibration_dataset"
   prompts: "models/flux-schnell/calib_prompts.yaml"
   collect_script: "models/flux-schnell/collect_calibration_dataset.py"
-  num_files: 512  # 128 samples x 4 steps (schnell is 4-step)
+  num_files: 2560  # 128 samples x 20 calib steps (inference uses 4, but more steps = richer Hessian)

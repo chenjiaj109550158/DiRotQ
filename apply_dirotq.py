@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--a-bits", type=int, default=None,
                         help="Override activation bits (default: from config)")
     parser.add_argument("--a-groupsize", type=int, default=None,
-                        help="Override activation groupsize (default: -1 per-token for INT4, 16 for NF4)")
+                        help="Override activation groupsize (default: 64 for INT4, 16 for NF4)")
     parser.add_argument("--hadamard-layers", nargs="*", default=None,
                         help="Layer patterns to use Hadamard rotation instead of PCA "
                              "(e.g. --hadamard-layers ff.net.2)")
@@ -150,7 +150,7 @@ if __name__ == "__main__":
                         help="Layer name patterns to skip activation quantization (bits=16). "
                              "E.g. --skip-quant-layers to_out")
     parser.add_argument("--gptq-calib-files", type=int, default=5120) # 128 samples x 20 steps
-    parser.add_argument("--gptq-batch-size", type=int, default=1)
+    parser.add_argument("--gptq-batch-size", type=int, default=8)
     parser.add_argument("--gptq-block-size", type=int, default=128)
     parser.add_argument("--gptq-damp-pct", type=float, default=0.01)
     parser.add_argument("--batch-size", type=int, default=1,
@@ -289,6 +289,22 @@ if __name__ == "__main__":
     if cache_path.exists():
         print(f"Loading quantized weights from cache: {cache_path}")
         state = torch.load(cache_path, map_location="cpu", weights_only=False)
+        model_keys = set(pipe.transformer.state_dict().keys())
+        cache_keys = set(state.keys())
+        missing = model_keys - cache_keys
+        unexpected = cache_keys - model_keys
+        if missing:
+            print(f"WARNING: {len(missing)} keys in model but not in cache (will keep init weights):")
+            for k in sorted(missing)[:10]:
+                print(f"  {k}")
+            if len(missing) > 10:
+                print(f"  ... and {len(missing) - 10} more")
+        if unexpected:
+            print(f"WARNING: {len(unexpected)} keys in cache but not in model (stale cache?):")
+            for k in sorted(unexpected)[:10]:
+                print(f"  {k}")
+            if len(unexpected) > 10:
+                print(f"  ... and {len(unexpected) - 10} more")
         pipe.transformer.load_state_dict(state, strict=False)
         for _, mod in pipe.transformer.named_modules():
             if isinstance(mod, ActQuantWrapper) and (mod.rotation is not None or mod.rotation_per_head is not None or getattr(mod, 'use_hadamard', False)):

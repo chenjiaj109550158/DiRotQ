@@ -9,7 +9,7 @@ deepcompressor/app/diffusion/dataset/collect/calib.py.
 
 Output structure:
   <output_dir>/
-    caches/   {prompt_id}-{repeat}-{step:05d}-{guidance}.pt   (~512 files)
+    caches/   {prompt_id}-{repeat}-{step:05d}-{guidance}.pt   (~2560 files)
     samples/  {prompt_id}-{repeat}.png                         (128 files)
 
 Each .pt cache file contains:
@@ -250,7 +250,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples",         type=int,   default=128)
     parser.add_argument("--prompt-id",           type=str,   default=None,
                         help="Regenerate only this prompt ID (e.g. '0960')")
-    parser.add_argument("--num-steps",           type=int,   default=4)
+    parser.add_argument("--num-steps",           type=int,   default=20,
+                        help="Denoising steps for calibration (more steps = richer "
+                             "Hessian coverage; inference still uses 4)")
     parser.add_argument("--guidance-scale",      type=float, default=0.0)
     parser.add_argument("--batch-size",          type=int,   default=1)
     parser.add_argument("--image-size",          type=int,   default=1024)
@@ -285,7 +287,7 @@ if __name__ == "__main__":
         max_sequence_length=args.max_sequence_length,
     )
 
-    # At guidance_scale=0 the FLUX scheduler only runs one branch per step.
+    # At guidance_scale=0 the FLUX scheduler runs one branch per step.
     expected = len(prompts) * args.num_steps * 1
     actual   = len(list(Path(args.output, "caches").glob("*.pt")))
     print(f"Done. Saved {actual}/{expected} cache files to {args.output}/caches/")

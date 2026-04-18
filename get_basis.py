@@ -85,6 +85,8 @@ if __name__ == "__main__":
                         help="Override basis output path from config")
     parser.add_argument("--cache-dir", default=None,
                         help="Override calibration cache dir from config")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Forward-pass batch size for basis collection (default: model-specific)")
     args = parser.parse_args()
 
     cfg = load_model_config(args.model)
@@ -111,15 +113,22 @@ if __name__ == "__main__":
         module_name, cls_name = pipeline_cls_path.rsplit(".", 1)
         PipelineClass = getattr(importlib.import_module(module_name), cls_name)
 
-        print(f"Loading {cfg['model_id']} ({pipeline_cls_path}) in float32...")
+        _dtype_map = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                      "fp16": torch.float16,  "float16":  torch.float16,
+                      "fp32": torch.float32,  "float32":  torch.float32}
+        torch_dtype = _dtype_map.get(cfg.get("dtype", "float32"), torch.float32)
+        print(f"Loading {cfg['model_id']} ({pipeline_cls_path}) in {torch_dtype}...")
         pipe = PipelineClass.from_pretrained(
-            cfg["model_id"], torch_dtype=torch.float32, use_safetensors=True
+            cfg["model_id"], torch_dtype=torch_dtype, use_safetensors=True
         )
         pipe = pipe.to("cuda")
         pipe.transformer.eval()
         pipe.transformer.requires_grad_(False)
 
-        basis_dict = collect_basis(pipe.transformer, cache_files, cfg)
+        collect_kwargs = {}
+        if args.batch_size is not None:
+            collect_kwargs["batch_size"] = args.batch_size
+        basis_dict = collect_basis(pipe.transformer, cache_files, cfg, **collect_kwargs)
 
         del pipe
         torch.cuda.empty_cache()

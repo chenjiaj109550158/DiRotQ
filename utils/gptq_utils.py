@@ -24,8 +24,9 @@ is flagged `_unrot_fused=True` so the patched forward skips the unrotation.
 """
 
 import gc
-import math
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -129,8 +130,20 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     layer_n = {name: 0 for name in qlayers}
 
     # Register hooks on ActQuantWrapper to capture input x.
-    # GPU layers accumulate in-place via addmm_; CPU layers compute the
-    # partial on GPU, transfer to CPU, add.
+    # GPU layers accumulate in-place via addmm_ — no PCIe traffic.
+    # CPU layers: partial XTX stays on GPU inside the hook and is flushed to
+    # CPU after each full forward pass (_flush_pending), so the forward pass
+    # is never stalled by synchronous GPU→CPU memcpy.
+    _pending = []  # list of (layer_name, gpu_partial) for CPU layers
+
+    def _flush_pending():
+        if not _pending:
+            return
+        torch.cuda.synchronize()
+        for n, p_gpu in _pending:
+            layer_H[n] += p_gpu.cpu()
+        _pending.clear()
+
     hooks = []
     for name, ql in qlayers.items():
         in_features = ql.module.in_features
@@ -145,7 +158,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
                 def _hook(module, inp, out):
                     x = inp[0].detach().float().reshape(-1, d)
                     layer_n[n] += x.shape[0]
-                    layer_H[n] += (x.T @ x).cpu()
+                    _pending.append((n, x.T @ x))  # stays on GPU, flushed after pass
             return _hook
 
         hooks.append(ql.register_forward_hook(
@@ -183,27 +196,54 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
                 stacked_kwargs[k] = vals[0]  # scalar/non-tensor: use first
         with torch.no_grad():
             transformer(latents, **stacked_kwargs)
+        _flush_pending()  # drain deferred CPU transfers without stalling forward pass
         batch_args.clear()
         for k in batch_kwargs_lists:
             batch_kwargs_lists[k].clear()
 
-    for f in _log_tqdm(calib_files, desc="Calibration forward passes"):
-        data = torch.load(f, map_location="cpu", weights_only=False)
-        batch_args.append([a.to(model_dtype) if a.is_floating_point() else a
-                           for a in data["input_args"]])
-        for k, v in data["input_kwargs"].items():
-            if k not in batch_kwargs_lists:
-                batch_kwargs_lists[k] = []
-            if isinstance(v, torch.Tensor):
-                batch_kwargs_lists[k].append(
-                    v.to(model_dtype) if v.is_floating_point() else v
-                )
-            else:
-                batch_kwargs_lists[k].append(v)
-        if len(batch_args) >= batch_size:
-            _run_batch()
+    # Group files into batches upfront so each thread-pool task loads a whole
+    # batch. tqdm then counts BATCHES not individual files.
+    file_batches = [calib_files[i:i + batch_size]
+                    for i in range(0, len(calib_files), batch_size)]
+    num_batches  = len(file_batches)
 
-    _run_batch()  # flush remaining
+    # Prefetch 2 full batches ahead so NFS I/O overlaps GPU compute.
+    PREFETCH = 2
+
+    def _load_batch(files):
+        return [torch.load(f, map_location="cpu", weights_only=False) for f in files]
+
+    def _enqueue_batch(batch_data):
+        for data in batch_data:
+            batch_args.append([a.to(model_dtype) if a.is_floating_point() else a
+                               for a in data["input_args"]])
+            for k, v in data["input_kwargs"].items():
+                if k not in batch_kwargs_lists:
+                    batch_kwargs_lists[k] = []
+                if isinstance(v, torch.Tensor):
+                    batch_kwargs_lists[k].append(
+                        v.to(model_dtype) if v.is_floating_point() else v
+                    )
+                else:
+                    batch_kwargs_lists[k].append(v)
+
+    with ThreadPoolExecutor(max_workers=PREFETCH) as pool:
+        io_queue  = deque()
+        batch_iter = iter(file_batches)
+
+        for _ in range(PREFETCH):
+            try:
+                io_queue.append(pool.submit(_load_batch, next(batch_iter)))
+            except StopIteration:
+                break
+
+        for _ in _log_tqdm(range(num_batches), desc="Calibration forward passes"):
+            try:
+                io_queue.append(pool.submit(_load_batch, next(batch_iter)))
+            except StopIteration:
+                pass
+            _enqueue_batch(io_queue.popleft().result())
+            _run_batch()  # always a full batch (or final partial)
 
     for h in hooks:
         h.remove()
@@ -327,13 +367,25 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
     damp_val    = damp_pct * H_diag.mean()
     H_diag     += damp_val
 
-    # Cholesky inversion (with retry on numerical failure)
+    # Cholesky inversion (with retry on numerical failure OR near-zero diag)
+    #
+    # A "successful" Cholesky can still leave near-zero diagonals in H_inv
+    # (the upper Cholesky factor of H^{-1}).  Those tiny d values cause
+    # err_col = (w - w_q) / d  to explode during error propagation, silently
+    # producing NaN weights.  Detect this and add more damping before retrying.
     H_inv = None
     for _ in range(num_inv_tries):
         try:
             L     = torch.linalg.cholesky(H)
             H_inv = torch.cholesky_inverse(L)
             H_inv = torch.linalg.cholesky(H_inv, upper=True)
+            # Reject if any diagonal is < 1e-4 × mean — those columns would
+            # produce catastrophic error propagation (err / d -> Inf -> NaN).
+            diag = H_inv.diagonal()
+            if diag.min() < 1e-4 * diag.mean():
+                H_inv = None          # force retry
+                H_diag += damp_pct * H_diag.mean()
+                continue
             break
         except RuntimeError:
             H_diag += (damp_pct * 0.1) * H_diag.mean()

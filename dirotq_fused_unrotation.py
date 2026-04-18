@@ -132,15 +132,7 @@ def _fused_forward(self, x):
             self.quantizer.find_params(x)
             x = self.quantizer(x).to(x_dtype)
 
-    # Linear forward (uses fused weight when _unrot_fused=True)
-    x = self.module(x).to(x_dtype)
-
-    # Output quantization (unused in current DiRotQ setup, kept for completeness)
-    if self.out_quantizer.bits < 16:
-        self.out_quantizer.find_params(x)
-        x = self.out_quantizer(x).to(x_dtype)
-
-    return x
+    return self.module(x).to(x_dtype)
 
 
 def patch_forward():

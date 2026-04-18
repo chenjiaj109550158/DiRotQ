@@ -127,16 +127,15 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     """Configure mixed-precision activation quantizers by PixArt-Sigma layer type.
 
     When nvfp4=False (INT4):
-      - QKV and FFN up-proj: groupsize=-1 (per-token), asymmetric
+      - QKV and FFN up-proj: groupsize=64, asymmetric
       - attn to_out: groupsize=head_dim (per head per token), asymmetric
-      - FFN down-proj: groupsize=-1, no mixed-precision
+      - FFN down-proj: groupsize=64, no mixed-precision
 
     When nvfp4=True (NF4):
       - All layers: groupsize=16 (except to_out: groupsize=72/head_dim), symmetric
       - NF4 codebook quantization
     """
     a_bits = cfg["quantization"]["a_bits"]
-    high_bits = cfg["quantization"]["high_bits"]
     head_dim = cfg["dims"]["head"]
 
     if nvfp4:
@@ -145,7 +144,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
         qdt = "nvfp4"
     else:
-        a_gs = -1
+        a_gs = 64
         a_gs_out = head_dim
         qdt = "int"
 
@@ -154,24 +153,29 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         # Keep to_out at per-head groupsize — PCA rotation is per-head,
         # so groups must not cross head boundaries
         a_gs_out = head_dim
-        # Round up high_bits_length to nearest multiple of groupsize
-        # so 4-bit portion is divisible by groupsize
-        if a_groupsize > 0:
-            def _ceil_to_gs(high, gs):
-                if high == 0:
-                    return 0
-                return ((high + gs - 1) // gs) * gs
-            high_len_hidden = _ceil_to_gs(high_len_hidden, a_groupsize)
-            high_len_head = _ceil_to_gs(high_len_head, a_gs_out)
-            high_len_down = _ceil_to_gs(high_len_down, a_groupsize)
-            print(f"Adjusted high_bits_length for groupsize={a_groupsize}: "
-                  f"hidden={high_len_hidden} ({high_len_hidden}/{cfg['dims']['hidden']}="
-                  f"{high_len_hidden/cfg['dims']['hidden']*100:.1f}%), "
-                  f"head={high_len_head} (to_out gs={a_gs_out}, "
-                  f"{high_len_head}/{cfg['dims']['hidden']}="
-                  f"{high_len_head/cfg['dims']['hidden']*100:.1f}%), "
-                  f"down={high_len_down} ({high_len_down}/{cfg['dims']['intermediate']}="
-                  f"{high_len_down/cfg['dims']['intermediate']*100:.1f}%)")
+
+    # Align high_bits_length so the 4-bit region is divisible by groupsize.
+    # Only hidden and down are aligned — per-head layers (to_out) always use
+    # d_q = head_dim - high_len_head as their effective groupsize in the fused
+    # forward, so aligning high_len_head to a_gs_out would wrongly zero out the
+    # entire 4-bit region (e.g. _ceil_to_gs(9, 72) = 72 → d_q = 0).
+    if a_gs > 0:
+        def _ceil_to_gs(high, gs):
+            if high == 0:
+                return 0
+            return ((high + gs - 1) // gs) * gs
+        high_len_hidden_aligned = _ceil_to_gs(high_len_hidden, a_gs)
+        high_len_down_aligned   = _ceil_to_gs(high_len_down,   a_gs)
+        if high_len_hidden_aligned != high_len_hidden or high_len_down_aligned != high_len_down:
+            print(f"Aligned high_bits_length to gs={a_gs}: "
+                  f"hidden {high_len_hidden}->{high_len_hidden_aligned} "
+                  f"({high_len_hidden_aligned}/{cfg['dims']['hidden']}="
+                  f"{high_len_hidden_aligned/cfg['dims']['hidden']*100:.1f}%), "
+                  f"down {high_len_down}->{high_len_down_aligned} "
+                  f"({high_len_down_aligned}/{cfg['dims']['intermediate']}="
+                  f"{high_len_down_aligned/cfg['dims']['intermediate']*100:.1f}%)")
+        high_len_hidden = high_len_hidden_aligned
+        high_len_down   = high_len_down_aligned
 
     if hadamard_layers is None:
         hadamard_layers = []
@@ -199,22 +203,19 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         if is_self_attn_qkv:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=high_len_hidden, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
             )
         elif is_attn_out:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
-                high_bits_length=high_len_head, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_head,
                 quant_dtype=qdt,
             )
         elif is_ffn_up:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=high_len_hidden, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
             )
         elif is_ffn_down:
@@ -228,14 +229,13 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 had_high_len = high_len_down
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=had_high_len, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=had_high_len,
                 quant_dtype=qdt,
             )
         else:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=0, high_bits=high_bits,
+                high_bits_length=0,
                 quant_dtype=qdt,
             )
 

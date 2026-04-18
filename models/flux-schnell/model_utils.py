@@ -231,9 +231,8 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         proj_out.linears.0 — attn-out half, per-head groupsize + high_len_head slice
         proj_out.linears.1 — mlp half, dense groupsize + high_len_down slice
     """
-    a_bits    = cfg["quantization"]["a_bits"]
-    high_bits = cfg["quantization"]["high_bits"]
-    head_dim  = cfg["dims"]["head"]
+    a_bits   = cfg["quantization"]["a_bits"]
+    head_dim = cfg["dims"]["head"]
 
     if nvfp4:
         nvfp4_cfg = cfg.get("nvfp4", {})
@@ -241,19 +240,28 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
         qdt      = "nvfp4"
     else:
-        a_gs     = -1
+        a_gs     = 64
         a_gs_out = head_dim
         qdt      = "int"
 
     if a_groupsize is not None:
         a_gs     = a_groupsize
         a_gs_out = head_dim
-        if a_groupsize > 0:
-            def _ceil(high, gs):
-                return 0 if high == 0 else ((high + gs - 1) // gs) * gs
-            high_len_hidden = _ceil(high_len_hidden, a_groupsize)
-            high_len_head   = _ceil(high_len_head,   a_gs_out)
-            high_len_down   = _ceil(high_len_down,   a_groupsize)
+
+    # Align hidden and down so the 4-bit region is divisible by groupsize.
+    # high_len_head is NOT aligned — per-head layers always use d_q as their
+    # effective groupsize, so aligning to a_gs_out would zero out d_q entirely.
+    if a_gs > 0:
+        def _ceil(high, gs):
+            return 0 if high == 0 else ((high + gs - 1) // gs) * gs
+        high_len_hidden_aligned = _ceil(high_len_hidden, a_gs)
+        high_len_down_aligned   = _ceil(high_len_down,   a_gs)
+        if high_len_hidden_aligned != high_len_hidden or high_len_down_aligned != high_len_down:
+            print(f"Aligned high_bits_length to gs={a_gs}: "
+                  f"hidden {high_len_hidden}->{high_len_hidden_aligned}, "
+                  f"down {high_len_down}->{high_len_down_aligned}")
+        high_len_hidden = high_len_hidden_aligned
+        high_len_down   = high_len_down_aligned
 
     if skip_quant_layers is None:
         skip_quant_layers = []
@@ -291,8 +299,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         if is_attn_qkv or is_double_ff_up or is_single_mlp_up:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=high_len_hidden, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
             )
         elif is_attn_out or is_single_proj_out_attn:
@@ -300,8 +307,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
             # per-head groupsize + high_len_head slice as double-block to_out.
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
-                high_bits_length=high_len_head, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_head,
                 quant_dtype=qdt,
             )
         elif is_double_ff_down or is_single_proj_out_mlp:
@@ -309,14 +315,13 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
             # as double-block ff.net.2.
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=high_len_down, high_bits=high_bits,
-                low_bits_length=0, low_bits=high_bits,
+                high_bits_length=high_len_down,
                 quant_dtype=qdt,
             )
         else:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=0, high_bits=high_bits,
+                high_bits_length=0,
                 quant_dtype=qdt,
             )
 

@@ -2,7 +2,6 @@
 Quantization utilities for DiRotQ.
 """
 
-import math
 import torch
 import torch.nn as nn
 
@@ -60,38 +59,10 @@ def get_minq_maxq(bits, sym):
     return minq, maxq
 
 
-def asym_quant(x, scale, zero, maxq):
-    scale = scale.to(x.device)
-    zero = zero.to(x.device)
-    q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
-    return q, scale, zero
-
-
-def asym_dequant(q, scale, zero):
-    return scale * (q - zero)
-
-
-def asym_quant_dequant(x, scale, zero, maxq):
-    return asym_dequant(*asym_quant(x, scale, zero, maxq))
-
-
-def sym_quant(x, scale, maxq):
-    scale = scale.to(x.device)
-    q = torch.clamp(torch.round(x / scale), -(maxq + 1), maxq)
-    return q, scale
-
-
-def sym_dequant(q, scale):
-    return scale * q
-
-
-def sym_quant_dequant(x, scale, maxq):
-    return sym_dequant(*sym_quant(x, scale, maxq))
-
 
 class STEQuantize(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, scale, maxq, stoch=False):
+    def forward(ctx, x, scale, maxq):
         scale = scale.to(x.device)
         q = torch.clamp(torch.round(x / scale), -(maxq + 1), maxq)
         return scale * q
@@ -103,7 +74,7 @@ class STEQuantize(torch.autograd.Function):
 
 class AsymSTEQuantize(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, scale, zero, maxq, stoch=False):
+    def forward(ctx, x, scale, zero, maxq):
         scale = scale.to(x.device)
         zero = zero.to(x.device)
         q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
@@ -111,13 +82,14 @@ class AsymSTEQuantize(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None, None, None
+        return grad_output, None, None, None
 
 
 class ActQuantizer(nn.Module):
     """
-    Per-token activation quantizer with mixed-precision support.
-    Splits activations into 3 zones: low-bit, mid-bit (main), high-bit.
+    Activation quantizer with mixed-precision support.
+    Splits activations into 2 zones: quantized (main, e.g., 4-bit) 
+    and unquantized passthrough (tail, e.g., bf16/fp16).
     """
 
     def __init__(self):
@@ -126,28 +98,16 @@ class ActQuantizer(nn.Module):
         self.register_buffer("scale", torch.zeros(1))
         self.register_buffer("zero", torch.zeros(1))
 
-        self.register_buffer("maxq_h", torch.tensor(0))
-        self.register_buffer("scale_h", torch.zeros(1))
-        self.register_buffer("zero_h", torch.zeros(1))
-
-        self.register_buffer("maxq_l", torch.tensor(0))
-        self.register_buffer("scale_l", torch.zeros(1))
-        self.register_buffer("zero_l", torch.zeros(1))
-
         self.bits = 16
-        self.high_bits = 16
-        self.low_bits = 16
         self.high_bits_length = 0
-        self.low_bits_length = 0
+        self.groupsize = -1
+        self.sym = False
+        self.clip_ratio = 1.0
         self.quant_dtype = "int"  # "int" or "nvfp4"
 
     def free(self):
         self.zero = None
         self.scale = None
-        self.zero_h = None
-        self.scale_h = None
-        self.zero_l = None
-        self.scale_l = None
 
     def forward(self, x):
         x_dtype = x.dtype
@@ -155,117 +115,69 @@ class ActQuantizer(nn.Module):
         if self.bits == 16:
             return x
 
-        # NF4 with groupsize: mixed-precision split is across GROUPS, not within
+        # NF4 with groupsize: fp16/bf16 split first, then group only the 4-bit region
         if self.quant_dtype == "nvfp4" and self.groupsize > 0:
             return self._forward_nvfp4_grouped(x, x_dtype)
 
-        # Two strategies for groupsize > 0:
-        #   A) high_bits_length <= groupsize: group first, split within each group.
-        #   B) high_bits_length > groupsize: split on full dim first, group the 4-bit part.
-        #   When groupsize <= 0: no grouping, just split on full dim (per-token).
-        if self.groupsize > 0 and self.high_bits_length <= self.groupsize:
-            # Strategy A: group → split within group
-            init_shape = x.shape
-            x = x.reshape(
-                x.shape[0], x.shape[1], x.shape[2] // self.groupsize, self.groupsize
-            )
-
-            low_dim = self.low_bits_length
-            high_dim = x.shape[-1] - self.high_bits_length
-            x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
-
-            if self.sym:
-                x_m = STEQuantize.apply(x_m, self.scale, self.maxq)
-            else:
-                x_m = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
-
-            parts = []
-            if self.low_bits_length != 0:
-                if self.low_bits < 16:
-                    x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l) if self.sym else \
-                          AsymSTEQuantize.apply(x_l, self.scale_l, self.zero_l, self.maxq_l)
-                parts.append(x_l)
-            parts.append(x_m)
-            if self.high_bits_length != 0:
-                if self.high_bits < 16:
-                    x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h) if self.sym else \
-                          AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
-                parts.append(x_h)
-
-            if len(parts) == 1:
-                x = parts[0].to(x_dtype)
-            else:
-                x = torch.cat(parts, dim=-1).to(x_dtype)
-            return x.reshape(init_shape)
-
-        # Strategy B (groupsize > 0, high > groupsize) or per-token (groupsize <= 0):
-        # Split mixed-precision on full channel dim, then group the 4-bit portion.
-        low_dim = self.low_bits_length
-        high_dim = x.shape[-1] - self.high_bits_length
-        x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
+        # Split: quantized region first, bf16/fp16 passthrough tail.
+        # Pad quantized region to next multiple of groupsize if needed, quantize, trim.
+        q_len = x.shape[-1] - self.high_bits_length
+        x_l = x[..., :q_len] # quantized to low prec, e.g., 4-bit
+        x_h = x[..., q_len:] # bf16/fp16 passthrough — never quantized
 
         if self.groupsize > 0:
-            init_shape_m = x_m.shape
-            x_m = x_m.reshape(
-                x_m.shape[0], x_m.shape[1], x_m.shape[2] // self.groupsize, self.groupsize
-            )
+            pad = (-q_len) % self.groupsize
+            if pad > 0:
+                x_l = torch.nn.functional.pad(x_l, (0, pad))
+            x_l = x_l.reshape(x_l.shape[0], x_l.shape[1], -1, self.groupsize)
 
         if self.quant_dtype == "nvfp4":
-            x_m = NF4STEQuantize.apply(x_m, self.scale)
+            x_l = NF4STEQuantize.apply(x_l, self.scale)
         elif self.sym:
-            x_m = STEQuantize.apply(x_m, self.scale, self.maxq)
+            x_l = STEQuantize.apply(x_l, self.scale, self.maxq)
         else:
-            x_m = AsymSTEQuantize.apply(x_m, self.scale, self.zero, self.maxq)
+            x_l = AsymSTEQuantize.apply(x_l, self.scale, self.zero, self.maxq)
 
         if self.groupsize > 0:
-            x_m = x_m.reshape(init_shape_m)
+            x_l = x_l.reshape(x_l.shape[0], x_l.shape[1], -1)[..., :q_len]
 
-        parts = []
-        if self.low_bits_length != 0:
-            if self.low_bits < 16:
-                x_l = STEQuantize.apply(x_l, self.scale_l, self.maxq_l) if self.sym else \
-                      AsymSTEQuantize.apply(x_l, self.scale_l, self.zero_l, self.maxq_l)
-            parts.append(x_l)
-        parts.append(x_m)
-        if self.high_bits_length != 0:
-            if self.high_bits < 16:
-                x_h = STEQuantize.apply(x_h, self.scale_h, self.maxq_h) if self.sym else \
-                      AsymSTEQuantize.apply(x_h, self.scale_h, self.zero_h, self.maxq_h)
-            parts.append(x_h)
-
-        if len(parts) == 1:
-            x = parts[0].to(x_dtype)
-        else:
-            x = torch.cat(parts, dim=-1).to(x_dtype)
-
-        return x
+        if self.high_bits_length == 0:
+            return x_l.to(x_dtype)
+        return torch.cat([x_l, x_h], dim=-1).to(x_dtype)
 
     def _forward_nvfp4_grouped(self, x, x_dtype):
-        """NF4 quantization with groupsize: mixed-precision split across groups."""
+        """NF4 quantization with groupsize.
+
+        Grouping applies only to the quantized region. The fp16/bf16 passthrough
+        (last high_bits_length channels) needs no grouping — there is no
+        quantization there, hence no scale to share.
+
+        The quantized region is padded to the next multiple of groupsize if
+        needed, quantized group-wise, then trimmed back to original length.
+        """
         init_shape = x.shape
         gs = self.groupsize
-        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] // gs, gs)
-        n_groups = x.shape[-2]
-        n_high = self.high_bits_length // gs if self.high_bits_length > 0 else 0
+        hlen = self.high_bits_length
+        q_len = init_shape[-1] - hlen  # channels to NF4-quantize
 
-        if n_high > 0 and n_high < n_groups:
-            # Split groups: first (n_groups - n_high) are NF4, last n_high are 16-bit
-            x_m = x[..., :n_groups - n_high, :]  # NF4 groups
-            x_h = x[..., n_groups - n_high:, :]  # high-precision groups (16-bit)
+        x_q = x[..., :q_len]               # 4-bit nvfp4 region
+        x_h = x[..., q_len:] if hlen > 0 else None  # bf16/ fp16 passthrough
 
-            # NF4 quantize the main groups
-            scale = torch.amax(x_m.abs(), dim=-1, keepdim=True) * self.clip_ratio
-            scale = (scale / NF4_MAX).clamp(min=1e-8)
-            x_m_q = round_to_nf4_codebook(x_m / scale) * scale
+        # Pad to next multiple of gs, quantize, trim
+        pad = (-q_len) % gs
+        if pad > 0:
+            x_q = torch.nn.functional.pad(x_q, (0, pad))
 
-            x = torch.cat([x_m_q, x_h], dim=-2).to(x_dtype)
-        else:
-            # All groups quantized with NF4
-            scale = torch.amax(x.abs(), dim=-1, keepdim=True) * self.clip_ratio
-            scale = (scale / NF4_MAX).clamp(min=1e-8)
-            x = (round_to_nf4_codebook(x / scale) * scale).to(x_dtype)
+        x_g = x_q.reshape(x_q.shape[0], x_q.shape[1], -1, gs)
+        scale = torch.amax(x_g.abs(), dim=-1, keepdim=True) * self.clip_ratio
+        scale = (scale / NF4_MAX).clamp(min=1e-5)
+        x_g_q = round_to_nf4_codebook(x_g / scale) * scale
 
-        return x.reshape(init_shape)
+        x_q_out = x_g_q.reshape(x_q.shape[0], x_q.shape[1], -1)[..., :q_len]
+
+        if x_h is not None:
+            return torch.cat([x_q_out, x_h], dim=-1).to(x_dtype)
+        return x_q_out.to(x_dtype)
 
     def configure(
         self,
@@ -274,9 +186,6 @@ class ActQuantizer(nn.Module):
         sym=False,
         clip_ratio=1.0,
         high_bits_length=0,
-        high_bits=16,
-        low_bits_length=0,
-        low_bits=16,
         quant_dtype="int",
     ):
         self.quant_dtype = quant_dtype
@@ -287,26 +196,11 @@ class ActQuantizer(nn.Module):
         self.groupsize = groupsize
         self.sym = sym
         self.clip_ratio = clip_ratio
-
         self.high_bits_length = high_bits_length
-        self.high_bits = high_bits
-        _, self.maxq_h = get_minq_maxq(high_bits, sym)
 
-        self.low_bits_length = low_bits_length
-        self.low_bits = low_bits
-        _, self.maxq_l = get_minq_maxq(low_bits, sym)
-
-    def find_params_per_token_groupwise(self, x, maxq, use_nvfp4=False):
-        if use_nvfp4:
-            # NF4: scale = max(|x|) / 6.0 (symmetric, codebook range [-6, 6])
-            xmax = torch.amax(x.abs(), dim=3, keepdim=True) * self.clip_ratio
-            tmp = xmax == 0
-            scale = xmax / NF4_MAX
-            scale[tmp] = 1
-            return scale.to(x.dtype), torch.zeros_like(scale, dtype=x.dtype)
-
-        xmax = torch.amax(x, dim=3, keepdim=True) * self.clip_ratio
-        xmin = torch.amin(x, dim=3, keepdim=True) * self.clip_ratio
+    def find_params_per_token_groupwise(self, x, maxq):
+        xmax = torch.amax(x, dim=-1, keepdim=True) * self.clip_ratio
+        xmin = torch.amin(x, dim=-1, keepdim=True) * self.clip_ratio
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
@@ -317,7 +211,7 @@ class ActQuantizer(nn.Module):
             tmp = (xmin == 0) & (xmax == 0)
             xmin[tmp] = -1
             xmax[tmp] = +1
-            scale = (xmax - xmin) / maxq
+            scale = (xmax - xmin).clamp(min=1e-5) / maxq
             zero = torch.round(-xmin / scale)
         return scale.to(x.dtype), zero.to(x.dtype)
 
@@ -328,65 +222,24 @@ class ActQuantizer(nn.Module):
         if is_nvfp4 and self.groupsize > 0:
             return  # No pre-computed params needed; done in forward
 
-        if self.groupsize > 0 and self.high_bits_length <= self.groupsize:
-            # Strategy A: group → split within each group (matches forward Strategy A).
-            # Each group's high-bits slice gets independent scale computation.
-            x_reshaped = x.reshape(
-                x.shape[0], x.shape[1], x.shape[2] // self.groupsize, self.groupsize
-            )
-            low_dim = self.low_bits_length
-            high_dim = x_reshaped.shape[-1] - self.high_bits_length
-            x_m = x_reshaped[..., low_dim:high_dim]
-            x_h = x_reshaped[..., high_dim:]
-            x_l = x_reshaped[..., :low_dim]
-
-            self.scale, self.zero = self.find_params_per_token_groupwise(x_m, self.maxq)
-            if self.high_bits_length != 0 and self.high_bits < 16:
-                self.scale_h, self.zero_h = self.find_params_per_token_groupwise(x_h, self.maxq_h)
-            if self.low_bits_length != 0 and self.low_bits < 16:
-                self.scale_l, self.zero_l = self.find_params_per_token_groupwise(x_l, self.maxq_l)
-            return
+        # Only the quantized region needs scale; bf16/fp16 tail is passthrough.
+        q_len = x.shape[-1] - self.high_bits_length
+        x_l = x[..., :q_len]
 
         if self.groupsize > 0:
-            # Strategy B: split on full dim first, group the 4-bit part.
-            low_dim = self.low_bits_length
-            high_dim = x.shape[-1] - self.high_bits_length
-            x_m = x[..., low_dim:high_dim]
-            x_m_grouped = x_m.reshape(
-                x_m.shape[0], x_m.shape[1], x_m.shape[2] // self.groupsize, self.groupsize
-            )
-            self.scale, self.zero = self.find_params_per_token_groupwise(x_m_grouped, self.maxq)
-            if self.high_bits_length != 0 and self.high_bits < 16:
-                x_h = x[..., high_dim:]
-                x_h_grouped = x_h.reshape(
-                    x_h.shape[0], x_h.shape[1], x_h.shape[2] // self.groupsize, self.groupsize
-                )
-                self.scale_h, self.zero_h = self.find_params_per_token_groupwise(x_h_grouped, self.maxq_h)
-            if self.low_bits_length != 0 and self.low_bits < 16:
-                x_l = x[..., :low_dim]
-                x_l_grouped = x_l.reshape(
-                    x_l.shape[0], x_l.shape[1], x_l.shape[2] // self.groupsize, self.groupsize
-                )
-                self.scale_l, self.zero_l = self.find_params_per_token_groupwise(x_l_grouped, self.maxq_l)
+            pad = (-q_len) % self.groupsize
+            if pad > 0:
+                x_l = torch.nn.functional.pad(x_l, (0, pad))
+            x_l_grouped = x_l.reshape(x_l.shape[0], x_l.shape[1], -1, self.groupsize)
+            self.scale, self.zero = self.find_params_per_token_groupwise(x_l_grouped, self.maxq)
             return
 
-        low_dim = self.low_bits_length
-        high_dim = x.shape[-1] - self.high_bits_length
-        x_l, x_m, x_h = x[..., :low_dim], x[..., low_dim:high_dim], x[..., high_dim:]
-
         if is_nvfp4:
-            self.scale, self.zero = self._find_params_nvfp4(x_m)
+            self.scale, self.zero = self._find_params_nvfp4(x_l)
         else:
-            self.scale, self.zero = self._find_params(x_m, self.maxq)
-        if self.high_bits_length != 0 and self.high_bits < 16:
-            self.scale_h, self.zero_h = self._find_params(x_h, self.maxq_h)
-        if self.low_bits_length != 0 and self.low_bits < 16:
-            self.scale_l, self.zero_l = self._find_params(x_l, self.maxq_l)
+            self.scale, self.zero = self._find_params(x_l, self.maxq)
 
     def _find_params(self, x, maxq):
-        if self.bits == 16:
-            return torch.zeros(1, dtype=x.dtype), torch.zeros(1, dtype=x.dtype)
-
         dev = x.device
         init_shape = x.shape
         reshaped_x = x.reshape((-1, x.shape[-1]))
@@ -408,7 +261,7 @@ class ActQuantizer(nn.Module):
             tmp = (xmin == 0) & (xmax == 0)
             xmin[tmp] = -1
             xmax[tmp] = +1
-            scale = (xmax - xmin) / maxq
+            scale = (xmax - xmin).clamp(min=1e-5) / maxq
             zero = torch.round(-xmin / scale)
             scale = scale.reshape(bcast_shape)
             zero = zero.reshape(bcast_shape)
@@ -417,9 +270,6 @@ class ActQuantizer(nn.Module):
 
     def _find_params_nvfp4(self, x):
         """Compute per-token NF4 scale: max(|x|) / 6.0."""
-        if self.bits == 16:
-            return torch.zeros(1, dtype=x.dtype), torch.zeros(1, dtype=x.dtype)
-
         dev = x.device
         init_shape = x.shape
         reshaped_x = x.reshape((-1, x.shape[-1]))
@@ -453,7 +303,6 @@ class ActQuantWrapper(nn.Module):
         self.weight = module.weight
         self.bias = module.bias
         self.quantizer = ActQuantizer()
-        self.out_quantizer = ActQuantizer()
 
         # Online rotation for DiRotQ (set externally after wrapping)
         self.rotation = None           # [D, D] float32 tensor or None
@@ -469,7 +318,7 @@ class ActQuantWrapper(nn.Module):
     def extra_repr(self):
         s = f"Input Quant: {self.quantizer.bits}b"
         if self.quantizer.high_bits_length > 0:
-            s += f", high={self.quantizer.high_bits}b/{self.quantizer.high_bits_length}d"
+            s += f", fp16_tail={self.quantizer.high_bits_length}d"
         return s
 
     def forward(self, x):
@@ -497,18 +346,43 @@ class ActQuantWrapper(nn.Module):
 
         elif self.rotation_per_head is not None and self.quantizer.bits < 16:
             # Per-head rotation: input is [B, T, H*d].
-            # Same strategy: all in fp32, single cast at the end.
+            # Rotate each head, then rearrange so the 4-bit region is contiguous
+            # [H*d_q] and fp16 region is contiguous [H*hlen] before quantization.
+            # This ensures grouping applies only within 4-bit channels and the
+            # fp16 passthrough is never accidentally quantized.
             B_T = x.shape[:-1]
             H, d = self.num_heads, self.head_dim
+            hlen = self.quantizer.high_bits_length  # fp16 channels per head (e.g. 9)
+            d_q  = d - hlen                         # 4-bit channels per head (e.g. 63)
             U_ph = self.rotation_per_head.to(x.device, dtype=torch.float32)  # [H, d, d]
-            x_heads = x.float().reshape(*B_T, H, d)                          # fp32
-            x_rot_flat = torch.einsum('...hd,hde->...he', x_heads, U_ph).reshape(*B_T, H * d)
-            self.quantizer.find_params(x_rot_flat)
-            x_quant_flat = self.quantizer(x_rot_flat)                         # fp32
-            self.quantizer.free()
-            x_quant_heads = x_quant_flat.reshape(*B_T, H, d)
+            x_heads = x.float().reshape(*B_T, H, d)                           # fp32
+            x_rot_heads = torch.einsum('...hd,hde->...he', x_heads, U_ph)    # [*B_T, H, d]
+            if hlen > 0:
+                # Rearrange: [*B_T, H, d] -> [*B_T, H*d_q | H*hlen]
+                x_rearranged = torch.cat([
+                    x_rot_heads[..., :d_q].reshape(*B_T, H * d_q),
+                    x_rot_heads[..., d_q:].reshape(*B_T, H * hlen),
+                ], dim=-1)
+                saved_hlen = self.quantizer.high_bits_length
+                saved_gs   = self.quantizer.groupsize
+                self.quantizer.high_bits_length = H * hlen
+                self.quantizer.groupsize        = d_q if d_q > 0 else -1
+                self.quantizer.find_params(x_rearranged)
+                x_quant = self.quantizer(x_rearranged)                        # fp32
+                self.quantizer.free()
+                self.quantizer.high_bits_length = saved_hlen
+                self.quantizer.groupsize        = saved_gs
+                # Re-interleave: -> [*B_T, H, d]
+                x_q_heads = x_quant[..., :H * d_q].reshape(*B_T, H, d_q)
+                x_h_heads = x_quant[..., H * d_q:].reshape(*B_T, H, hlen)
+                x_quant_heads = torch.cat([x_q_heads, x_h_heads], dim=-1)    # [*B_T, H, d]
+            else:
+                x_rot_flat = x_rot_heads.reshape(*B_T, H * d)
+                self.quantizer.find_params(x_rot_flat)
+                x_quant_heads = self.quantizer(x_rot_flat).reshape(*B_T, H, d)  # fp32
+                self.quantizer.free()
             x_unrot = torch.einsum('...hd,hde->...he', x_quant_heads,
-                                   U_ph.transpose(1, 2))                      # fp32
+                                   U_ph.transpose(1, 2))                       # fp32
             x = x_unrot.to(x_dtype).reshape(*B_T, H * d)
 
         elif self.use_hadamard and self.quantizer.bits < 16:
@@ -560,113 +434,8 @@ class ActQuantWrapper(nn.Module):
                 x = self.quantizer(x).to(x_dtype)
                 self.quantizer.free()
 
-        # Linear forward
-        x = self.module(x).to(x_dtype)
+        return self.module(x).to(x_dtype)
 
-        # Output quantization (unused in current DiRotQ setup)
-        if self.out_quantizer.bits < 16:
-            self.out_quantizer.find_params(x)
-            x = self.out_quantizer(x).to(x_dtype)
-            self.out_quantizer.free()
-
-        return x
-
-
-class WeightQuantizer(nn.Module):
-    """Per-channel or per-tensor weight quantizer using RTN."""
-
-    def __init__(self, shape=1):
-        super().__init__()
-        self.register_buffer("maxq", torch.tensor(0))
-        self.register_buffer("scale", torch.zeros(shape))
-        self.register_buffer("zero", torch.zeros(shape))
-
-    def configure(self, bits, perchannel=False, sym=True, mse=False,
-                  norm=2.4, grid=100, maxshrink=0.8):
-        self.bits = bits
-        self.perchannel = perchannel
-        self.sym = sym
-        self.mse = mse
-        self.norm = norm
-        self.grid = grid
-        self.maxshrink = maxshrink
-        if sym:
-            self.maxq = torch.tensor(2 ** (bits - 1) - 1)
-        else:
-            self.maxq = torch.tensor(2**bits - 1)
-
-    def find_params(self, x):
-        if self.bits == 16:
-            return
-        dev = x.device
-        self.maxq = self.maxq.to(dev)
-
-        shape = x.shape
-        if self.perchannel:
-            x = x.flatten(1)
-        else:
-            x = x.flatten().unsqueeze(0)
-
-        tmp = torch.zeros(x.shape[0], device=dev)
-        xmin = torch.minimum(x.min(1)[0], tmp)
-        xmax = torch.maximum(x.max(1)[0], tmp)
-
-        if self.sym:
-            xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
-            self.scale = xmax / self.maxq
-            self.zero = torch.zeros_like(self.scale)
-        else:
-            tmp = (xmin == 0) & (xmax == 0)
-            xmin[tmp] = -1
-            xmax[tmp] = +1
-            self.scale = (xmax - xmin).clamp(min=1e-5) / self.maxq
-            self.zero = torch.round(-xmin / self.scale)
-
-        if self.mse:
-            best = torch.full([x.shape[0]], float("inf"), device=dev)
-            for i in range(int(self.maxshrink * self.grid)):
-                p = 1 - i / self.grid
-                xmin1 = p * xmin
-                xmax1 = p * xmax
-                if self.sym:
-                    scale1 = xmax1 / self.maxq
-                    q = sym_quant_dequant(x, scale1.unsqueeze(1), self.maxq)
-                else:
-                    scale1 = (xmax1 - xmin1) / self.maxq
-                    zero1 = torch.round(-xmin1 / scale1)
-                    q = asym_quant_dequant(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
-                q -= x
-                q.abs_()
-                q.pow_(self.norm)
-                err = torch.sum(q, 1)
-                tmp = err < best
-                if torch.any(tmp):
-                    best[tmp] = err[tmp]
-                    self.scale[tmp] = scale1[tmp]
-                    self.zero[tmp] = zero1[tmp]
-
-        if not self.perchannel:
-            tmp = shape[0]
-            self.scale = self.scale.repeat(tmp)
-            self.zero = self.zero.repeat(tmp)
-
-        shape = [-1] + [1] * (len(shape) - 1)
-        self.scale = self.scale.reshape(shape)
-        self.zero = self.zero.reshape(shape)
-
-    def quantize(self, x):
-        x_dtype = x.dtype
-        if self.ready() and self.bits < 16:
-            if self.sym:
-                return STEQuantize.apply(x, self.scale, self.maxq, False).to(x_dtype)
-            return AsymSTEQuantize.apply(x, self.scale, self.zero, self.maxq, False).to(x_dtype)
-        return x
-
-    def enabled(self):
-        return self.maxq > 0
-
-    def ready(self):
-        return torch.all(self.scale != 0)
 
 
 def _match_skip(full_name, patterns):

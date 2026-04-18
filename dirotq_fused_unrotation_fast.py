@@ -72,10 +72,32 @@ def _fused_forward_fast(self, x):
         elif self.rotation_per_head is not None:
             B_T = x.shape[:-1]
             H, d = self.num_heads, self.head_dim
+            hlen = self.quantizer.high_bits_length  # fp16/bf16 channels per head 
+            d_q  = d - hlen                         # 4-bit channels per head 
             x_heads = x.reshape(*B_T, H, d)
-            x_rot_flat = torch.einsum('...hd,hde->...he', x_heads, self.rotation_per_head).reshape(*B_T, H * d)
-            self.quantizer.find_params(x_rot_flat)
-            x = self.quantizer(x_rot_flat).to(x_dtype)
+            x_rot_heads = torch.einsum('...hd,hde->...he', x_heads, self.rotation_per_head)
+            if hlen > 0:
+                # Rearrange so bf16/fp16 channels are contiguous at end: [*B_T, H*d_q | H*hlen]
+                x_rearranged = torch.cat([
+                    x_rot_heads[..., :d_q].reshape(*B_T, H * d_q),
+                    x_rot_heads[..., d_q:].reshape(*B_T, H * hlen),
+                ], dim=-1)
+                saved_hlen = self.quantizer.high_bits_length
+                saved_gs   = self.quantizer.groupsize
+                self.quantizer.high_bits_length = H * hlen
+                self.quantizer.groupsize        = d_q if d_q > 0 else -1
+                self.quantizer.find_params(x_rearranged)
+                x_quant = self.quantizer(x_rearranged)
+                self.quantizer.high_bits_length = saved_hlen
+                self.quantizer.groupsize        = saved_gs
+                # Re-interleave: [*B_T, H*d_q | H*hlen] -> [*B_T, H*d]
+                x_q_heads = x_quant[..., :H * d_q].reshape(*B_T, H, d_q)
+                x_h_heads = x_quant[..., H * d_q:].reshape(*B_T, H, hlen)
+                x = torch.cat([x_q_heads, x_h_heads], dim=-1).reshape(*B_T, H * d).to(x_dtype)
+            else:
+                x_rot_flat = x_rot_heads.reshape(*B_T, H * d)
+                self.quantizer.find_params(x_rot_flat)
+                x = self.quantizer(x_rot_flat).to(x_dtype)
 
         elif getattr(self, 'use_hadamard', False):
             init_shape = x.shape
@@ -106,13 +128,7 @@ def _fused_forward_fast(self, x):
             self.quantizer.find_params(x)
             x = self.quantizer(x).to(x_dtype)
 
-    x = self.module(x).to(x_dtype)
-
-    if self.out_quantizer.bits < 16:
-        self.out_quantizer.find_params(x)
-        x = self.out_quantizer(x).to(x_dtype)
-
-    return x
+    return self.module(x).to(x_dtype)
 
 
 def patch_forward_fast():
