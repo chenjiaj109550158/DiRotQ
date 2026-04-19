@@ -24,6 +24,7 @@ is flagged `_unrot_fused=True` so the patched forward skips the unrotation.
 """
 
 import gc
+import os
 import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -108,7 +109,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     # in-place addmm_ (no PCIe traffic, no per-call alloc). Big-D layers
     # (FLUX ffn_down @12288, single_block proj_out.linears.1 @12288) accumulate
     # on CPU to avoid eating tens of GB of GPU RAM.
-    GPU_HESSIAN_MAX_D = 4096
+    GPU_HESSIAN_MAX_D = int(os.environ.get("DIROTQ_GPU_HESSIAN_MAX_D", 4096))
 
     layer_H = {}
     layer_on_gpu = {}
@@ -367,62 +368,62 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
     damp_val    = damp_pct * H_diag.mean()
     H_diag     += damp_val
 
-    # Cholesky inversion (with retry on numerical failure OR near-zero diag)
-    #
-    # A "successful" Cholesky can still leave near-zero diagonals in H_inv
-    # (the upper Cholesky factor of H^{-1}).  Those tiny d values cause
-    # err_col = (w - w_q) / d  to explode during error propagation, silently
-    # producing NaN weights.  Detect this and add more damping before retrying.
-    H_inv = None
-    for _ in range(num_inv_tries):
+    # Cholesky + GPTQ with retry on:
+    #   1. Cholesky failure (RuntimeError)
+    #   2. Near-zero H_inv diagonal (err/d explosion)
+    #   3. NaN in GPTQ output (error propagation overflow)
+    # Each retry increases Hessian damping and re-runs from Cholesky.
+    W_q = None
+    for _attempt in range(num_inv_tries):
         try:
             L     = torch.linalg.cholesky(H)
             H_inv = torch.cholesky_inverse(L)
             H_inv = torch.linalg.cholesky(H_inv, upper=True)
-            # Reject if any diagonal is < 1e-4 × mean — those columns would
-            # produce catastrophic error propagation (err / d -> Inf -> NaN).
-            diag = H_inv.diagonal()
-            if diag.min() < 1e-4 * diag.mean():
-                H_inv = None          # force retry
-                H_diag += damp_pct * H_diag.mean()
-                continue
-            break
         except RuntimeError:
             H_diag += (damp_pct * 0.1) * H_diag.mean()
+            continue
 
-    if H_inv is None:
-        return None
+        diag = H_inv.diagonal()
+        if diag.min() < 1e-4 * diag.mean():
+            H_diag += damp_pct * H_diag.mean()
+            continue
 
-    # GPTQ column-wise quantization loop
-    W_q = torch.zeros_like(W_proc)
+        # GPTQ column-wise quantization loop
+        W_proc_run = W_proc.clone()
+        W_q_run    = torch.zeros_like(W_proc_run)
 
-    for c_start in range(0, in_features, block_size):
-        c_end    = min(c_start + block_size, in_features)
-        W_block  = W_proc[:, c_start:c_end].clone()
-        H_block  = H_inv[c_start:c_end, c_start:c_end]
-        Err      = torch.zeros_like(W_block)
+        for c_start in range(0, in_features, block_size):
+            c_end    = min(c_start + block_size, in_features)
+            W_block  = W_proc_run[:, c_start:c_end].clone()
+            H_block  = H_inv[c_start:c_end, c_start:c_end]
+            Err      = torch.zeros_like(W_block)
 
-        for _c in range(c_end - c_start):
-            c_abs    = c_start + _c
-            w_col    = W_block[:, _c]                  # [out_features]
-            d        = H_block[_c, _c]                 # scalar
-            orig_col = perm[c_abs].item()              # original column index
+            for _c in range(c_end - c_start):
+                c_abs    = c_start + _c
+                w_col    = W_block[:, _c]
+                d        = H_block[_c, _c]
+                orig_col = perm[c_abs].item()
 
-            w_q_col = _quant_col(w_col, orig_col)
-            W_q[:, c_abs] = w_q_col
+                w_q_col = _quant_col(w_col, orig_col)
+                W_q_run[:, c_abs] = w_q_col
 
-            err_col = (w_col - w_q_col) / d           # propagation error
-            Err[:, _c] = err_col
-            # Greedy error compensation for remaining columns in this block
-            W_block[:, _c + 1:] -= (
-                err_col.unsqueeze(1) * H_block[_c, _c + 1:].unsqueeze(0)
-            )
+                err_col = (w_col - w_q_col) / d
+                Err[:, _c] = err_col
+                W_block[:, _c + 1:] -= (
+                    err_col.unsqueeze(1) * H_block[_c, _c + 1:].unsqueeze(0)
+                )
 
-        # Propagate error to all columns after this block
-        W_proc[:, c_end:] -= Err @ H_inv[c_start:c_end, c_end:]
+            W_proc_run[:, c_end:] -= Err @ H_inv[c_start:c_end, c_end:]
 
-    # Un-permute columns back to original order
-    W_q = W_q[:, inv_perm]
+        W_q_run = W_q_run[:, inv_perm]
+
+        if W_q_run.isnan().any():
+            H_diag += damp_pct * H_diag.mean()
+            continue
+
+        W_q = W_q_run
+        break
+
     return W_q
 
 

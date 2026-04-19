@@ -250,8 +250,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples",         type=int,   default=128)
     parser.add_argument("--prompt-id",           type=str,   default=None,
                         help="Regenerate only this prompt ID (e.g. '0960')")
-    parser.add_argument("--num-steps",           type=int,   default=4)
-    parser.add_argument("--guidance-scale",      type=float, default=0.0)
+    parser.add_argument("--num-steps",           type=int,   default=25)
+    parser.add_argument("--guidance-scale",      type=float, default=3.5)
     parser.add_argument("--batch-size",          type=int,   default=1)
     parser.add_argument("--image-size",          type=int,   default=1024)
     parser.add_argument("--max-sequence-length", type=int,   default=256)

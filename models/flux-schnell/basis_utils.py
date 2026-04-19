@@ -19,8 +19,8 @@ Basis keys (match flux-schnell/model_utils.py:assign_online_rotations):
   Double blocks (transformer_blocks.{i}):
     layer.{i}.img_attn          [hidden, hidden]            img Q/K/V input
     layer.{i}.txt_attn          [hidden, hidden]            txt Q/K/V input
-    layer.{i}.img_attn.value    [num_heads, head, head]     img V output per-head
-    layer.{i}.txt_attn.value    [num_heads, head, head]     txt V output per-head
+    layer.{i}.img_attn.value    [hidden, hidden]            img attn out-proj input
+    layer.{i}.txt_attn.value    [hidden, hidden]            txt attn out-proj input
     layer.{i}.img_ffn           [hidden, hidden]            img FFN up input
     layer.{i}.img_ffn.down      [inter, inter]              img FFN down input
     layer.{i}.txt_ffn           [hidden, hidden]            txt FFN up input
@@ -29,9 +29,8 @@ Basis keys (match flux-schnell/model_utils.py:assign_online_rotations):
   Single blocks (single_transformer_blocks.{i}):
     single.{i}.attn             [hidden, hidden]            Q/K/V input
     single.{i}.mlp              [hidden, hidden]            MLP up input
-    single.{i}.attn_out.value   [num_heads, head, head]     attn-out half of
-                                                            split proj_out
-                                                            (per-head)
+    single.{i}.attn_out.value   [hidden, hidden]            attn-out half of
+                                                            split proj_out input
     single.{i}.mlp.down         [inter, inter]              mlp half of split
                                                             proj_out
 """
@@ -75,7 +74,6 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     # Allocate covariance accumulators.
     #
     # Small-D (D = hidden = 3072): GPU float32. No PCIe traffic.
-    # Per-head (D = head_dim = 128): GPU float32, shape [H, d, d].
     # Large-D (D = inter = 12288): CPU float32. Flushed after each pass.
     # -----------------------------------------------------------------------
     def _gpu(shape):
@@ -88,29 +86,29 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     on_gpu_inter  = inter  <= _GPU_H_MAX_D
 
     # Double-block accumulators
-    H_img_attn = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
-    H_txt_attn = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
-    H_img_val  = [_gpu((num_heads, head_dim, head_dim))               for _ in range(num_double_layers)]
-    H_txt_val  = [_gpu((num_heads, head_dim, head_dim))               for _ in range(num_double_layers)]
-    H_img_ffn  = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
-    H_txt_ffn  = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
-    H_img_down = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
-    H_txt_down = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
+    H_img_attn     = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_txt_attn     = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_img_attn_out = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_txt_attn_out = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_img_ffn      = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_txt_ffn      = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
+    H_img_down     = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
+    H_txt_down     = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
 
     # Single-block accumulators
     H_sattn    = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
     H_smlp     = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
-    H_sattnout = [_gpu((num_heads, head_dim, head_dim))               for _ in range(num_single_layers)]
+    H_sattnout = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
     H_smlpdown = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_single_layers)]
 
-    cnt_img_attn = [0] * num_double_layers
-    cnt_txt_attn = [0] * num_double_layers
-    cnt_img_val  = [0] * num_double_layers
-    cnt_txt_val  = [0] * num_double_layers
-    cnt_img_ffn  = [0] * num_double_layers
-    cnt_txt_ffn  = [0] * num_double_layers
-    cnt_img_down = [0] * num_double_layers
-    cnt_txt_down = [0] * num_double_layers
+    cnt_img_attn     = [0] * num_double_layers
+    cnt_txt_attn     = [0] * num_double_layers
+    cnt_img_attn_out = [0] * num_double_layers
+    cnt_txt_attn_out = [0] * num_double_layers
+    cnt_img_ffn      = [0] * num_double_layers
+    cnt_txt_ffn      = [0] * num_double_layers
+    cnt_img_down     = [0] * num_double_layers
+    cnt_txt_down     = [0] * num_double_layers
     cnt_sattn    = [0] * num_single_layers
     cnt_smlp     = [0] * num_single_layers
     cnt_sattnout = [0] * num_single_layers
@@ -149,29 +147,6 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
                 _pending.append((H_list[i], x_flat.T @ x_flat))
         return hook
 
-    def _value_hook(i, H_list, cnt_list):
-        # Per-head cov on GPU (head_dim is small).
-        def hook(module, args, output):
-            if output.dim() == 2:
-                output = output.unsqueeze(0)
-            B, T, _ = output.shape
-            v = output.reshape(B * T, num_heads, head_dim).detach().float()
-            H_list[i].add_(torch.einsum('nhd,nhe->hde', v, v))
-            cnt_list[i] += B * T
-        return hook
-
-    def _attn_out_input_hook(i, H_list, cnt_list):
-        """Per-head input cov for proj_out.linears[0]."""
-        def hook(module, args, output):
-            x = args[0] if isinstance(args, tuple) else args
-            if x.dim() == 2:
-                x = x.unsqueeze(0)
-            B, T, D = x.shape
-            v = x.reshape(B * T, num_heads, head_dim).detach().float()
-            H_list[i].add_(torch.einsum('nhd,nhe->hde', v, v))
-            cnt_list[i] += B * T
-        return hook
-
     # -----------------------------------------------------------------------
     # Register hooks
     # -----------------------------------------------------------------------
@@ -179,11 +154,11 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
 
     for i, block in enumerate(transformer.transformer_blocks):
         hooks.append(block.attn.to_q.register_forward_hook(_input_hook(i, H_img_attn, cnt_img_attn)))
-        hooks.append(block.attn.to_v.register_forward_hook(_value_hook(i, H_img_val,  cnt_img_val)))
+        hooks.append(block.attn.to_out[0].register_forward_hook(_input_hook(i, H_img_attn_out, cnt_img_attn_out)))
         hooks.append(block.ff.net[0].proj.register_forward_hook(_input_hook(i, H_img_ffn,  cnt_img_ffn)))
         hooks.append(block.ff.net[2].register_forward_hook(      _input_hook(i, H_img_down, cnt_img_down)))
         hooks.append(block.attn.add_q_proj.register_forward_hook(_input_hook(i, H_txt_attn, cnt_txt_attn)))
-        hooks.append(block.attn.add_v_proj.register_forward_hook(_value_hook(i, H_txt_val,  cnt_txt_val)))
+        hooks.append(block.attn.to_add_out.register_forward_hook(_input_hook(i, H_txt_attn_out, cnt_txt_attn_out)))
         hooks.append(block.ff_context.net[0].proj.register_forward_hook(_input_hook(i, H_txt_ffn,  cnt_txt_ffn)))
         hooks.append(block.ff_context.net[2].register_forward_hook(      _input_hook(i, H_txt_down, cnt_txt_down)))
 
@@ -191,7 +166,7 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
         hooks.append(block.attn.to_q.register_forward_hook(_input_hook(i, H_sattn, cnt_sattn)))
         hooks.append(block.proj_mlp.register_forward_hook(  _input_hook(i, H_smlp,  cnt_smlp)))
         hooks.append(block.proj_out.linears[0].register_forward_hook(
-            _attn_out_input_hook(i, H_sattnout, cnt_sattnout)))
+            _input_hook(i, H_sattnout, cnt_sattnout)))
         hooks.append(block.proj_out.linears[1].register_forward_hook(
             _input_hook(i, H_smlpdown, cnt_smlpdown)))
 
@@ -273,8 +248,8 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     for i in tqdm(range(num_double_layers), desc="double blocks"):
         basis_dict[f"layer.{i}.img_attn"]       = _eigh(_to_f64_cpu(H_img_attn[i], cnt_img_attn[i]))
         basis_dict[f"layer.{i}.txt_attn"]       = _eigh(_to_f64_cpu(H_txt_attn[i], cnt_txt_attn[i]))
-        basis_dict[f"layer.{i}.img_attn.value"] = _eigh_per_head(_to_f64_cpu(H_img_val[i], cnt_img_val[i]), num_heads)
-        basis_dict[f"layer.{i}.txt_attn.value"] = _eigh_per_head(_to_f64_cpu(H_txt_val[i], cnt_txt_val[i]), num_heads)
+        basis_dict[f"layer.{i}.img_attn.value"] = _eigh(_to_f64_cpu(H_img_attn_out[i], cnt_img_attn_out[i]))
+        basis_dict[f"layer.{i}.txt_attn.value"] = _eigh(_to_f64_cpu(H_txt_attn_out[i], cnt_txt_attn_out[i]))
         basis_dict[f"layer.{i}.img_ffn"]        = _eigh(_to_f64_cpu(H_img_ffn[i], cnt_img_ffn[i]))
         basis_dict[f"layer.{i}.txt_ffn"]        = _eigh(_to_f64_cpu(H_txt_ffn[i], cnt_txt_ffn[i]))
         basis_dict[f"layer.{i}.img_ffn.down"]   = _eigh(_to_f64_cpu(H_img_down[i], cnt_img_down[i]))
@@ -283,7 +258,7 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     for i in tqdm(range(num_single_layers), desc="single blocks"):
         basis_dict[f"single.{i}.attn"]           = _eigh(_to_f64_cpu(H_sattn[i],    cnt_sattn[i]))
         basis_dict[f"single.{i}.mlp"]            = _eigh(_to_f64_cpu(H_smlp[i],     cnt_smlp[i]))
-        basis_dict[f"single.{i}.attn_out.value"] = _eigh_per_head(_to_f64_cpu(H_sattnout[i], cnt_sattnout[i]), num_heads)
+        basis_dict[f"single.{i}.attn_out.value"] = _eigh(_to_f64_cpu(H_sattnout[i], cnt_sattnout[i]))
         basis_dict[f"single.{i}.mlp.down"]       = _eigh(_to_f64_cpu(H_smlpdown[i], cnt_smlpdown[i]))
 
     return basis_dict

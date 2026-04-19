@@ -150,12 +150,10 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                     module.rotation = _hidden(basis_dict[key])
                     assigned += 1
             elif suffix == "proj_out.linears.0":
-                # Attn-out half of the split proj_out — per-head rotation.
+                # Attn-out half of the split proj_out — global rotation.
                 key = f"single.{bi}.attn_out.value"
                 if key in basis_dict:
-                    module.rotation_per_head = _per_head(basis_dict[key])
-                    module.num_heads = num_heads
-                    module.head_dim  = head_dim
+                    module.rotation = _hidden(basis_dict[key])
                     assigned += 1
             elif suffix == "proj_out.linears.1":
                 # MLP half of the split proj_out — dense FFN-down rotation.
@@ -177,16 +175,12 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
             elif suffix == "attn.to_out.0":
                 key = f"layer.{bi}.img_attn.value"
                 if key in basis_dict:
-                    module.rotation_per_head = _per_head(basis_dict[key])
-                    module.num_heads = num_heads
-                    module.head_dim  = head_dim
+                    module.rotation = _hidden(basis_dict[key])
                     assigned += 1
             elif suffix == "attn.to_add_out":
                 key = f"layer.{bi}.txt_attn.value"
                 if key in basis_dict:
-                    module.rotation_per_head = _per_head(basis_dict[key])
-                    module.num_heads = num_heads
-                    module.head_dim  = head_dim
+                    module.rotation = _hidden(basis_dict[key])
                     assigned += 1
             elif suffix == "ff.net.0.proj":
                 key = f"layer.{bi}.img_ffn"
@@ -303,11 +297,10 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 quant_dtype=qdt,
             )
         elif is_attn_out or is_single_proj_out_attn:
-            # Attn-out input is the per-head attention output; use the same
-            # per-head groupsize + high_len_head slice as double-block to_out.
+            # Attn-out uses global (flat) rotation, same as QKV/FFN layers.
             module.quantizer.configure(
-                bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
-                high_bits_length=high_len_head,
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
             )
         elif is_double_ff_down or is_single_proj_out_mlp:

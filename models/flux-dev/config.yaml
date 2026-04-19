@@ -1,0 +1,60 @@
+model: flux-dev
+model_id: "black-forest-labs/FLUX.1-dev"
+pipeline_class: "diffusers.FluxPipeline"
+dtype: bf16
+
+# FLUX.1-dev: same architecture as schnell (19 double + 38 single blocks)
+# but with guidance_embeds=True and 50-step inference.
+dims:
+  hidden: 3072
+  head: 128
+  intermediate: 12288
+  num_heads: 24
+  num_double_layers: 19
+  num_single_layers: 38
+  joint_attention_dim: 4096
+
+rotation:
+  high_fraction: 0.125
+  output_path: "models/flux-dev/basis/R-flux-schnell.pt"
+
+basis:
+  output_path: "models/flux-dev/basis/U-flux-dev.pt"
+  cache_dir: "models/flux-dev/calibration_dataset/caches"
+
+# Skip lists — same as schnell
+quantization:
+  w_bits: 4
+  a_bits: 4
+  high_bits: 16
+  w_groupsize: 64
+  skip_layers:
+    - "x_embedder"
+    - "time_text_embed"
+    - "context_embedder"
+    - "norm_out"
+    - "^proj_out$"
+    - ".norm1.linear"
+    - ".norm.linear"
+    - ".norm1_context.linear"
+
+nvfp4:
+  w_groupsize: 16
+  a_groupsize: 16
+  a_groupsize_attn_out: 128
+  skip_layers:
+    - "x_embedder"
+    - "time_text_embed"
+    - "context_embedder"
+    - "norm_out"
+    - "^proj_out$"
+    - ".norm1.linear"
+    - ".norm.linear"
+    - ".norm1_context.linear"
+
+calib:
+  cache_dir: "models/flux-dev/calibration_dataset/caches"
+  output_dir: "models/flux-dev/calibration_dataset"
+  prompts: "models/flux-dev/calib_prompts.yaml"
+  collect_script: "models/flux-dev/collect_calibration_dataset.py"
+  num_files: 3200  # 128 samples x 25 steps

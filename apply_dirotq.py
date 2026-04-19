@@ -291,7 +291,11 @@ if __name__ == "__main__":
         state = torch.load(cache_path, map_location="cpu", weights_only=False)
         model_keys = set(pipe.transformer.state_dict().keys())
         cache_keys = set(state.keys())
-        missing = model_keys - cache_keys
+        # Quantizer scale/zero are transient (recomputed each forward pass),
+        # so they are expected to be absent from the cache.
+        _transient = {".quantizer.scale", ".quantizer.zero"}
+        missing = {k for k in (model_keys - cache_keys)
+                   if not any(k.endswith(s) for s in _transient)}
         unexpected = cache_keys - model_keys
         if missing:
             print(f"WARNING: {len(missing)} keys in model but not in cache (will keep init weights):")
@@ -354,6 +358,12 @@ if __name__ == "__main__":
             print(f"Applying INT4 RTN weight quantization (group_size={w_groupsize})...")
             rtn_quantize_weights(pipe.transformer, bits=w_bits, groupsize=w_groupsize,
                                  sym=True, skip_names=skip_layers)
+
+        # Clear transient quantizer buffers before saving — they are
+        # recomputed by find_params() on every forward pass.
+        for _, mod in pipe.transformer.named_modules():
+            if isinstance(mod, ActQuantWrapper):
+                mod.quantizer.free()
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving quantized weights to cache: {cache_path}")
