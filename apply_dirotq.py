@@ -19,6 +19,7 @@ import subprocess
 import yaml
 import torch
 import torch.nn as nn
+import diffusers.training_utils
 from pathlib import Path
 from tqdm import tqdm
 
@@ -98,7 +99,9 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
     for batch_idx in tqdm(range(num_batches)):
         batch = to_generate[batch_idx * batch_size : (batch_idx + 1) * batch_size]
         prompts = [info["prompt"] for _, info in batch]
-        generators = [torch.Generator().manual_seed(hash_str_to_int(img_id)) for img_id, _ in batch]
+        seeds = [hash_str_to_int(img_id) for img_id, _ in batch]
+        diffusers.training_utils.set_seed(seeds[0])
+        generators = [torch.Generator().manual_seed(seed) for seed in seeds]
 
         for _, info in batch:
             (output_dir / info["category"]).mkdir(parents=True, exist_ok=True)

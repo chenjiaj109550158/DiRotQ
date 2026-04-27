@@ -1,0 +1,168 @@
+"""
+Model-specific utilities for Sana-1.6B.
+
+Provides:
+  - assign_online_rotations: map PCA basis + rotation matrices to Sana attn layers
+  - configure_quantizers_by_name: set mixed-precision quantizer config per layer type
+  - generation_params: Sana generation settings (steps, guidance, resolution)
+
+Architecture notes:
+  Quantized layers (matching SVDQuant):
+    attn1.to_q/k/v, attn1.to_out.0  (self-attention)
+    attn2.to_q, attn2.to_out.0      (cross-attn image-side Q and output)
+  Skipped:
+    attn2.to_k, attn2.to_v          (text K/V from fixed embeddings — SVDQuant attn_add skip)
+  Not wrappable:
+    ff.conv_inverted, ff.conv_point  (GLUMBConv Conv2d — add_actquant only handles nn.Linear)
+"""
+
+import torch
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from utils.quant_utils import ActQuantWrapper
+
+
+# Generation parameters from SVDQuant sana-1.6b.yaml
+generation_params = dict(
+    num_inference_steps=20,
+    guidance_scale=4.5,
+    height=1024,
+    width=1024,
+)
+
+
+def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
+                             hadamard_layers=None, sign_flips_dict=None):
+    """Assign online PCA rotation matrices to each ActQuantWrapper.
+
+    Sana layer mapping:
+      - attn1.to_q/k/v:  self-attn QKV input      -> hidden-dim rotation (U_sa  @ R1)
+      - attn1.to_out.0:  self-attn out proj        -> per-head rotation   (U_sa_val @ R2)
+      - attn2.to_q:      cross-attn query input    -> hidden-dim rotation (U_ca  @ R1)
+      - attn2.to_out.0:  cross-attn out proj       -> per-head rotation   (U_ca_val @ R2)
+    """
+    num_heads = cfg["dims"]["num_heads"]
+    head_dim  = cfg["dims"]["head"]
+
+    R1 = rotation_dict["R1"].float()
+    R2 = rotation_dict["R2"].float()
+
+    assigned = 0
+    for name, module in transformer.named_modules():
+        if not isinstance(module, ActQuantWrapper):
+            continue
+
+        parts = name.split(".")
+        if "transformer_blocks" not in parts:
+            continue
+        try:
+            block_idx = int(parts[parts.index("transformer_blocks") + 1])
+        except (ValueError, IndexError):
+            continue
+
+        layer_suffix = ".".join(parts[parts.index("transformer_blocks") + 2:])
+
+        if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
+            evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
+            module.rotation = evec @ R1
+            assigned += 1
+        elif layer_suffix == "attn1.to_out.0":
+            evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
+            module.rotation_per_head = torch.bmm(
+                evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+            )
+            module.num_heads = num_heads
+            module.head_dim  = head_dim
+            assigned += 1
+        elif layer_suffix == "attn2.to_q":
+            evec = basis_dict[f"layer.{block_idx}.cross_attn"].float()
+            module.rotation = evec @ R1
+            assigned += 1
+        elif layer_suffix == "attn2.to_out.0":
+            evec_val = basis_dict[f"layer.{block_idx}.cross_attn.value"].float()
+            module.rotation_per_head = torch.bmm(
+                evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+            )
+            module.num_heads = num_heads
+            module.head_dim  = head_dim
+            assigned += 1
+
+    print(f"Assigned rotations to {assigned} ActQuantWrapper layers.")
+    return assigned
+
+
+def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
+                                 nvfp4=False, hadamard_layers=None, a_groupsize=None,
+                                 high_len_down=0, skip_quant_layers=None):
+    """Configure mixed-precision activation quantizers by Sana layer type.
+
+    INT4 mode:
+      - attn1.to_q/k/v, attn2.to_q: groupsize=64, high_bits_length=high_len_hidden
+      - attn1.to_out.0, attn2.to_out.0: groupsize=head_dim (32), high_bits_length=high_len_head
+
+    NF4 mode:
+      - attn1.to_q/k/v, attn2.to_q: groupsize=16, symmetric
+      - attn1.to_out.0, attn2.to_out.0: groupsize=head_dim (32), symmetric
+    """
+    a_bits   = cfg["quantization"]["a_bits"]
+    head_dim = cfg["dims"]["head"]
+
+    if nvfp4:
+        nvfp4_cfg = cfg.get("nvfp4", {})
+        a_gs      = nvfp4_cfg.get("a_groupsize", 16)
+        a_gs_out  = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
+        qdt       = "nvfp4"
+    else:
+        a_gs     = 64
+        a_gs_out = head_dim
+        qdt      = "int"
+
+    if a_groupsize is not None:
+        a_gs     = a_groupsize
+        a_gs_out = head_dim  # always keep per-head for to_out
+
+    if a_gs > 0 and high_len_hidden > 0:
+        high_len_hidden = ((high_len_hidden + a_gs - 1) // a_gs) * a_gs
+
+    if hadamard_layers is None:
+        hadamard_layers = []
+    if skip_quant_layers is None:
+        skip_quant_layers = []
+
+    n_skipped = 0
+    for name, module in transformer.named_modules():
+        if not isinstance(module, ActQuantWrapper):
+            continue
+
+        if any(pat in name for pat in skip_quant_layers):
+            module.quantizer.configure(bits=16, groupsize=-1, sym=True)
+            n_skipped += 1
+            continue
+
+        is_self_attn_qkv = (
+            ".attn1.to_q" in name or ".attn1.to_k" in name or ".attn1.to_v" in name
+            or ".attn2.to_q" in name
+        )
+        is_attn_out = ".attn1.to_out" in name or ".attn2.to_out" in name
+
+        if is_self_attn_qkv:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=high_len_hidden,
+                quant_dtype=qdt,
+            )
+        elif is_attn_out:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
+                high_bits_length=high_len_head,
+                quant_dtype=qdt,
+            )
+        else:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=0,
+                quant_dtype=qdt,
+            )
+
+    if n_skipped:
+        print(f"Skipped activation quantization for {n_skipped} layers (bits=16).")

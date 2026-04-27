@@ -1,0 +1,69 @@
+model: sana-1.6b
+model_id: "Efficient-Large-Model/Sana_1600M_1024px_BF16_diffusers"
+pipeline_class: "diffusers.SanaPipeline"
+dtype: bf16
+
+# Sana-1600M at 1024px:
+#   hidden = num_attention_heads * attention_head_dim = 70 * 32 = 2240
+#   intermediate = mlp_ratio * hidden = 2.5 * 2240 = 5600
+#
+# Only self-attention (attn1) is quantized.
+# The FFN uses GLUMBConv (all Conv2d), which add_actquant never wraps.
+# Cross-attention (attn2) is skipped to match SVDQuant's attn_add skip.
+dims:
+  hidden: 2240
+  head: 32
+  intermediate: 5600   # used by gen_rotation.py for R_down; not applied to Conv2d ff
+  num_heads: 70
+  num_layers: 20
+
+rotation:
+  high_fraction: 0.125
+  output_path: "models/sana-1.6b/basis/R-sana-1.6b.pt"
+
+basis:
+  output_path: "models/sana-1.6b/basis/U-sana-1.6b.pt"
+  cache_dir: "models/sana-1.6b/calibration_dataset/caches"
+
+# Skip lists aligned with SVDQuant deepcompressor sana-1.6b.yaml:
+#   embed              -> patch_embed, time_embed (AdaLayerNormSingle), caption_projection, caption_norm
+#   transformer_proj_out -> proj_out
+#   transformer_norm   -> .norm1, .norm2, norm_out  (LayerNorm, not wrapped anyway)
+#   attn_add           -> attn2.to_k, attn2.to_v only (text K/V from fixed embeddings)
+#                         attn2.to_q and attn2.to_out.0 ARE quantized (image-side tokens)
+#   ffn_add            -> ff.* (GLUMBConv Conv2d, excluded automatically by add_actquant)
+quantization:
+  w_bits: 4
+  a_bits: 4
+  high_bits: 16
+  w_groupsize: 64
+  skip_layers:
+    - "patch_embed"
+    - "time_embed"
+    - "caption_projection"
+    - "caption_norm"
+    - "norm_out"
+    - "proj_out"
+    - "attn2.to_k"
+    - "attn2.to_v"
+
+nvfp4:
+  w_groupsize: 16
+  a_groupsize: 16
+  a_groupsize_attn_out: 32    # head_dim
+  skip_layers:
+    - "patch_embed"
+    - "time_embed"
+    - "caption_projection"
+    - "caption_norm"
+    - "norm_out"
+    - "proj_out"
+    - "attn2.to_k"
+    - "attn2.to_v"
+
+calib:
+  cache_dir: "models/sana-1.6b/calibration_dataset/caches"
+  output_dir: "models/sana-1.6b/calibration_dataset"
+  prompts: "models/sana-1.6b/calib_prompts.yaml"
+  collect_script: "models/sana-1.6b/collect_calibration_dataset.py"
+  num_files: 5120   # 128 samples × 20 steps × 2 guidance (CFG)

@@ -1,7 +1,7 @@
 # Large generated artifacts
 models/*/basis/
-models/*/calibration_dataset/
-models/*/quantized_cache/
+models/*/calibration_dataset*/
+models/*/quantized_cache*/
 models/*/generated_images_*/
 
 
