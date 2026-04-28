@@ -1,0 +1,89 @@
+{
+  "report": "Flux-dev W4A4 \u2014 DiRotQ on SVDQuant kernel (no-rot ff_down)",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "hardware_vram_gb": 24,
+  "w4a4_source": "DiRotQ packing on nunchaku v2 SVDQuant kernel (rot K=3072, no-rot K=12288)",
+  "weights_gb": {
+    "fp16": 23.8,
+    "w4a4_measured": 11.512351232
+  },
+  "weight_savings_x": 2.0673448473188487,
+  "fp16_phase": {
+    "native": {
+      "1": {
+        "ms": 624.5988395021413,
+        "std_ms": 1.0680374126627834,
+        "peak_gb": 24.303634432
+      }
+    },
+    "offload": {
+      "1": {
+        "ms": 3682.699467011844,
+        "std_ms": 0.0,
+        "peak_gb": 0.643321856
+      },
+      "2": {
+        "ms": 4917.531151004368,
+        "std_ms": 0.0,
+        "peak_gb": 1.114676736
+      },
+      "4": {
+        "ms": 7217.323962002411,
+        "std_ms": 0.0,
+        "peak_gb": 2.086758912
+      }
+    }
+  },
+  "w4a4_phase": {
+    "measurements": {
+      "1": {
+        "ms": 272.5633250011015,
+        "std_ms": 0.049080282914400405,
+        "peak_gb": 11.829481472
+      },
+      "2": {
+        "ms": 543.2404759994824,
+        "std_ms": 0.16982441845303198,
+        "peak_gb": 12.1309568
+      },
+      "4": {
+        "ms": 1084.1209900027025,
+        "std_ms": 0.09300575724377638,
+        "peak_gb": 12.739478016
+      }
+    },
+    "w4a4_weight_gb": 11.512351232,
+    "source": "DiRotQ packing on nunchaku v2 SVDQuant kernel (rot K=3072, no-rot K=12288)"
+  },
+  "summary": [
+    {
+      "B": 1,
+      "fp16_ms": 624.5988395021413,
+      "fp16_label": "native",
+      "fp16_peak_native_gb": 24.303634432,
+      "w4a4_ms": 272.5633250011015,
+      "w4a4_peak_gb": 11.829481472,
+      "speedup": 2.291573305027803
+    },
+    {
+      "B": 2,
+      "fp16_ms": 4917.531151004368,
+      "fp16_label": "offload",
+      "fp16_peak_native_gb": 24.807268863999997,
+      "w4a4_ms": 543.2404759994824,
+      "w4a4_peak_gb": 12.1309568,
+      "speedup": 9.052217881881566
+    },
+    {
+      "B": 4,
+      "fp16_ms": 7217.323962002411,
+      "fp16_label": "offload",
+      "fp16_peak_native_gb": 25.814537727999994,
+      "w4a4_ms": 1084.1209900027025,
+      "w4a4_peak_gb": 12.739478016,
+      "speedup": 6.657304884378652
+    }
+  ],
+  "pcie_bw_gbs": 25.9,
+  "timestamp": "2026-04-28T19:24:22.144072Z"
+}
