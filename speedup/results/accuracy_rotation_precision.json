@@ -1,0 +1,521 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "model": "pixart-sigma",
+  "dtype": "bf16",
+  "n_calib": 2048,
+  "n_test": 4096,
+  "n_trials": 3,
+  "outlier_frac": 0.05,
+  "outlier_scale": 4.0,
+  "groupsize": 64,
+  "schemes": [
+    {
+      "name": "A: bf16 rotation (current)",
+      "kwargs": {
+        "rot_quant_low": "bf16"
+      }
+    },
+    {
+      "name": "B: int8 rot, x rowwise",
+      "kwargs": {
+        "rot_quant_low": "int8",
+        "x_quant_granularity": "rowwise"
+      }
+    },
+    {
+      "name": "C: int8 rot, x rowgrp",
+      "kwargs": {
+        "rot_quant_low": "int8",
+        "x_quant_granularity": "rowwise_groupwise"
+      }
+    },
+    {
+      "name": "D: int4 rot, x rowwise",
+      "kwargs": {
+        "rot_quant_low": "int4",
+        "x_quant_granularity": "rowwise"
+      }
+    },
+    {
+      "name": "E: int4 rot, x rowgrp",
+      "kwargs": {
+        "rot_quant_low": "int4",
+        "x_quant_granularity": "rowwise_groupwise"
+      }
+    }
+  ],
+  "timestamp": "2026-04-28T00:33:54.776897Z",
+  "by_distribution": {
+    "axis-aligned": {
+      "rows": [
+        {
+          "layer": "attn1.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 19.401955286661785,
+            "B: int8 rot, x rowwise": 19.27838389078776,
+            "C: int8 rot, x rowgrp": 19.373480478922527,
+            "D: int4 rot, x rowwise": 9.208992958068848,
+            "E: int4 rot, x rowgrp": 14.471306482950846
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357139587402344,
+            "C: int8 rot, x rowgrp": -0.028474807739257812,
+            "D: int4 rot, x rowwise": -10.192962328592937,
+            "E: int4 rot, x rowgrp": -4.930648803710939
+          }
+        },
+        {
+          "layer": "attn1.to_k",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 19.401955286661785,
+            "B: int8 rot, x rowwise": 19.27838389078776,
+            "C: int8 rot, x rowgrp": 19.373480478922527,
+            "D: int4 rot, x rowwise": 9.208992958068848,
+            "E: int4 rot, x rowgrp": 14.471306482950846
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357139587402344,
+            "C: int8 rot, x rowgrp": -0.028474807739257812,
+            "D: int4 rot, x rowwise": -10.192962328592937,
+            "E: int4 rot, x rowgrp": -4.930648803710939
+          }
+        },
+        {
+          "layer": "attn1.to_v",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 19.401955286661785,
+            "B: int8 rot, x rowwise": 19.27838389078776,
+            "C: int8 rot, x rowgrp": 19.373480478922527,
+            "D: int4 rot, x rowwise": 9.208992958068848,
+            "E: int4 rot, x rowgrp": 14.471306482950846
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357139587402344,
+            "C: int8 rot, x rowgrp": -0.028474807739257812,
+            "D: int4 rot, x rowwise": -10.192962328592937,
+            "E: int4 rot, x rowgrp": -4.930648803710939
+          }
+        },
+        {
+          "layer": "attn1.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 19.12128512064616,
+            "B: int8 rot, x rowwise": 18.997708002726238,
+            "C: int8 rot, x rowgrp": 19.092583974202473,
+            "D: int4 rot, x rowwise": 8.928675015767416,
+            "E: int4 rot, x rowgrp": 14.186398188273111
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357711791992188,
+            "C: int8 rot, x rowgrp": -0.028701146443687264,
+            "D: int4 rot, x rowwise": -10.192610104878744,
+            "E: int4 rot, x rowgrp": -4.934886932373049
+          }
+        },
+        {
+          "layer": "attn2.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 19.401955286661785,
+            "B: int8 rot, x rowwise": 19.27838389078776,
+            "C: int8 rot, x rowgrp": 19.373480478922527,
+            "D: int4 rot, x rowwise": 9.208992958068848,
+            "E: int4 rot, x rowgrp": 14.471306482950846
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357139587402344,
+            "C: int8 rot, x rowgrp": -0.028474807739257812,
+            "D: int4 rot, x rowwise": -10.192962328592937,
+            "E: int4 rot, x rowgrp": -4.930648803710939
+          }
+        },
+        {
+          "layer": "attn2.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 19.12128512064616,
+            "B: int8 rot, x rowwise": 18.997708002726238,
+            "C: int8 rot, x rowgrp": 19.092583974202473,
+            "D: int4 rot, x rowwise": 8.928675015767416,
+            "E: int4 rot, x rowgrp": 14.186398188273111
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12357711791992188,
+            "C: int8 rot, x rowgrp": -0.028701146443687264,
+            "D: int4 rot, x rowwise": -10.192610104878744,
+            "E: int4 rot, x rowgrp": -4.934886932373049
+          }
+        },
+        {
+          "layer": "ff.net.0.proj",
+          "K": 1152,
+          "N": 4608,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 19.3983637491862,
+            "B: int8 rot, x rowwise": 19.27532132466634,
+            "C: int8 rot, x rowgrp": 19.369208017985027,
+            "D: int4 rot, x rowwise": 9.20871639251709,
+            "E: int4 rot, x rowgrp": 14.466171582539877
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.12304242451985914,
+            "C: int8 rot, x rowgrp": -0.029155731201171875,
+            "D: int4 rot, x rowwise": -10.18964735666911,
+            "E: int4 rot, x rowgrp": -4.932192166646322
+          }
+        }
+      ],
+      "block_avg": {
+        "A: bf16 rotation (current)": 19.321250733875097,
+        "B: int8 rot, x rowwise": 19.197753270467125,
+        "C: int8 rot, x rowgrp": 19.292613983154297,
+        "D: int4 rot, x rowwise": 9.12886260804676,
+        "E: int4 rot, x rowgrp": 14.389170555841355
+      },
+      "block_avg_delta": {
+        "B: int8 rot, x rowwise": -0.12349746340797196,
+        "C: int8 rot, x rowgrp": -0.028636750720799853,
+        "D: int4 rot, x rowwise": -10.192388125828337,
+        "E: int4 rot, x rowgrp": -4.9320801780337415
+      }
+    },
+    "rotated": {
+      "rows": [
+        {
+          "layer": "attn1.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.123449325561523,
+            "B: int8 rot, x rowwise": 17.098923365275066,
+            "C: int8 rot, x rowgrp": 17.10455576578776,
+            "D: int4 rot, x rowwise": 12.613263130187988,
+            "E: int4 rot, x rowgrp": 13.286115010579428
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02452596028645715,
+            "C: int8 rot, x rowgrp": -0.018893559773761837,
+            "D: int4 rot, x rowwise": -4.510186195373535,
+            "E: int4 rot, x rowgrp": -3.8373343149820958
+          }
+        },
+        {
+          "layer": "attn1.to_k",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.123449325561523,
+            "B: int8 rot, x rowwise": 17.098923365275066,
+            "C: int8 rot, x rowgrp": 17.10455576578776,
+            "D: int4 rot, x rowwise": 12.613263130187988,
+            "E: int4 rot, x rowgrp": 13.286115010579428
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02452596028645715,
+            "C: int8 rot, x rowgrp": -0.018893559773761837,
+            "D: int4 rot, x rowwise": -4.510186195373535,
+            "E: int4 rot, x rowgrp": -3.8373343149820958
+          }
+        },
+        {
+          "layer": "attn1.to_v",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.123449325561523,
+            "B: int8 rot, x rowwise": 17.098923365275066,
+            "C: int8 rot, x rowgrp": 17.10455576578776,
+            "D: int4 rot, x rowwise": 12.613263130187988,
+            "E: int4 rot, x rowgrp": 13.286115010579428
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02452596028645715,
+            "C: int8 rot, x rowgrp": -0.018893559773761837,
+            "D: int4 rot, x rowwise": -4.510186195373535,
+            "E: int4 rot, x rowgrp": -3.8373343149820958
+          }
+        },
+        {
+          "layer": "attn1.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 16.840965906778973,
+            "B: int8 rot, x rowwise": 16.816365559895832,
+            "C: int8 rot, x rowgrp": 16.821970621744793,
+            "D: int4 rot, x rowwise": 12.330538431803385,
+            "E: int4 rot, x rowgrp": 13.002895991007486
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02460034688314039,
+            "C: int8 rot, x rowgrp": -0.018995285034179688,
+            "D: int4 rot, x rowwise": -4.510427474975588,
+            "E: int4 rot, x rowgrp": -3.838069915771486
+          }
+        },
+        {
+          "layer": "attn2.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.123449325561523,
+            "B: int8 rot, x rowwise": 17.098923365275066,
+            "C: int8 rot, x rowgrp": 17.10455576578776,
+            "D: int4 rot, x rowwise": 12.613263130187988,
+            "E: int4 rot, x rowgrp": 13.286115010579428
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02452596028645715,
+            "C: int8 rot, x rowgrp": -0.018893559773761837,
+            "D: int4 rot, x rowwise": -4.510186195373535,
+            "E: int4 rot, x rowgrp": -3.8373343149820958
+          }
+        },
+        {
+          "layer": "attn2.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 16.840965906778973,
+            "B: int8 rot, x rowwise": 16.816365559895832,
+            "C: int8 rot, x rowgrp": 16.821970621744793,
+            "D: int4 rot, x rowwise": 12.330538431803385,
+            "E: int4 rot, x rowgrp": 13.002895991007486
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02460034688314039,
+            "C: int8 rot, x rowgrp": -0.018995285034179688,
+            "D: int4 rot, x rowwise": -4.510427474975588,
+            "E: int4 rot, x rowgrp": -3.838069915771486
+          }
+        },
+        {
+          "layer": "ff.net.0.proj",
+          "K": 1152,
+          "N": 4608,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.10686747233073,
+            "B: int8 rot, x rowwise": 17.082196553548176,
+            "C: int8 rot, x rowgrp": 17.088000615437824,
+            "D: int4 rot, x rowwise": 12.600761731465658,
+            "E: int4 rot, x rowgrp": 13.274553616841635
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.024670918782554452,
+            "C: int8 rot, x rowgrp": -0.018866856892906014,
+            "D: int4 rot, x rowwise": -4.506105740865072,
+            "E: int4 rot, x rowgrp": -3.8323138554890956
+          }
+        }
+      ],
+      "block_avg": {
+        "A: bf16 rotation (current)": 17.04037094116211,
+        "B: int8 rot, x rowwise": 17.01580301920573,
+        "C: int8 rot, x rowgrp": 17.021452131725493,
+        "D: int4 rot, x rowwise": 12.530698730832055,
+        "E: int4 rot, x rowgrp": 13.203543663024902
+      },
+      "block_avg_delta": {
+        "B: int8 rot, x rowwise": -0.024567921956379024,
+        "C: int8 rot, x rowgrp": -0.018918809436616613,
+        "D: int4 rot, x rowwise": -4.509672210330054,
+        "E: int4 rot, x rowgrp": -3.836827278137207
+      }
+    },
+    "mixture": {
+      "rows": [
+        {
+          "layer": "attn1.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.103715896606445,
+            "B: int8 rot, x rowwise": 17.078379313151043,
+            "C: int8 rot, x rowgrp": 17.083316802978516,
+            "D: int4 rot, x rowwise": 12.573628425598145,
+            "E: int4 rot, x rowgrp": 13.23757521311442
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02533658345540246,
+            "C: int8 rot, x rowgrp": -0.020399093627929688,
+            "D: int4 rot, x rowwise": -4.530087471008301,
+            "E: int4 rot, x rowgrp": -3.8661406834920253
+          }
+        },
+        {
+          "layer": "attn1.to_k",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.103715896606445,
+            "B: int8 rot, x rowwise": 17.078379313151043,
+            "C: int8 rot, x rowgrp": 17.083316802978516,
+            "D: int4 rot, x rowwise": 12.573628425598145,
+            "E: int4 rot, x rowgrp": 13.23757521311442
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02533658345540246,
+            "C: int8 rot, x rowgrp": -0.020399093627929688,
+            "D: int4 rot, x rowwise": -4.530087471008301,
+            "E: int4 rot, x rowgrp": -3.8661406834920253
+          }
+        },
+        {
+          "layer": "attn1.to_v",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.103715896606445,
+            "B: int8 rot, x rowwise": 17.078379313151043,
+            "C: int8 rot, x rowgrp": 17.083316802978516,
+            "D: int4 rot, x rowwise": 12.573628425598145,
+            "E: int4 rot, x rowgrp": 13.23757521311442
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02533658345540246,
+            "C: int8 rot, x rowgrp": -0.020399093627929688,
+            "D: int4 rot, x rowwise": -4.530087471008301,
+            "E: int4 rot, x rowgrp": -3.8661406834920253
+          }
+        },
+        {
+          "layer": "attn1.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 16.822277704874676,
+            "B: int8 rot, x rowwise": 16.79681396484375,
+            "C: int8 rot, x rowgrp": 16.80174954732259,
+            "D: int4 rot, x rowwise": 12.291460037231445,
+            "E: int4 rot, x rowgrp": 12.95803960164388
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.025463740030925663,
+            "C: int8 rot, x rowgrp": -0.020528157552085702,
+            "D: int4 rot, x rowwise": -4.53081766764323,
+            "E: int4 rot, x rowgrp": -3.864238103230795
+          }
+        },
+        {
+          "layer": "attn2.to_q",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.103715896606445,
+            "B: int8 rot, x rowwise": 17.078379313151043,
+            "C: int8 rot, x rowgrp": 17.083316802978516,
+            "D: int4 rot, x rowwise": 12.573628425598145,
+            "E: int4 rot, x rowgrp": 13.23757521311442
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.02533658345540246,
+            "C: int8 rot, x rowgrp": -0.020399093627929688,
+            "D: int4 rot, x rowwise": -4.530087471008301,
+            "E: int4 rot, x rowgrp": -3.8661406834920253
+          }
+        },
+        {
+          "layer": "attn2.to_out.0",
+          "K": 1152,
+          "N": 1152,
+          "M": 4096,
+          "hlen": 128,
+          "snr": {
+            "A: bf16 rotation (current)": 16.822277704874676,
+            "B: int8 rot, x rowwise": 16.79681396484375,
+            "C: int8 rot, x rowgrp": 16.80174954732259,
+            "D: int4 rot, x rowwise": 12.291460037231445,
+            "E: int4 rot, x rowgrp": 12.95803960164388
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.025463740030925663,
+            "C: int8 rot, x rowgrp": -0.020528157552085702,
+            "D: int4 rot, x rowwise": -4.53081766764323,
+            "E: int4 rot, x rowgrp": -3.864238103230795
+          }
+        },
+        {
+          "layer": "ff.net.0.proj",
+          "K": 1152,
+          "N": 4608,
+          "M": 4096,
+          "hlen": 192,
+          "snr": {
+            "A: bf16 rotation (current)": 17.106645584106445,
+            "B: int8 rot, x rowwise": 17.082316716512043,
+            "C: int8 rot, x rowgrp": 17.087378819783527,
+            "D: int4 rot, x rowwise": 12.57780901590983,
+            "E: int4 rot, x rowgrp": 13.24013646443685
+          },
+          "delta_vs_A": {
+            "B: int8 rot, x rowwise": -0.024328867594402226,
+            "C: int8 rot, x rowgrp": -0.01926676432291785,
+            "D: int4 rot, x rowwise": -4.528836568196615,
+            "E: int4 rot, x rowgrp": -3.8665091196695958
+          }
+        }
+      ],
+      "block_avg": {
+        "A: bf16 rotation (current)": 17.0237235114688,
+        "B: int8 rot, x rowwise": 16.99849455697196,
+        "C: int8 rot, x rowgrp": 17.003449303763254,
+        "D: int4 rot, x rowwise": 12.493606113252186,
+        "E: int4 rot, x rowgrp": 13.158073788597472
+      },
+      "block_avg_delta": {
+        "B: int8 rot, x rowwise": -0.02522895449683915,
+        "C: int8 rot, x rowgrp": -0.020274207705544,
+        "D: int4 rot, x rowwise": -4.530117398216612,
+        "E: int4 rot, x rowgrp": -3.8656497228713267
+      }
+    }
+  }
+}

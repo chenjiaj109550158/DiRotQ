@@ -18,11 +18,12 @@ huggingface_hub==0.36.2
 safetensors==0.7.0
 tokenizers==0.22.2
 sentencepiece==0.2.1
+protobuf>=4.0
 
 # Metrics
 torchmetrics>=1.0
 torchvision>=0.20
-cleanfid>=0.3.0
+clean-fid>=0.1.35
 piq>=0.8.0
 
 # Utilities
