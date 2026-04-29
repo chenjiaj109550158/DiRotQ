@@ -1,0 +1,133 @@
+{
+  "report": "Flux-dev: fp16 vs A16W4 baseline (no rotation) vs DiRotQ-W4A4 (no-rot ff_down)",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "hardware_vram_gb": 24,
+  "weights_gb": {
+    "fp16": 23.8,
+    "a16w4": 11.003015168,
+    "w4a4_raw": 11.512351232,
+    "w4a4_dummy_overhead": 0.245612544,
+    "w4a4_dirotq_effective": 11.266738688
+  },
+  "weight_savings_x": {
+    "a16w4": 2.163043460052422,
+    "w4a4_raw": 2.0673448473188487,
+    "w4a4_dirotq_effective": 2.112412532062091
+  },
+  "fp16_phase": {
+    "native": {
+      "1": {
+        "ms": 624.953597493004,
+        "std_ms": 0.12725022600524685,
+        "peak_gb": 24.303634432
+      }
+    },
+    "offload": {
+      "1": {
+        "ms": 3753.9702669891994,
+        "std_ms": 0.0,
+        "peak_gb": 0.643321856
+      },
+      "2": {
+        "ms": 4977.22599899862,
+        "std_ms": 0.0,
+        "peak_gb": 1.114676736
+      },
+      "4": {
+        "ms": 7208.5301900078775,
+        "std_ms": 0.0,
+        "peak_gb": 2.086758912
+      }
+    }
+  },
+  "a16w4_phase": {
+    "measurements": {
+      "1": {
+        "ms": 644.4757184945047,
+        "std_ms": 0.45278239994061387,
+        "peak_gb": 11.515524608,
+        "offload": false
+      },
+      "2": {
+        "ms": 1334.1778995018103,
+        "std_ms": 0.07462734406918516,
+        "peak_gb": 11.988982784,
+        "offload": false
+      },
+      "4": {
+        "ms": 2632.5001630029874,
+        "std_ms": 0.2229083432832292,
+        "peak_gb": 12.96106496,
+        "offload": false
+      }
+    },
+    "a16w4_weight_gb": 11.003015168,
+    "by_K": {
+      "3072": 343,
+      "12288": 38,
+      "15360": 38
+    },
+    "source": "A16W4 baseline (bitsandbytes NF4), no rotation"
+  },
+  "w4a4_phase": {
+    "measurements": {
+      "1": {
+        "ms": 273.1549370000721,
+        "std_ms": 0.03597617328375864,
+        "peak_gb": 11.829481472
+      },
+      "2": {
+        "ms": 543.4844880001037,
+        "std_ms": 0.029605146179827447,
+        "peak_gb": 12.1309568
+      },
+      "4": {
+        "ms": 1084.4926009958726,
+        "std_ms": 0.10900050683317655,
+        "peak_gb": 12.739478016
+      }
+    },
+    "w4a4_weight_gb": 11.512351232,
+    "source": "DiRotQ packing on nunchaku v2 SVDQuant kernel (rot K=3072, no-rot K=12288)"
+  },
+  "summary": [
+    {
+      "B": 1,
+      "fp16_ms": 624.953597493004,
+      "fp16_label": "native",
+      "a16w4_ms": 644.4757184945047,
+      "a16w4_peak_gb": 11.515524608,
+      "a16w4_label": "native",
+      "a16w4_speedup": 0.9697085236242813,
+      "w4a4_ms": 273.1549370000721,
+      "w4a4_peak_gb": 11.829481472,
+      "w4a4_speedup": 2.2879088489359396
+    },
+    {
+      "B": 2,
+      "fp16_ms": 4977.22599899862,
+      "fp16_label": "offload",
+      "a16w4_ms": 1334.1778995018103,
+      "a16w4_peak_gb": 11.988982784,
+      "a16w4_label": "native",
+      "a16w4_speedup": 3.7305564729090057,
+      "w4a4_ms": 543.4844880001037,
+      "w4a4_peak_gb": 12.1309568,
+      "w4a4_speedup": 9.157990906628543
+    },
+    {
+      "B": 4,
+      "fp16_ms": 7208.5301900078775,
+      "fp16_label": "offload",
+      "a16w4_ms": 2632.5001630029874,
+      "a16w4_peak_gb": 12.96106496,
+      "a16w4_label": "native",
+      "a16w4_speedup": 2.7382829035743907,
+      "w4a4_ms": 1084.4926009958726,
+      "w4a4_peak_gb": 12.739478016,
+      "w4a4_speedup": 6.64691504892555
+    }
+  ],
+  "pcie_bw_gbs": 25.9,
+  "timestamp": "2026-04-28T20:51:06.125164Z"
+}
