@@ -246,38 +246,51 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     basis_dict = {}
 
     for i in tqdm(range(num_double_layers), desc="double blocks"):
-        basis_dict[f"layer.{i}.img_attn"]       = _eigh(_to_f64_cpu(H_img_attn[i], cnt_img_attn[i]))
-        basis_dict[f"layer.{i}.txt_attn"]       = _eigh(_to_f64_cpu(H_txt_attn[i], cnt_txt_attn[i]))
-        basis_dict[f"layer.{i}.img_attn.value"] = _eigh(_to_f64_cpu(H_img_attn_out[i], cnt_img_attn_out[i]))
-        basis_dict[f"layer.{i}.txt_attn.value"] = _eigh(_to_f64_cpu(H_txt_attn_out[i], cnt_txt_attn_out[i]))
-        basis_dict[f"layer.{i}.img_ffn"]        = _eigh(_to_f64_cpu(H_img_ffn[i], cnt_img_ffn[i]))
-        basis_dict[f"layer.{i}.txt_ffn"]        = _eigh(_to_f64_cpu(H_txt_ffn[i], cnt_txt_ffn[i]))
-        basis_dict[f"layer.{i}.img_ffn.down"]   = _eigh(_to_f64_cpu(H_img_down[i], cnt_img_down[i]))
-        basis_dict[f"layer.{i}.txt_ffn.down"]   = _eigh(_to_f64_cpu(H_txt_down[i], cnt_txt_down[i]))
+        for key, H_acc, cnt in [
+            (f"layer.{i}.img_attn",       H_img_attn[i],     cnt_img_attn[i]),
+            (f"layer.{i}.txt_attn",       H_txt_attn[i],     cnt_txt_attn[i]),
+            (f"layer.{i}.img_attn.value", H_img_attn_out[i], cnt_img_attn_out[i]),
+            (f"layer.{i}.txt_attn.value", H_txt_attn_out[i], cnt_txt_attn_out[i]),
+            (f"layer.{i}.img_ffn",        H_img_ffn[i],      cnt_img_ffn[i]),
+            (f"layer.{i}.txt_ffn",        H_txt_ffn[i],      cnt_txt_ffn[i]),
+            (f"layer.{i}.img_ffn.down",   H_img_down[i],     cnt_img_down[i]),
+            (f"layer.{i}.txt_ffn.down",   H_txt_down[i],     cnt_txt_down[i]),
+        ]:
+            evec, evals = _eigh(_to_f64_cpu(H_acc, cnt))
+            basis_dict[key] = evec
+            basis_dict[f"{key}.eigenvalues"] = evals
 
     for i in tqdm(range(num_single_layers), desc="single blocks"):
-        basis_dict[f"single.{i}.attn"]           = _eigh(_to_f64_cpu(H_sattn[i],    cnt_sattn[i]))
-        basis_dict[f"single.{i}.mlp"]            = _eigh(_to_f64_cpu(H_smlp[i],     cnt_smlp[i]))
-        basis_dict[f"single.{i}.attn_out.value"] = _eigh(_to_f64_cpu(H_sattnout[i], cnt_sattnout[i]))
-        basis_dict[f"single.{i}.mlp.down"]       = _eigh(_to_f64_cpu(H_smlpdown[i], cnt_smlpdown[i]))
+        for key, H_acc, cnt in [
+            (f"single.{i}.attn",           H_sattn[i],    cnt_sattn[i]),
+            (f"single.{i}.mlp",            H_smlp[i],     cnt_smlp[i]),
+            (f"single.{i}.attn_out.value", H_sattnout[i], cnt_sattnout[i]),
+            (f"single.{i}.mlp.down",       H_smlpdown[i], cnt_smlpdown[i]),
+        ]:
+            evec, evals = _eigh(_to_f64_cpu(H_acc, cnt))
+            basis_dict[key] = evec
+            basis_dict[f"{key}.eigenvalues"] = evals
 
     return basis_dict
 
 
-def _eigh(H: torch.Tensor, damping: float = 0.01) -> torch.Tensor:
-    """Eigendecomposition of a covariance matrix. Returns eigenvectors (ascending).
+def _eigh(H: torch.Tensor, damping: float = 0.01):
+    """Returns (evec, evals) both float32, eigenvalues in ascending order.
 
-    H is accumulated in fp64 for numerical stability of the eigendecomposition,
-    but the returned evec is cast to fp32.
+    H is accumulated in fp64 for numerical stability; evec/evals cast to fp32.
     """
     H = H + damping * H.diagonal().mean() * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
-    _, evec = torch.linalg.eigh(H)
-    return evec.float()
+    evals, evec = torch.linalg.eigh(H)
+    return evec.float(), evals.float()
 
 
-def _eigh_per_head(H: torch.Tensor, num_heads: int, damping: float = 0.01) -> torch.Tensor:
-    """Per-head eigendecomposition. H: [num_heads, d, d]. Returns [num_heads, d, d]."""
-    evec_all = torch.zeros_like(H)
+def _eigh_per_head(H: torch.Tensor, num_heads: int, damping: float = 0.01):
+    """Per-head eigendecomposition. H: [num_heads, d, d]. Returns (evec [H,d,d], evals [H,d]) float32."""
+    d = H.shape[1]
+    evec_all  = torch.zeros(num_heads, d, d, dtype=torch.float32)
+    evals_all = torch.zeros(num_heads, d, dtype=torch.float32)
     for h in range(num_heads):
-        evec_all[h] = _eigh(H[h], damping)
-    return evec_all
+        evec_h, evals_h = _eigh(H[h], damping)
+        evec_all[h]  = evec_h
+        evals_all[h] = evals_h
+    return evec_all, evals_all

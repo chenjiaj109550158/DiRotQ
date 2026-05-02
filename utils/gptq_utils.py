@@ -36,6 +36,7 @@ from tqdm import tqdm
 from .quant_utils import (
     ActQuantWrapper, find_qlayers, round_to_nf4_codebook, NF4_MAX, _match_skip,
     _rotate_and_split_W, _quant_group_int, _quant_group_nvfp4,
+    perm_idx_from_eigendecomp, perm_idx_from_eigendecomp_per_head,
 )
 from .hadamard_utils import fast_hadamard_transform
 
@@ -471,6 +472,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
         rotate_hidden = (qlayer.quantizer.bits < 16 and qlayer.rotation is not None)
         rotate_head   = (qlayer.quantizer.bits < 16 and qlayer.rotation_per_head is not None)
         rotate_had    = (qlayer.quantizer.bits < 16 and getattr(qlayer, 'use_hadamard', False))
+        rotate_perm   = (qlayer.quantizer.bits < 16 and getattr(qlayer, 'perm_idx', None) is not None)
 
         if rotate_hidden:
             # Rotate W, slice off fp16 tail. Both W_low and W_tail live on W's
@@ -620,6 +622,44 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 else:
                     print(f"  WARNING: GPTQ inversion failed for {name}, falling back to rotated RTN")
                 W_low_q = _rtn_low(W_low, gs)
+                n_rtn_fail += 1
+            else:
+                n_gptq += 1
+
+            qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
+            qlayer._unrot_fused = True
+
+        elif rotate_perm:
+            # PCA-only permutation: permute H rows+cols, extract low block, run GPTQ.
+            W_low, W_tail, stitch, _ = _rotate_and_split_W(qlayer, W)
+            n_low = W_low.shape[1]
+
+            H_raw = hessians.get(name)
+            W_low_q = None
+            if H_raw is not None:
+                perm = qlayer.perm_idx.to(device=device)
+                H_dev  = H_raw.to(device=device, dtype=torch.float32)
+                H_perm = H_dev[perm][:, perm]
+                H_low  = H_perm[:n_low, :n_low].contiguous()
+
+                mean_full = H_perm.diagonal().mean().clamp(min=1e-12)
+                mean_low  = H_low.diagonal().mean().clamp(min=1e-12)
+                damp_scale = float(torch.clamp(mean_full / mean_low, min=1.0).item())
+                del H_perm, H_dev
+
+                W_low_q = _gptq_quantize_layer(
+                    W_low.to(device), H_low, bits, groupsize, sym,
+                    damp_pct * damp_scale, block_size, num_inv_tries, device,
+                    nvfp4=nvfp4,
+                )
+                del H_low
+
+            if W_low_q is None:
+                if H_raw is None:
+                    print(f"  WARNING: no Hessian for {name}, falling back to permuted RTN")
+                else:
+                    print(f"  WARNING: GPTQ inversion failed for {name}, falling back to permuted RTN")
+                W_low_q = _rtn_low(W_low, groupsize)
                 n_rtn_fail += 1
             else:
                 n_gptq += 1

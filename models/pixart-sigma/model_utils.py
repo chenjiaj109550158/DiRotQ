@@ -11,7 +11,9 @@ import torch
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.quant_utils import ActQuantWrapper
+from utils.quant_utils import (
+    ActQuantWrapper, perm_idx_from_eigendecomp, perm_idx_from_eigendecomp_per_head,
+)
 from utils.hadamard_utils import generate_sign_flips
 
 
@@ -25,7 +27,8 @@ generation_params = dict(
 
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
-                             hadamard_layers=None, sign_flips_dict=None):
+                             hadamard_layers=None, sign_flips_dict=None,
+                             pca_only_layers=None):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     PixArt-Sigma layer mapping:
@@ -37,16 +40,15 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
       - ff.net.2:          FFN down projection  -> intermediate-dim rotation (U @ R_down)
                             OR Hadamard if in hadamard_layers
 
-    Args:
-        hadamard_layers: list of layer suffix patterns to use Hadamard instead of PCA.
-                         e.g. ["ff.net.2"] for FFN down projection only.
-        sign_flips_dict: optional dict {block_idx: tensor} of optimized sign flips.
-                         If provided, uses these instead of random sign flips.
+    When a layer suffix matches any pattern in pca_only_layers, a perm_idx is assigned
+    instead of a rotation matrix. Falls back to rotation if eigenvalues absent in basis_dict.
     """
     if hadamard_layers is None:
         hadamard_layers = []
     if sign_flips_dict is None:
         sign_flips_dict = {}
+    if pca_only_layers is None:
+        pca_only_layers = []
 
     num_heads = cfg["dims"]["num_heads"]
     head_dim = cfg["dims"]["head"]
@@ -56,8 +58,12 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     R2     = rotation_dict["R2"].float()
     R_down = rotation_dict["R_down"].float()
 
+    def _use_perm(suffix):
+        return any(pat.strip() in suffix for pat in pca_only_layers)
+
     assigned = 0
     hadamard_count = 0
+    n_perm = 0
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
@@ -72,38 +78,66 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
         layer_suffix = ".".join(parts[parts.index("transformer_blocks") + 2:])
 
-        # Check if this layer should use Hadamard
+        # Check if this layer should use Hadamard (only applies to ff.net.2)
         use_had = any(pat in layer_suffix for pat in hadamard_layers)
 
         if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
             evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
-            module.rotation = evec @ R1
+            evals_key = f"layer.{block_idx}.self_attn.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                n_perm += 1
+            else:
+                module.rotation = evec @ R1
             assigned += 1
         elif layer_suffix == "attn2.to_q":
             evec = basis_dict[f"layer.{block_idx}.cross_attn_q"].float()
-            module.rotation = evec @ R1
+            evals_key = f"layer.{block_idx}.cross_attn_q.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                n_perm += 1
+            else:
+                module.rotation = evec @ R1
             assigned += 1
         elif layer_suffix == "attn1.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
-            module.rotation_per_head = torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
+            evals_key = f"layer.{block_idx}.self_attn.value.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp_per_head(
+                    evec_val, basis_dict[evals_key].float()
+                )
+                n_perm += 1
+            else:
+                module.rotation_per_head = torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.num_heads = num_heads
+                module.head_dim  = head_dim
             assigned += 1
         elif layer_suffix == "attn2.to_out.0":
             evec_val_ca = basis_dict[f"layer.{block_idx}.cross_attn_q.value"].float()
-            module.rotation_per_head = torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
+            evals_key = f"layer.{block_idx}.cross_attn_q.value.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp_per_head(
+                    evec_val_ca, basis_dict[evals_key].float()
+                )
+                n_perm += 1
+            else:
+                module.rotation_per_head = torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.num_heads = num_heads
+                module.head_dim  = head_dim
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".proj"):
             evec = basis_dict[f"layer.{block_idx}.ffn"].float()
-            module.rotation = evec @ R1
+            evals_key = f"layer.{block_idx}.ffn.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                n_perm += 1
+            else:
+                module.rotation = evec @ R1
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".2"):
             if use_had:
                 # Hadamard rotation: O(D log D) instead of O(D²)
-                # low_dim = largest power of 2 <= D (here 4096 for D=4608)
-                low_dim = 1 << (intermediate_dim.bit_length() - 1)  # 4096
+                low_dim = 1 << (intermediate_dim.bit_length() - 1)  # 4096 for D=4608
                 module.use_hadamard = True
                 module.hadamard_low_dim = low_dim
                 if block_idx in sign_flips_dict:
@@ -113,11 +147,17 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 hadamard_count += 1
             else:
                 evec = basis_dict[f"layer.{block_idx}.ffn.down_proj"].float()
-                module.rotation = evec @ R_down
+                evals_key = f"layer.{block_idx}.ffn.down_proj.eigenvalues"
+                if _use_perm(layer_suffix) and evals_key in basis_dict:
+                    module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                    n_perm += 1
+                else:
+                    module.rotation = evec @ R_down
             assigned += 1
 
     print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
-          f"({hadamard_count} Hadamard, {assigned - hadamard_count} PCA).")
+          f"({n_perm} perm_idx, {hadamard_count} Hadamard, "
+          f"{assigned - n_perm - hadamard_count} PCA rotation).")
     return assigned
 
 
@@ -200,7 +240,14 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         is_ffn_up    = ".ff." in name and ".net." in name and name.endswith(".proj")
         is_ffn_down  = ".ff." in name and ".net." in name and name.endswith(".2")
 
-        if is_self_attn_qkv:
+        # perm_idx layers use flat hidden-dim layout: high_len_hidden + a_gs groupsize
+        if getattr(module, 'perm_idx', None) is not None:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=high_len_hidden,
+                quant_dtype=qdt,
+            )
+        elif is_self_attn_qkv:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden,

@@ -175,26 +175,39 @@ def collect_basis(transformer, cache_files: list, cfg: dict, batch_size: int = 8
     print("Computing PCA eigendecompositions...")
     basis_dict = {}
     for i in tqdm(range(num_layers)):
-        basis_dict[f"layer.{i}.self_attn"]        = _eigh(_to_f64_cpu(H_sa[i],     cnt_sa[i]))
-        basis_dict[f"layer.{i}.self_attn.value"]  = _eigh_per_head(
-            _to_f64_cpu(H_sa_val[i], cnt_sa_val[i]), num_heads
-        )
-        basis_dict[f"layer.{i}.cross_attn"]       = _eigh(_to_f64_cpu(H_ca[i],     cnt_ca[i]))
-        basis_dict[f"layer.{i}.cross_attn.value"] = _eigh_per_head(
-            _to_f64_cpu(H_ca_val[i], cnt_ca_val[i]), num_heads
-        )
+        evec, evals = _eigh(_to_f64_cpu(H_sa[i], cnt_sa[i]))
+        basis_dict[f"layer.{i}.self_attn"] = evec
+        basis_dict[f"layer.{i}.self_attn.eigenvalues"] = evals
+
+        evec_v, evals_v = _eigh_per_head(_to_f64_cpu(H_sa_val[i], cnt_sa_val[i]), num_heads)
+        basis_dict[f"layer.{i}.self_attn.value"] = evec_v
+        basis_dict[f"layer.{i}.self_attn.value.eigenvalues"] = evals_v
+
+        evec_ca, evals_ca = _eigh(_to_f64_cpu(H_ca[i], cnt_ca[i]))
+        basis_dict[f"layer.{i}.cross_attn"] = evec_ca
+        basis_dict[f"layer.{i}.cross_attn.eigenvalues"] = evals_ca
+
+        evec_cv, evals_cv = _eigh_per_head(_to_f64_cpu(H_ca_val[i], cnt_ca_val[i]), num_heads)
+        basis_dict[f"layer.{i}.cross_attn.value"] = evec_cv
+        basis_dict[f"layer.{i}.cross_attn.value.eigenvalues"] = evals_cv
 
     return basis_dict
 
 
-def _eigh(H: torch.Tensor, damping: float = 0.01) -> torch.Tensor:
+def _eigh(H: torch.Tensor, damping: float = 0.01):
+    """Returns (evec, evals) both float32, eigenvalues in ascending order."""
     H = H + damping * H.diagonal().mean() * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
-    _, evec = torch.linalg.eigh(H)
-    return evec.float()
+    evals, evec = torch.linalg.eigh(H)
+    return evec.float(), evals.float()
 
 
-def _eigh_per_head(H: torch.Tensor, num_heads: int, damping: float = 0.01) -> torch.Tensor:
-    evec_all = torch.zeros_like(H)
+def _eigh_per_head(H: torch.Tensor, num_heads: int, damping: float = 0.01):
+    """Per-head eigendecomposition. H: [num_heads, d, d]. Returns (evec [H,d,d], evals [H,d]) float32."""
+    d = H.shape[1]
+    evec_all  = torch.zeros(num_heads, d, d, dtype=torch.float32)
+    evals_all = torch.zeros(num_heads, d, dtype=torch.float32)
     for h in range(num_heads):
-        evec_all[h] = _eigh(H[h], damping)
-    return evec_all
+        evec_h, evals_h = _eigh(H[h], damping)
+        evec_all[h]  = evec_h
+        evals_all[h] = evals_h
+    return evec_all, evals_all

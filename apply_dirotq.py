@@ -55,7 +55,8 @@ def hash_str_to_int(s: str) -> int:
 
 
 def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
-                           skip_layers=None, hadamard_layers=None, sign_flips_dict=None):
+                           skip_layers=None, hadamard_layers=None, sign_flips_dict=None,
+                           pca_only_layers=None):
     """Wrap linear layers with ActQuantWrapper and assign online PCA rotations."""
     if skip_layers is None:
         skip_layers = cfg["quantization"]["skip_layers"]
@@ -64,10 +65,14 @@ def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_on
     add_actquant(transformer, skip_names=skip_layers)
     qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
     print(f"Wrapped {len(qlayers)} layers with ActQuantWrapper.")
+    pca_only_layers = pca_only_layers or []
+    if pca_only_layers:
+        print(f"PCA-only layers (permutation instead of rotation): {pca_only_layers!r}")
     print("Assigning online PCA rotations to quantizers...")
     assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                              hadamard_layers=hadamard_layers or [],
-                             sign_flips_dict=sign_flips_dict or {})
+                             sign_flips_dict=sign_flips_dict or {},
+                             pca_only_layers=pca_only_layers)
     return transformer
 
 
@@ -152,6 +157,10 @@ if __name__ == "__main__":
     parser.add_argument("--skip-quant-layers", nargs="*", default=None,
                         help="Layer name patterns to skip activation quantization (bits=16). "
                              "E.g. --skip-quant-layers to_out")
+    parser.add_argument("--pca-only-layers", nargs="*", default=None,
+                        help="Layer name patterns to use PCA-only channel permutation (O(D) gather) "
+                             "instead of full rotation matmul (O(D²)). "
+                             "E.g. --pca-only-layers to_q to_k to_v")
     parser.add_argument("--gptq-calib-files", type=int, default=5120) # 128 samples x 20 steps
     parser.add_argument("--gptq-batch-size", type=int, default=8)
     parser.add_argument("--gptq-block-size", type=int, default=128)
@@ -167,6 +176,14 @@ if __name__ == "__main__":
                         help="Use fp32 fused-unrotation path (debug/fallback). "
                              "Default is the fast bf16/fp16 path.")
     args = parser.parse_args()
+
+    # Strip any accidental whitespace from list arguments (e.g. backslash-space in shell)
+    if args.pca_only_layers:
+        args.pca_only_layers = [p.strip() for p in args.pca_only_layers if p.strip()]
+    if args.skip_quant_layers:
+        args.skip_quant_layers = [p.strip() for p in args.skip_quant_layers if p.strip()]
+    if args.hadamard_layers:
+        args.hadamard_layers = [p.strip() for p in args.hadamard_layers if p.strip()]
 
     if args.slow_unrotation:
         from dirotq_fused_unrotation import patch_forward, preconvert_rotations_to_device
@@ -219,16 +236,24 @@ if __name__ == "__main__":
     # The cache must include it because weight quant only rotates+splits when
     # bits<16 — skipped layers have unfused weights, so a cache built with a
     # different skip config can't be reused.
+    import hashlib
     if args.skip_quant_layers:
-        import hashlib
         key = ",".join(sorted(args.skip_quant_layers))
         skip_tag = "_skip" + hashlib.md5(key.encode()).hexdigest()[:8]
     else:
         skip_tag = ""
 
+    # pca_tag encodes --pca-only-layers: weight columns are permuted (not rotated)
+    # for matching layers, so caches from different pca configs are incompatible.
+    if args.pca_only_layers:
+        key = ",".join(sorted(args.pca_only_layers))
+        pca_tag = "_pca" + hashlib.md5(key.encode()).hexdigest()[:8]
+    else:
+        pca_tag = ""
+
     if args.quantized_cache is None:
         method = "gptq" if args.gptq else "rtn"
-        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}_model.pt"
+        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}_model.pt"
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
 
     torch.manual_seed(args.seed)
@@ -236,7 +261,7 @@ if __name__ == "__main__":
 
     if args.output_dir is None:
         method = "gptq" if args.gptq else "rtn"
-        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}")
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}")
 
     if not os.path.exists(rotation_path):
         print(f"Rotation file not found at {rotation_path}, generating...")
@@ -277,7 +302,8 @@ if __name__ == "__main__":
 
     apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
                            skip_layers=skip_layers, hadamard_layers=args.hadamard_layers,
-                           sign_flips_dict=sign_flips_dict)
+                           sign_flips_dict=sign_flips_dict,
+                           pca_only_layers=args.pca_only_layers)
 
     high_len_hidden = rotation_dict["high_len_hidden"]
     high_len_head   = rotation_dict["high_len_head"]
@@ -314,7 +340,12 @@ if __name__ == "__main__":
                 print(f"  ... and {len(unexpected) - 10} more")
         pipe.transformer.load_state_dict(state, strict=False)
         for _, mod in pipe.transformer.named_modules():
-            if isinstance(mod, ActQuantWrapper) and (mod.rotation is not None or mod.rotation_per_head is not None or getattr(mod, 'use_hadamard', False)):
+            if isinstance(mod, ActQuantWrapper) and (
+                mod.rotation is not None or
+                mod.rotation_per_head is not None or
+                getattr(mod, 'use_hadamard', False) or
+                getattr(mod, 'perm_idx', None) is not None
+            ):
                 mod._unrot_fused = True
     else:
         if args.gptq:

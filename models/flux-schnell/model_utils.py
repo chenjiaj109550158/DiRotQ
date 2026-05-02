@@ -31,7 +31,9 @@ import torch
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.quant_utils import ActQuantWrapper
+from utils.quant_utils import (
+    ActQuantWrapper, perm_idx_from_eigendecomp, perm_idx_from_eigendecomp_per_head,
+)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from split_proj_out import split_flux_single_proj_out
@@ -77,7 +79,8 @@ def _block_idx(name: str) -> int | None:
 
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
-                             hadamard_layers=None, sign_flips_dict=None):
+                             hadamard_layers=None, sign_flips_dict=None,
+                             pca_only_layers=None):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     FLUX layer mapping (only applied if the matching basis key is present):
@@ -100,9 +103,15 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
     If basis_dict is empty or a key is missing, the layer is left without a
     rotation (falls through to standard activation quantization).
+
+    When a layer suffix matches any pattern in pca_only_layers, a perm_idx is
+    assigned instead of a rotation matrix. Falls back to rotation if eigenvalues
+    are absent in basis_dict (old basis cache without .eigenvalues entries).
     """
     if sign_flips_dict is None:
         sign_flips_dict = {}
+    if pca_only_layers is None:
+        pca_only_layers = []
 
     num_heads = cfg["dims"]["num_heads"]
     head_dim  = cfg["dims"]["head"]
@@ -117,12 +126,25 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     def _down(evec):
         return evec.float() @ R_down if R_down is not None else evec.float()
 
-    def _per_head(evec):
-        if R2 is None:
-            return evec.float()
-        return torch.bmm(evec.float(), R2.unsqueeze(0).expand(num_heads, -1, -1))
+    def _use_perm(suffix):
+        return any(pat.strip() in suffix for pat in pca_only_layers)
+
+    def _assign_perm_or_rot(module, key, suffix, rot_fn):
+        """Assign perm_idx if pca_only matches and eigenvalues exist, else rotation."""
+        if key not in basis_dict:
+            return False
+        if _use_perm(suffix):
+            evals_key = f"{key}.eigenvalues"
+            if evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(
+                    basis_dict[key].float(), basis_dict[evals_key].float()
+                )
+                return True
+        module.rotation = rot_fn(basis_dict[key])
+        return True
 
     assigned = 0
+    n_perm = 0
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
@@ -133,77 +155,56 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
         is_single = _is_single_block(name)
         parts = name.split(".")
-        # suffix after "{container}.{idx}."
         container = "single_transformer_blocks" if is_single else "transformer_blocks"
         start = parts.index(container) + 2
         suffix = ".".join(parts[start:])
 
+        prev_perm = module.perm_idx
+
         if is_single:
             if suffix in ("attn.to_q", "attn.to_k", "attn.to_v"):
-                key = f"single.{bi}.attn"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"single.{bi}.attn", suffix, _hidden):
                     assigned += 1
             elif suffix == "proj_mlp":
-                key = f"single.{bi}.mlp"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"single.{bi}.mlp", suffix, _hidden):
                     assigned += 1
             elif suffix == "proj_out.linears.0":
-                # Attn-out half of the split proj_out — global rotation.
-                key = f"single.{bi}.attn_out.value"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"single.{bi}.attn_out.value", suffix, _hidden):
                     assigned += 1
             elif suffix == "proj_out.linears.1":
-                # MLP half of the split proj_out — dense FFN-down rotation.
-                key = f"single.{bi}.mlp.down"
-                if key in basis_dict:
-                    module.rotation = _down(basis_dict[key])
+                if _assign_perm_or_rot(module, f"single.{bi}.mlp.down", suffix, _down):
                     assigned += 1
         else:
             if suffix in ("attn.to_q", "attn.to_k", "attn.to_v"):
-                key = f"layer.{bi}.img_attn"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn", suffix, _hidden):
                     assigned += 1
             elif suffix in ("attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"):
-                key = f"layer.{bi}.txt_attn"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn", suffix, _hidden):
                     assigned += 1
             elif suffix == "attn.to_out.0":
-                key = f"layer.{bi}.img_attn.value"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn.value", suffix, _hidden):
                     assigned += 1
             elif suffix == "attn.to_add_out":
-                key = f"layer.{bi}.txt_attn.value"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn.value", suffix, _hidden):
                     assigned += 1
             elif suffix == "ff.net.0.proj":
-                key = f"layer.{bi}.img_ffn"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn", suffix, _hidden):
                     assigned += 1
             elif suffix == "ff.net.2":
-                key = f"layer.{bi}.img_ffn.down"
-                if key in basis_dict:
-                    module.rotation = _down(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn.down", suffix, _down):
                     assigned += 1
             elif suffix == "ff_context.net.0.proj":
-                key = f"layer.{bi}.txt_ffn"
-                if key in basis_dict:
-                    module.rotation = _hidden(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn", suffix, _hidden):
                     assigned += 1
             elif suffix == "ff_context.net.2":
-                key = f"layer.{bi}.txt_ffn.down"
-                if key in basis_dict:
-                    module.rotation = _down(basis_dict[key])
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn.down", suffix, _down):
                     assigned += 1
 
-    print(f"Assigned rotations to {assigned} ActQuantWrapper layers.")
+        if module.perm_idx is not None and prev_perm is None:
+            n_perm += 1
+
+    print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
+          f"({n_perm} perm_idx, {assigned - n_perm} rotation).")
     return assigned
 
 
@@ -290,7 +291,16 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         is_single_proj_out_attn  = is_single and name.endswith(".proj_out.linears.0")
         is_single_proj_out_mlp   = is_single and name.endswith(".proj_out.linears.1")
 
-        if is_attn_qkv or is_double_ff_up or is_single_mlp_up:
+        # perm_idx layers always use flat hidden-dim groupsize and high_len_hidden.
+        # For FFN-down perm_idx layers, high_len_hidden is used instead of high_len_down
+        # since we're sorting globally by variance rather than using the down-proj basis.
+        if getattr(module, 'perm_idx', None) is not None:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=high_len_hidden,
+                quant_dtype=qdt,
+            )
+        elif is_attn_qkv or is_double_ff_up or is_single_mlp_up:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden,

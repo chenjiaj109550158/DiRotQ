@@ -45,9 +45,13 @@ def preconvert_rotations_to_device(transformer, device="cuda"):
         elif mod.rotation_per_head is not None:
             mod.rotation_per_head = mod.rotation_per_head.to(device=device, dtype=torch.float32)
             n += 1
+        elif getattr(mod, 'perm_idx', None) is not None:
+            # perm_idx is int64 — move to device but keep dtype
+            mod.perm_idx = mod.perm_idx.to(device=device)
+            n += 1
         if getattr(mod, 'hadamard_sign_flips', None) is not None:
             mod.hadamard_sign_flips = mod.hadamard_sign_flips.to(device=device, dtype=torch.float32)
-    print(f"Preconverted {n} rotation matrices to fp32 on {device}.")
+    print(f"Preconverted {n} rotation/permutation tensors to fp32/int64 on {device}.")
     return n
 
 
@@ -119,6 +123,15 @@ def _fused_forward(self, x):
                 x = self.quantizer(x_rot).to(x_dtype)
             else:
                 x = x_rot.to(x_dtype)
+
+        elif getattr(self, 'perm_idx', None) is not None:
+            # PCA-only permutation: O(D) gather, weight already pre-permuted.
+            x_perm = x[..., self.perm_idx]
+            if self.quantizer.bits < 16:
+                self.quantizer.find_params(x_perm)
+                x = self.quantizer(x_perm).to(x_dtype)
+            else:
+                x = x_perm.to(x_dtype)
 
         else:
             # Fused but no rotation assigned — just quantize if needed

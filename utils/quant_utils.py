@@ -315,6 +315,13 @@ class ActQuantWrapper(nn.Module):
         self.hadamard_sign_flips = None  # [D] tensor of ±1
         self.hadamard_low_dim = None     # power-of-2 dim for FWHT
 
+        # PCA-only permutation: O(D) gather instead of O(D²) matmul.
+        # perm_idx[i] = original channel that maps to position i after permutation.
+        # Channels are sorted ascending by per-channel variance (low-var first),
+        # so the high-variance tail naturally lands in the fp16 passthrough region.
+        # Weight is pre-permuted offline (W[:, perm_idx]), no unrotation needed.
+        self.perm_idx = None             # [D] int64 tensor or None
+
     def extra_repr(self):
         s = f"Input Quant: {self.quantizer.bits}b"
         if self.quantizer.high_bits_length > 0:
@@ -427,6 +434,14 @@ class ActQuantWrapper(nn.Module):
             else:
                 x = x_unrot_low.to(x_dtype)
 
+        elif self.perm_idx is not None and self.quantizer.bits < 16:
+            # PCA-only: O(D) gather to put low-var channels first, then quantize.
+            # The weight is pre-permuted (W[:, perm_idx]) so no unrotation needed.
+            x = x[..., self.perm_idx.to(x.device)]
+            self.quantizer.find_params(x)
+            x = self.quantizer(x).to(x_dtype)
+            self.quantizer.free()
+
         else:
             # No rotation: standard activation quantization
             if self.quantizer.bits < 16:
@@ -523,6 +538,37 @@ def find_qlayers(module, layers=None, name=""):
                          name=f"{name}.{name1}" if name else name1)
         )
     return res
+
+
+# ---------------------------------------------------------------------------
+# PCA-only permutation helpers
+# ---------------------------------------------------------------------------
+
+def perm_idx_from_eigendecomp(evec: torch.Tensor, evals: torch.Tensor) -> torch.Tensor:
+    """Compute channel permutation from flat PCA eigendecomposition.
+
+    Per-channel variance in the original space:
+        var[i] = sum_j  evec[i, j]^2 * evals[j]
+    Returns perm_idx [D] int64 sorted ascending by variance (low-var first),
+    so the last `high_bits_length` positions are the highest-variance channels.
+    """
+    var = (evec.float() ** 2) @ evals.float()
+    return torch.argsort(var)
+
+
+def perm_idx_from_eigendecomp_per_head(
+    evec_ph: torch.Tensor, evals_ph: torch.Tensor
+) -> torch.Tensor:
+    """Compute global channel permutation from per-head PCA eigendecomposition.
+
+    evec_ph:  [H, d, d] per-head eigenvectors
+    evals_ph: [H, d]    per-head eigenvalues
+    Returns perm_idx [H*d] int64 sorted ascending by per-head variance (global flat sort).
+    """
+    # var_ph[h, i] = sum_j evec_ph[h, i, j]^2 * evals_ph[h, j]
+    var_ph   = torch.einsum('hid,hd->hi', evec_ph.float() ** 2, evals_ph.float())  # [H, d]
+    var_flat = var_ph.reshape(-1)  # [H*d]
+    return torch.argsort(var_flat)
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +684,27 @@ def _rotate_and_split_W(qlayer, W):
 
         return W_low, None, stitch, d
 
+    if getattr(qlayer, 'perm_idx', None) is not None:
+        # PCA-only permutation: reorder columns of W by perm_idx (no rotation matmul).
+        # Low-variance channels come first; high-variance tail stays in fp16.
+        perm = qlayer.perm_idx.to(W_f32.device)  # [D]
+        W_perm = W_f32[:, perm]                   # [out, D]
+        hlen = int(qlayer.quantizer.high_bits_length)
+        if hlen > 0:
+            n_low  = W_perm.shape[1] - hlen
+            W_low  = W_perm[:, :n_low].contiguous()
+            W_tail = W_perm[:, n_low:].contiguous()
+
+            def stitch(W_low_q):
+                return torch.cat([W_low_q.to(W_tail.device), W_tail], dim=1)
+        else:
+            W_low, W_tail = W_perm.contiguous(), None
+
+            def stitch(W_low_q):
+                return W_low_q
+
+        return W_low, W_tail, stitch, None
+
     # No rotation
     def _identity(W_q):
         return W_q
@@ -722,7 +789,8 @@ def rtn_quantize_weights(model, bits=4, groupsize=64, sym=True, skip_names=None)
         rotate = (qlayer.quantizer.bits < 16 and
                   (qlayer.rotation is not None or
                    qlayer.rotation_per_head is not None or
-                   getattr(qlayer, 'use_hadamard', False)))
+                   getattr(qlayer, 'use_hadamard', False) or
+                   getattr(qlayer, 'perm_idx', None) is not None))
 
         if rotate:
             W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)
@@ -753,7 +821,8 @@ def nvfp4_rtn_quantize_weights(model, groupsize=16, skip_names=None):
         rotate = (qlayer.quantizer.bits < 16 and
                   (qlayer.rotation is not None or
                    qlayer.rotation_per_head is not None or
-                   getattr(qlayer, 'use_hadamard', False)))
+                   getattr(qlayer, 'use_hadamard', False) or
+                   getattr(qlayer, 'perm_idx', None) is not None))
 
         if rotate:
             W_low, W_tail, stitch, gs_over = _rotate_and_split_W(qlayer, W)

@@ -19,7 +19,9 @@ Architecture notes:
 import torch
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from utils.quant_utils import ActQuantWrapper
+from utils.quant_utils import (
+    ActQuantWrapper, perm_idx_from_eigendecomp, perm_idx_from_eigendecomp_per_head,
+)
 
 
 # Generation parameters from SVDQuant sana-1.6b.yaml
@@ -32,7 +34,8 @@ generation_params = dict(
 
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
-                             hadamard_layers=None, sign_flips_dict=None):
+                             hadamard_layers=None, sign_flips_dict=None,
+                             pca_only_layers=None):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     Sana layer mapping:
@@ -40,14 +43,26 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
       - attn1.to_out.0:  self-attn out proj        -> per-head rotation   (U_sa_val @ R2)
       - attn2.to_q:      cross-attn query input    -> hidden-dim rotation (U_ca  @ R1)
       - attn2.to_out.0:  cross-attn out proj       -> per-head rotation   (U_ca_val @ R2)
+
+    When a layer suffix matches any pattern in pca_only_layers, a channel permutation
+    index is assigned instead of a rotation matrix (O(D) gather at inference vs O(D²) matmul).
+    Requires eigenvalues in basis_dict (produced by current get_basis.py); falls back to
+    rotation if eigenvalues are absent (old basis cache).
     """
+    if pca_only_layers is None:
+        pca_only_layers = []
+
     num_heads = cfg["dims"]["num_heads"]
     head_dim  = cfg["dims"]["head"]
 
     R1 = rotation_dict["R1"].float()
     R2 = rotation_dict["R2"].float()
 
+    def _use_perm(suffix):
+        return any(pat.strip() in suffix for pat in pca_only_layers)
+
     assigned = 0
+    n_perm = 0
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
@@ -64,30 +79,55 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
         if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
             evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
-            module.rotation = evec @ R1
+            evals_key = f"layer.{block_idx}.self_attn.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                n_perm += 1
+            else:
+                module.rotation = evec @ R1
             assigned += 1
         elif layer_suffix == "attn1.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
-            module.rotation_per_head = torch.bmm(
-                evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
-            )
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
+            evals_key = f"layer.{block_idx}.self_attn.value.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp_per_head(
+                    evec_val, basis_dict[evals_key].float()
+                )
+                n_perm += 1
+            else:
+                module.rotation_per_head = torch.bmm(
+                    evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+                )
+                module.num_heads = num_heads
+                module.head_dim  = head_dim
             assigned += 1
         elif layer_suffix == "attn2.to_q":
             evec = basis_dict[f"layer.{block_idx}.cross_attn"].float()
-            module.rotation = evec @ R1
+            evals_key = f"layer.{block_idx}.cross_attn.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
+                n_perm += 1
+            else:
+                module.rotation = evec @ R1
             assigned += 1
         elif layer_suffix == "attn2.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.cross_attn.value"].float()
-            module.rotation_per_head = torch.bmm(
-                evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
-            )
-            module.num_heads = num_heads
-            module.head_dim  = head_dim
+            evals_key = f"layer.{block_idx}.cross_attn.value.eigenvalues"
+            if _use_perm(layer_suffix) and evals_key in basis_dict:
+                module.perm_idx = perm_idx_from_eigendecomp_per_head(
+                    evec_val, basis_dict[evals_key].float()
+                )
+                n_perm += 1
+            else:
+                module.rotation_per_head = torch.bmm(
+                    evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+                )
+                module.num_heads = num_heads
+                module.head_dim  = head_dim
             assigned += 1
 
-    print(f"Assigned rotations to {assigned} ActQuantWrapper layers.")
+    print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
+          f"({n_perm} perm_idx, {assigned - n_perm} rotation).")
     return assigned
 
 
@@ -145,7 +185,15 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         )
         is_attn_out = ".attn1.to_out" in name or ".attn2.to_out" in name
 
-        if is_self_attn_qkv:
+        # perm_idx layers always use flat (hidden-dim) groupsize and high_len_hidden
+        # since the per-head structure is dissolved into a global channel sort.
+        if getattr(module, 'perm_idx', None) is not None:
+            module.quantizer.configure(
+                bits=a_bits, groupsize=a_gs, sym=nvfp4,
+                high_bits_length=high_len_hidden,
+                quant_dtype=qdt,
+            )
+        elif is_self_attn_qkv:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden,
