@@ -4,6 +4,16 @@ Cold-start checklist for `report_flux_w4a4_no_rot_ffdown.py` (2 configs:
 fp16 + DiRotQ-W4A4) and `report_flux_3_configs.py` (3 configs: fp16 +
 A16W4 baseline + DiRotQ-W4A4) on a fresh machine.
 
+> **Blackwell / NVFP4?** This file is the INT4 (sm_75–89, RTX 4090) repro.
+> For the NVFP4 path on Blackwell (sm_120) run
+> `report_flux_nvfp4_no_rot_ffdown.py` instead — int4 tensor cores don't
+> exist on Blackwell. The env that produced the NVFP4 numbers: the `dirotq`
+> conda env with **torch 2.11.0+cu128** and the prebuilt nunchaku wheel
+> `nunchaku-1.2.1+cu12.8torch2.11-cp312-cp312-linux_x86_64.whl` (from the
+> nunchaku GitHub releases — no source build, nvcc ≥ 12.8 only needed if you
+> compile). torchao is **not** required. See `README.md` and
+> `NVFP4_SPEEDUP_STEPS.md` for the full picture.
+
 ## 1. Hardware
 
 - **GPU**: NVIDIA RTX 4090 (24 GB) or any **sm_89 / Ada-class** card

@@ -1,0 +1,95 @@
+{
+  "report": "Flux-dev A16W4 (weight-only NVFP4)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "hardware_vram_gb": 96,
+  "source": "weight-only NVFP4 (group-16, per-channel global scale), fused-Triton-dequant + cuBLAS, no rotation",
+  "weights_gb": {
+    "fp16": 23.8,
+    "a16w4_quant_only": 4.845244416,
+    "a16w4_model_footprint": 11.436153344
+  },
+  "fp16_phase": {
+    "native": {
+      "1": {
+        "ms": 390.7488660006493,
+        "std_ms": 0.036640858204790405,
+        "peak_gb": 24.308484096
+      },
+      "2": {
+        "ms": 796.3261024988242,
+        "std_ms": 0.3650502401061485,
+        "peak_gb": 24.79033088
+      },
+      "4": {
+        "ms": 1662.1209409995572,
+        "std_ms": 2.1413102528778096,
+        "peak_gb": 25.762413056
+      }
+    }
+  },
+  "a16w4_phase": {
+    "measurements": {
+      "1": {
+        "ms": 408.24842850088316,
+        "std_ms": 0.07237732900496179,
+        "peak_gb": 11.949514752
+      },
+      "2": {
+        "ms": 821.3833090003391,
+        "std_ms": 0.9341997800926027,
+        "peak_gb": 12.422579712
+      },
+      "4": {
+        "ms": 1694.4634699993912,
+        "std_ms": 0.5748410443384081,
+        "peak_gb": 13.394661888
+      }
+    },
+    "w4_weight_gb": 11.436153344,
+    "quant_weight_gb": 4.845244416,
+    "n_quantized": 418,
+    "source": "weight-only NVFP4 (group-16, per-channel global scale), fused-Triton-dequant + cuBLAS, no rotation"
+  },
+  "summary": [
+    {
+      "B": 1,
+      "fp16_ms": 390.7488660006493,
+      "a16w4_ms": 408.24842850088316,
+      "fp16_peak_gb": 24.308484096,
+      "a16w4_peak_gb": 11.949514752,
+      "speedup": 0.9571350156460038,
+      "fp16_weights_gb": 23.8,
+      "fp16_acts_gb": 0.5084840960000001,
+      "a16w4_weights_gb": 11.436153344,
+      "a16w4_acts_gb": 0.5133614080000015,
+      "mem_ratio": 2.034265373991983
+    },
+    {
+      "B": 2,
+      "fp16_ms": 796.3261024988242,
+      "a16w4_ms": 821.3833090003391,
+      "fp16_peak_gb": 24.79033088,
+      "a16w4_peak_gb": 12.422579712,
+      "speedup": 0.9694938937437009,
+      "fp16_weights_gb": 23.8,
+      "fp16_acts_gb": 0.9903308799999984,
+      "a16w4_weights_gb": 11.436153344,
+      "a16w4_acts_gb": 0.986426368,
+      "mem_ratio": 1.9955863801826093
+    },
+    {
+      "B": 4,
+      "fp16_ms": 1662.1209409995572,
+      "a16w4_ms": 1694.4634699993912,
+      "fp16_peak_gb": 25.762413056,
+      "a16w4_peak_gb": 13.394661888,
+      "speedup": 0.9809128201507669,
+      "fp16_weights_gb": 23.8,
+      "fp16_acts_gb": 1.962413055999999,
+      "a16w4_weights_gb": 11.436153344,
+      "a16w4_acts_gb": 1.9585085440000007,
+      "mem_ratio": 1.9233343306022537
+    }
+  ],
+  "timestamp": "2026-06-01T23:41:07.059251Z"
+}

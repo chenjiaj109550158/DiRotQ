@@ -385,3 +385,75 @@ def convert_dirotq_low_weight_to_nunchaku(
         'rank': rank,
         'group_size': group_size,
     }
+
+
+# E2M1 max representable magnitude (top FP4 code). nvfp4 group scale = amax / 6.
+NVFP4_MAX = 6.0
+
+
+def convert_dirotq_low_weight_to_nunchaku_fp4(
+    W_low: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    rank: int = 32,
+):
+    """NVFP4 sibling of :func:`convert_dirotq_low_weight_to_nunchaku`.
+
+    Packs a DiRotQ low-region weight into the tensors nunchaku's
+    ``SVDQW4A4Linear(precision="nvfp4")`` expects for the FP4 (E2M1) GEMM
+    path on Blackwell. Differences from the INT4 wrapper:
+
+      - ``group_size == 16`` (NVFP4), which trips the micro-scale FP8 packing
+        branch in :meth:`NunchakuWeightPacker.pack_scale`.
+      - per-group scale = ``amax(|W_g|) / 6`` (top E2M1 code), mirroring the
+        accuracy-side recipe in ``utils/quant_utils._quant_group_nvfp4``.
+      - the converter is called with ``float_point=True`` so weights round to
+        the E2M1 codebook instead of signed int4.
+      - ``wscales`` come back as ``float8_e4m3fn`` in the micro-scale layout.
+
+    Like the INT4 wrapper this is a plain RTN pack with zero LoRA and no
+    smoothing — enough to drive the *real* FP4 kernel for the latency/memory
+    measurement. The per-output-channel scale (``wcscales``) and the global
+    scalar (``wtscale``) that NVFP4 also supports are left at their identity
+    values (ones / 1.0) by the caller; folding the group scale into ``/6``
+    keeps the dequant ``W ~= e2m1 * wscale`` self-consistent. This is *not*
+    the fully-calibrated deepcompressor recipe (that is what
+    ``apply_dirotq.py --nvfp4`` measures for accuracy); kernel latency and
+    weight footprint are identical either way.
+
+    Returns a dict with the same keys as the INT4 wrapper. The caller sets
+    ``wcscales``/``wtscale`` on the module separately.
+    """
+    assert W_low.ndim == 2
+    assert W_low.dtype in (torch.float16, torch.bfloat16)
+    N, n_low = W_low.shape
+    assert n_low % group_size == 0, f"n_low={n_low} not multiple of {group_size}"
+
+    device, dtype = W_low.device, W_low.dtype
+    Wg = W_low.float().reshape(N, n_low // group_size, group_size)
+    # Round the group scale through e4m3 *before* quantizing the weight, so the
+    # codes match what the kernel will dequant with (wscales is stored e4m3).
+    w_scale = (Wg.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / NVFP4_MAX)
+    w_scale = w_scale.to(torch.float8_e4m3fn).to(dtype)
+
+    smooth = torch.ones(n_low, dtype=dtype, device=device)
+    bias_ = bias if bias is not None else torch.zeros(N, dtype=dtype, device=device)
+
+    lora_down_fp = torch.zeros(rank, n_low, dtype=dtype, device=device)
+    lora_up_fp = torch.zeros(N, rank, dtype=dtype, device=device)
+
+    qweight, wscales, bias_packed, smooth_packed, (lora_d, lora_u) = \
+        convert_to_nunchaku_w4x4y16(
+            weight=W_low, scale=w_scale, bias=bias_, smooth=smooth,
+            lora=(lora_down_fp, lora_up_fp), float_point=True)
+
+    return {
+        'qweight': qweight,
+        'wscales': wscales,
+        'bias': bias_packed.view(-1),
+        'smooth': smooth_packed,
+        'lora_down': lora_d,
+        'lora_up': lora_u,
+        'rank': rank,
+        'group_size': group_size,
+    }

@@ -1,0 +1,82 @@
+{
+  "report": "Flux-dev NVFP4 W4A4 \u2014 DiRotQ on SVDQuant FP4 kernel (no-rot ff_down)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "hardware_vram_gb": 96,
+  "w4a4_source": "DiRotQ NVFP4 packing on nunchaku v2 SVDQuant FP4 kernel (rot K=3072, no-rot K=12288)",
+  "weights_gb": {
+    "fp16": 23.8,
+    "w4a4_measured": 11.81946112
+  },
+  "weight_savings_x": 2.01362818138362,
+  "fp16_phase": {
+    "native": {
+      "1": {
+        "ms": 391.3806055002169,
+        "std_ms": 0.09711050953661379,
+        "peak_gb": 24.308484096
+      },
+      "2": {
+        "ms": 797.1488630000749,
+        "std_ms": 0.07712130742836462,
+        "peak_gb": 24.79033088
+      },
+      "4": {
+        "ms": 1663.2232689994453,
+        "std_ms": 1.358612341802599,
+        "peak_gb": 25.762413056
+      }
+    },
+    "offload": {}
+  },
+  "w4a4_phase": {
+    "measurements": {
+      "1": {
+        "ms": 191.71236399961344,
+        "std_ms": 0.1671826710179185,
+        "peak_gb": 12.138868736
+      },
+      "2": {
+        "ms": 370.1859194993631,
+        "std_ms": 0.07123181591461081,
+        "peak_gb": 12.440589824
+      },
+      "4": {
+        "ms": 744.7219260002385,
+        "std_ms": 0.19772261212328926,
+        "peak_gb": 13.05025792
+      }
+    },
+    "w4a4_weight_gb": 11.81946112,
+    "source": "DiRotQ NVFP4 packing on nunchaku v2 SVDQuant FP4 kernel (rot K=3072, no-rot K=12288)"
+  },
+  "summary": [
+    {
+      "B": 1,
+      "fp16_ms": 391.3806055002169,
+      "fp16_label": "native",
+      "fp16_peak_native_gb": 24.308484096,
+      "w4a4_ms": 191.71236399961344,
+      "w4a4_peak_gb": 12.138868736,
+      "speedup": 2.041499031856944
+    },
+    {
+      "B": 2,
+      "fp16_ms": 797.1488630000749,
+      "fp16_label": "native",
+      "fp16_peak_native_gb": 24.79033088,
+      "w4a4_ms": 370.1859194993631,
+      "w4a4_peak_gb": 12.440589824,
+      "speedup": 2.1533743478901997
+    },
+    {
+      "B": 4,
+      "fp16_ms": 1663.2232689994453,
+      "fp16_label": "native",
+      "fp16_peak_native_gb": 25.762413056,
+      "w4a4_ms": 744.7219260002385,
+      "w4a4_peak_gb": 13.05025792,
+      "speedup": 2.233348060439559
+    }
+  ],
+  "timestamp": "2026-06-01T22:42:53.585869Z"
+}
