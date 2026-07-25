@@ -1,0 +1,44 @@
+{
+  "report": "DiRotQ-W4A4 (no-rot ff_down) kernel-level latency breakdown",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "method": "torch.profiler self CUDA device time, averaged over 8 iters after 3 warmup, bucketed by kernel-name substring match",
+  "results": {
+    "1": {
+      "buckets_ms": {
+        "high_precision_bf16": 7.6536632500000055,
+        "norm_elementwise": 22.227875375000085,
+        "other": 2.1374474999999844,
+        "rotation": 52.38915937500004,
+        "quant_dequant": 6.139385125000014,
+        "int4_gemm": 87.06804699999996,
+        "attention_bf16": 96.81994000000007
+      },
+      "profiled_total_ms": 274.43551762500016
+    },
+    "2": {
+      "buckets_ms": {
+        "high_precision_bf16": 9.447409375,
+        "norm_elementwise": 76.81116962499961,
+        "other": 3.8456327499999605,
+        "rotation": 91.81817837500004,
+        "quant_dequant": 12.493087500000016,
+        "int4_gemm": 161.51011124999982,
+        "attention_bf16": 192.62895099999994
+      },
+      "profiled_total_ms": 548.5545398749994
+    },
+    "4": {
+      "buckets_ms": {
+        "other": 17.951242500000138,
+        "quant_dequant": 29.28970287500002,
+        "int4_gemm": 321.5434718750001,
+        "norm_elementwise": 160.33868287500027,
+        "attention_bf16": 371.82305499999967,
+        "rotation": 182.68582225000011,
+        "high_precision_bf16": 9.897498500000012
+      },
+      "profiled_total_ms": 1093.5294758750003
+    }
+  },
+  "timestamp": "2026-07-25T03:59:43.579251+00:00"
+}
