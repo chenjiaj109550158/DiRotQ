@@ -163,7 +163,8 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
 def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=False, hadamard_layers=None, a_groupsize=None,
-                                 high_len_down=0, skip_quant_layers=None):
+                                 high_len_down=0, skip_quant_layers=None,
+                                 activation_format="nvfp4", format_stats=None):
     """Configure mixed-precision activation quantizers by PixArt-Sigma layer type.
 
     When nvfp4=False (INT4):
@@ -171,9 +172,10 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
       - attn to_out: groupsize=head_dim (per head per token), asymmetric
       - FFN down-proj: groupsize=64, no mixed-precision
 
-    When nvfp4=True (NF4):
+    When nvfp4=True (FP4):
       - All layers: groupsize=16 (except to_out: groupsize=72/head_dim), symmetric
-      - NF4 codebook quantization
+      - ``activation_format`` selects legacy E2M1 or a hardware-faithful
+        fixed/mixed FP4 mode; weight quantization and rotation are unchanged
     """
     a_bits = cfg["quantization"]["a_bits"]
     head_dim = cfg["dims"]["head"]
@@ -182,7 +184,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         nvfp4_cfg = cfg.get("nvfp4", {})
         a_gs = nvfp4_cfg.get("a_groupsize", 16)
         a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
-        qdt = "nvfp4"
+        qdt = activation_format
     else:
         a_gs = 64
         a_gs_out = head_dim
@@ -227,6 +229,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
+        module.quantizer.format_stats = format_stats
 
         # Skip activation quantization for specified layers (bits=16 = no-op)
         if any(pat in name for pat in skip_quant_layers):

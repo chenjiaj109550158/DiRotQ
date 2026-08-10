@@ -30,6 +30,7 @@ from utils.quant_utils import (
     rtn_quantize_weights, nvfp4_rtn_quantize_weights,
 )
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
+from utils.tilemixfp4_utils import FormatSelectionStats
 
 _ROOT = Path(__file__).parent
 
@@ -82,16 +83,17 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
         samples = json.load(f)
 
     output_dir = Path(output_dir)
-    existing = sum(1 for img_id, info in samples.items()
-                   if (output_dir / info["category"] / f"{img_id}.png").exists())
-    print(f"Found {existing}/{len(samples)} images already generated.")
-
-    to_generate = [(img_id, info) for img_id, info in samples.items()
-                   if not (output_dir / info["category"] / f"{img_id}.png").exists()]
-
+    target_samples = list(samples.items())
     if max_images is not None:
-        to_generate = to_generate[:max_images]
-        print(f"Limiting to {max_images} images for testing.")
+        target_samples = target_samples[:max_images]
+        print(f"Limiting to the first {max_images} images.")
+
+    existing = sum(1 for img_id, info in target_samples
+                   if (output_dir / info["category"] / f"{img_id}.png").exists())
+    print(f"Found {existing}/{len(target_samples)} target images already generated.")
+
+    to_generate = [(img_id, info) for img_id, info in target_samples
+                   if not (output_dir / info["category"] / f"{img_id}.png").exists()]
 
     if not to_generate:
         print("Nothing to generate.")
@@ -140,10 +142,25 @@ if __name__ == "__main__":
                         help="Generate only N images (for testing)")
     parser.add_argument("--generate", action="store_true", default=True)
     parser.add_argument("--no-generate", action="store_false", dest="generate")
+    parser.add_argument(
+        "--fp16-reference", action="store_true",
+        help=("Generate from the untouched fp16 pipeline: no ActQuantWrapper, "
+              "rotation, activation quantization, or weight quantization"),
+    )
     parser.add_argument("--gptq", action="store_true", default=False,
                         help="Use GPTQ weight quantization instead of RTN")
     parser.add_argument("--nvfp4", action="store_true", default=False,
                         help="Use NF4 (FP4 E2M1) quantization instead of INT4")
+    parser.add_argument(
+        "--activation-format",
+        choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"),
+        default="nvfp4",
+        help=("Activation fake quant used with --nvfp4 weights: nvfp4 is the "
+              "legacy DiRotQ E2M1 baseline; nvfp4-hw is fixed E2M1 with one "
+              "FP32 global scale and E4M3 group scales; e0m3 and both oracle "
+              "modes share exactly the nvfp4-hw scale hierarchy "
+              "(default: nvfp4)"),
+    )
     parser.add_argument("--a-bits", type=int, default=None,
                         help="Override activation bits (default: from config)")
     parser.add_argument("--a-groupsize", type=int, default=None,
@@ -175,7 +192,25 @@ if __name__ == "__main__":
     parser.add_argument("--slow-unrotation", action="store_true",
                         help="Use fp32 fused-unrotation path (debug/fallback). "
                              "Default is the fast bf16/fp16 path.")
+    parser.add_argument(
+        "--collect-format-stats", action="store_true",
+        help="Count global E2M1/E0M3 oracle selections using device-side counters",
+    )
+    parser.add_argument(
+        "--format-stats-output", default=None,
+        help="JSON output path for --collect-format-stats",
+    )
     args = parser.parse_args()
+
+    if args.activation_format != "nvfp4" and not args.nvfp4:
+        parser.error("non-default --activation-format requires --nvfp4 weights")
+    oracle_formats = {"block-mix-oracle", "tile-mix-oracle"}
+    if args.collect_format_stats and args.activation_format not in oracle_formats:
+        parser.error("--collect-format-stats requires an oracle activation format")
+    if args.collect_format_stats != bool(args.format_stats_output):
+        parser.error("--collect-format-stats and --format-stats-output must be used together")
+    if args.fp16_reference and (args.gptq or args.nvfp4 or args.collect_format_stats):
+        parser.error("--fp16-reference cannot be combined with quantization or format stats")
 
     # Strip any accidental whitespace from list arguments (e.g. backslash-space in shell)
     if args.pca_only_layers:
@@ -251,6 +286,12 @@ if __name__ == "__main__":
     else:
         pca_tag = ""
 
+    # Activation format changes runtime fake quantization only.  It must not
+    # enter the weight-cache key, because all activation modes deliberately reuse
+    # the same NVFP4 E2M1 GPTQ weights.  It is included only in default output
+    # naming to prevent experimental images from colliding with the baseline.
+    act_tag = "" if args.activation_format == "nvfp4" else f"_act-{args.activation_format}"
+
     if args.quantized_cache is None:
         method = "gptq" if args.gptq else "rtn"
         cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}_model.pt"
@@ -261,7 +302,48 @@ if __name__ == "__main__":
 
     if args.output_dir is None:
         method = "gptq" if args.gptq else "rtn"
-        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}")
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{act_tag}")
+
+    if args.nvfp4:
+        print(f"Activation fake-quant format: {args.activation_format}")
+
+    pipeline_cls_path = cfg["pipeline_class"]
+    mod_name, cls_name = pipeline_cls_path.rsplit(".", 1)
+    PipelineClass = getattr(importlib.import_module(mod_name), cls_name)
+
+    dtype_str = cfg.get("dtype", "fp16")
+    torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[dtype_str]
+    print(f"Loading pipeline ({pipeline_cls_path}) in {dtype_str}...")
+    pipe = PipelineClass.from_pretrained(
+        model_id, torch_dtype=torch_dtype, use_safetensors=True
+    )
+
+    # Exit before reading DiRotQ basis/rotation caches, add_actquant(), or any
+    # weight quantizer.  This is the untouched full-precision reference path.
+    if args.fp16_reference:
+        wrapped = sum(isinstance(mod, ActQuantWrapper) for mod in pipe.transformer.modules())
+        if wrapped != 0:
+            raise RuntimeError(f"fp16 reference unexpectedly contains {wrapped} ActQuantWrapper layers")
+        print("FP16 reference verified: 0 ActQuantWrapper layers; skipping rotation and quantization.")
+        if preprocess_transformer is not None:
+            preprocess_transformer(pipe.transformer, cfg)
+        if args.generate:
+            print("Enabling model CPU offload for untouched fp16 pipeline...")
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception as e:
+                print(f"enable_model_cpu_offload failed ({e}); falling back to pipe.to('cuda').")
+                pipe = pipe.to("cuda")
+            generate_images(
+                pipe, args.output_dir, args.dataset, generation_params,
+                max_images=args.max_images, batch_size=args.batch_size,
+            )
+        wrapped = sum(isinstance(mod, ActQuantWrapper) for mod in pipe.transformer.modules())
+        if wrapped != 0:
+            raise RuntimeError(f"fp16 reference ended with {wrapped} ActQuantWrapper layers")
+        print("FP16 reference complete: 0 ActQuantWrapper layers.")
+        print("All done.")
+        raise SystemExit(0)
 
     if not os.path.exists(rotation_path):
         print(f"Rotation file not found at {rotation_path}, generating...")
@@ -279,17 +361,6 @@ if __name__ == "__main__":
     rotation_dict = torch.load(rotation_path, map_location="cpu", weights_only=False)
     print("Rotations:", {k: v.shape if isinstance(v, torch.Tensor) else v
                          for k, v in rotation_dict.items()})
-
-    pipeline_cls_path = cfg["pipeline_class"]
-    mod_name, cls_name = pipeline_cls_path.rsplit(".", 1)
-    PipelineClass = getattr(importlib.import_module(mod_name), cls_name)
-
-    dtype_str = cfg.get("dtype", "fp16")
-    torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[dtype_str]
-    print(f"Loading pipeline ({pipeline_cls_path}) in {dtype_str}...")
-    pipe = PipelineClass.from_pretrained(
-        model_id, torch_dtype=torch_dtype, use_safetensors=True
-    )
 
     sign_flips_dict = None
     if args.sign_flips:
@@ -309,10 +380,17 @@ if __name__ == "__main__":
     high_len_head   = rotation_dict["high_len_head"]
     high_len_down   = rotation_dict.get("high_len_down", 0)
 
+    format_stats = None
+    if args.collect_format_stats:
+        unit = "block" if args.activation_format == "block-mix-oracle" else "tile"
+        format_stats = FormatSelectionStats(selection_unit=unit)
+
     configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=args.nvfp4, hadamard_layers=args.hadamard_layers or [],
                                  a_groupsize=args.a_groupsize, high_len_down=high_len_down,
-                                 skip_quant_layers=args.skip_quant_layers or [])
+                                 skip_quant_layers=args.skip_quant_layers or [],
+                                 activation_format=args.activation_format,
+                                 format_stats=format_stats)
 
     cache_path = Path(args.quantized_cache)
     if cache_path.exists():
@@ -414,5 +492,17 @@ if __name__ == "__main__":
             pipe = pipe.to("cuda")
         preconvert_rotations_to_device(pipe.transformer, device="cuda")
         generate_images(pipe, args.output_dir, args.dataset, generation_params, max_images=args.max_images, batch_size=args.batch_size)
+
+    if format_stats is not None:
+        stats = {
+            "activation_format": args.activation_format,
+            **format_stats.snapshot(),
+        }
+        stats_path = Path(args.format_stats_output)
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+            f.write("\n")
+        print(f"Format selection stats saved to {stats_path}: {stats}")
 
     print("All done.")

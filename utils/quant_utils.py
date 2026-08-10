@@ -7,6 +7,13 @@ import torch.nn as nn
 
 from . import hadamard_utils
 from .hadamard_utils import fast_hadamard_transform
+from .tilemixfp4_utils import fake_quantize_activation
+
+
+FP4_ACTIVATION_FORMATS = {
+    "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+}
+EXPERIMENTAL_FP4_ACTIVATION_FORMATS = FP4_ACTIVATION_FORMATS - {"nvfp4"}
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +110,8 @@ class ActQuantizer(nn.Module):
         self.groupsize = -1
         self.sym = False
         self.clip_ratio = 1.0
-        self.quant_dtype = "int"  # "int" or "nvfp4"
+        self.quant_dtype = "int"  # int or one of FP4_ACTIVATION_FORMATS
+        self.format_stats = None
 
     def free(self):
         self.zero = None
@@ -118,6 +126,13 @@ class ActQuantizer(nn.Module):
         # NF4 with groupsize: fp16/bf16 split first, then group only the 4-bit region
         if self.quant_dtype == "nvfp4" and self.groupsize > 0:
             return self._forward_nvfp4_grouped(x, x_dtype)
+
+        # Hardware-oriented FP4 modes use one global scale over exactly this
+        # call's low-precision region, then 1x16 E4M3 block scales.  Candidate
+        # calculation and selection are performed by the pure PyTorch fake
+        # quantizer, while the high-precision tail is split off and untouched.
+        if self.quant_dtype in EXPERIMENTAL_FP4_ACTIVATION_FORMATS:
+            return self._forward_experimental_fp4(x, x_dtype)
 
         # Split: quantized region first, bf16/fp16 passthrough tail.
         # Pad quantized region to next multiple of groupsize if needed, quantize, trim.
@@ -179,6 +194,21 @@ class ActQuantizer(nn.Module):
             return torch.cat([x_q_out, x_h], dim=-1).to(x_dtype)
         return x_q_out.to(x_dtype)
 
+    def _forward_experimental_fp4(self, x, x_dtype):
+        """Hardware-faithful FP4 on the low region; fp16/bf16 tail passes through."""
+        q_len = x.shape[-1] - self.high_bits_length
+        x_q = x[..., :q_len]
+        x_h = x[..., q_len:] if self.high_bits_length > 0 else None
+        x_q_out = fake_quantize_activation(
+            x_q,
+            self.quant_dtype,
+            clip_ratio=self.clip_ratio,
+            format_stats=self.format_stats,
+        )
+        if x_h is not None:
+            return torch.cat([x_q_out, x_h], dim=-1).to(x_dtype)
+        return x_q_out.to(x_dtype)
+
     def configure(
         self,
         bits,
@@ -189,8 +219,8 @@ class ActQuantizer(nn.Module):
         quant_dtype="int",
     ):
         self.quant_dtype = quant_dtype
-        if quant_dtype == "nvfp4":
-            sym = True  # NF4 is always symmetric
+        if quant_dtype in FP4_ACTIVATION_FORMATS:
+            sym = True  # all FP4 codebooks are signed/symmetric
         _, self.maxq = get_minq_maxq(bits, sym)
         self.bits = bits
         self.groupsize = groupsize
@@ -217,6 +247,10 @@ class ActQuantizer(nn.Module):
 
     def find_params(self, x):
         is_nvfp4 = (self.quant_dtype == "nvfp4")
+
+        # Experimental FP4 modes compute per-block candidate scales inline.
+        if self.quant_dtype in EXPERIMENTAL_FP4_ACTIVATION_FORMATS:
+            return
 
         # NF4 with groupsize: scale computation is done inline in _forward_nvfp4_grouped
         if is_nvfp4 and self.groupsize > 0:
