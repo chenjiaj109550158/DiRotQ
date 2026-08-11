@@ -32,6 +32,14 @@ from utils.quant_utils import (
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 from utils.tilemixfp4_utils import FormatSelectionStats
 from utils.output_tilemixfp4_utils import OutputOracleFormatStats
+from utils.e0joint_gptq import (
+    OBJECTIVE_VERSION as E0JOINT_OBJECTIVE_VERSION,
+    build_e0joint_gptq,
+    sha256_file,
+    validate_e0joint_cache_path,
+    validate_e0joint_metadata,
+    write_e0joint_metadata,
+)
 
 _ROOT = Path(__file__).parent
 
@@ -240,6 +248,19 @@ if __name__ == "__main__":
     parser.add_argument("--gptq-batch-size", type=int, default=8)
     parser.add_argument("--gptq-block-size", type=int, default=128)
     parser.add_argument("--gptq-damp-pct", type=float, default=0.01)
+    parser.add_argument(
+        "--e0joint-gptq", action="store_true",
+        help=("SANA-only feasibility objective min ||AW-Q_E0(A) Q_E2(W)||²; "
+              "requires fixed e0m3 activation, random-R, NVFP4 and GPTQ"),
+    )
+    parser.add_argument(
+        "--e0joint-standard-cache", default=None,
+        help="Standard SANA NVFP4 E2M1 GPTQ cache used only for objective comparison",
+    )
+    parser.add_argument(
+        "--e0joint-report-dir", default=None,
+        help="Output directory for per-layer/aggregate E0-joint objective reports",
+    )
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Batch size for image generation (default: 1)")
     parser.add_argument("--seed", type=int, default=42,
@@ -303,6 +324,19 @@ if __name__ == "__main__":
             parser.error("a16w4-residual requires GPTQ weights")
         if args.residual_rotation != "random":
             parser.error("a16w4-residual requires the random residual rotation basis")
+    if args.e0joint_gptq:
+        if args.model != "sana-1.6b":
+            parser.error("--e0joint-gptq is restricted to SANA-1.6B")
+        if not (args.gptq and args.nvfp4):
+            parser.error("--e0joint-gptq requires --gptq and --nvfp4")
+        if args.activation_format != "e0m3":
+            parser.error("--e0joint-gptq requires --activation-format e0m3")
+        if args.residual_rotation != "random":
+            parser.error("--e0joint-gptq requires random residual rotation")
+        if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
+            parser.error("--e0joint-gptq requires the unmodified official SANA routing")
+    elif args.e0joint_standard_cache or args.e0joint_report_dir:
+        parser.error("E0-joint cache/report options require --e0joint-gptq")
     identity_models = {"pixart-sigma", "sana-1.6b"}
     if args.residual_rotation != "random" and args.model not in identity_models:
         parser.error(
@@ -384,20 +418,28 @@ if __name__ == "__main__":
     else:
         pca_tag = ""
 
-    # Activation format changes runtime fake quantization only.  It must not
-    # enter the weight-cache key, because all activation modes deliberately reuse
-    # the same NVFP4 E2M1 GPTQ weights.  It is included only in default output
-    # naming to prevent experimental images from colliding with the baseline.
+    # Activation format normally changes runtime fake quantization only and is
+    # absent from the weight key.  E0-joint is the sole explicit exception: its
+    # offline weight objective depends on E0 activations and must be isolated.
     act_tag = "" if args.activation_format == "nvfp4" else f"_act-{args.activation_format}"
+    if args.e0joint_gptq:
+        act_tag += "_e0joint"
     residual_tag = residual_rotation_cache_tag(args.residual_rotation)
 
     if args.quantized_cache is None:
-        method = "gptq" if args.gptq else "rtn"
-        cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}"
-        cache_name = quantized_weight_cache_name(cache_prefix, args.residual_rotation)
+        if args.e0joint_gptq:
+            cache_name = "nvfp4_g16_e0joint_gptq_model.pt"
+        else:
+            method = "gptq" if args.gptq else "rtn"
+            cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}"
+            cache_name = quantized_weight_cache_name(cache_prefix, args.residual_rotation)
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
     elif args.residual_rotation == "identity" and "rr-identity" not in Path(args.quantized_cache).name:
         parser.error("identity residual rotation requires an identity-tagged quantized cache")
+    try:
+        validate_e0joint_cache_path(Path(args.quantized_cache), args.e0joint_gptq)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -515,6 +557,19 @@ if __name__ == "__main__":
             f"weight cache; refusing to create a new cache at {cache_path}"
         )
     if cache_path.exists():
+        if args.e0joint_gptq:
+            validate_e0joint_metadata(cache_path, {
+                "objective_version": E0JOINT_OBJECTIVE_VERSION,
+                "activation_format": "e0m3",
+                "weight_format": "nvfp4-e2m1",
+                "groupsize": 16,
+                "calibration_count": args.gptq_calib_files,
+                "damp_pct": args.gptq_damp_pct,
+                "residual_rotation": "random",
+                "basis_sha256": sha256_file(Path(basis_path)),
+                "rotation_sha256": sha256_file(Path(rotation_path)),
+                "active_layers": 120,
+            })
         print(f"Loading quantized weights from cache: {cache_path}")
         state = torch.load(cache_path, map_location="cpu", weights_only=False)
         model_keys = set(pipe.transformer.state_dict().keys())
@@ -578,7 +633,42 @@ if __name__ == "__main__":
                 f"NVFP4 E2M1 GPTQ weights; native activation dtype={torch_dtype}."
             )
     else:
-        if args.gptq:
+        e0joint_result = None
+        if args.e0joint_gptq:
+            print("Moving transformer to CUDA for E0-aware joint GPTQ calibration...")
+            pipe.transformer = pipe.transformer.to("cuda")
+            standard_cache = Path(
+                args.e0joint_standard_cache or
+                (_ROOT / "models" / args.model / "quantized_cache" /
+                 "nvfp4_g16_gptq_model.pt")
+            )
+            report_dir = Path(
+                args.e0joint_report_dir or
+                (_ROOT / "models" / args.model / "e0joint_gptq")
+            )
+            e0joint_result = build_e0joint_gptq(
+                pipe.transformer,
+                calib_dir=calib_dir,
+                standard_cache=standard_cache,
+                report_dir=report_dir,
+                basis_path=Path(basis_path),
+                rotation_path=Path(rotation_path),
+                num_calib_files=args.gptq_calib_files,
+                batch_size=args.gptq_batch_size,
+                damp_pct=args.gptq_damp_pct,
+                block_size=args.gptq_block_size,
+                groupsize=w_groupsize,
+                device="cuda",
+            )
+            if not e0joint_result["cache_created"]:
+                print(
+                    "E0-joint continuous gate failed: "
+                    f"R_c={e0joint_result['aggregate_r_continuous']:.6f} < "
+                    f"{e0joint_result['early_stop_threshold']:.2f}; "
+                    "no joint cache or images were created."
+                )
+                sys.exit(0)
+        elif args.gptq:
             print("Moving transformer to CUDA for GPTQ calibration...")
             pipe.transformer = pipe.transformer.to("cuda")
 
@@ -634,6 +724,14 @@ if __name__ == "__main__":
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving quantized weights to cache: {cache_path}")
         torch.save(pipe.transformer.state_dict(), cache_path)
+        if e0joint_result is not None:
+            metadata = {
+                **e0joint_result,
+                "cache_path": str(cache_path),
+                "cache_sha256": sha256_file(cache_path),
+            }
+            metadata_path = write_e0joint_metadata(cache_path, metadata)
+            print(f"Saved E0-joint cache metadata: {metadata_path}")
 
     distribution_audit = None
     if args.distribution_audit_output:
