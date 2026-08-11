@@ -377,8 +377,14 @@ class ActQuantWrapper(nn.Module):
         self.output_oracle_weight_ready = False
         self._output_oracle_gram_cache = None
 
+        # Optional experiment-only streaming observer.  It must never replace
+        # the quantizer output; DistributionAuditCollector only reads x/weight.
+        self.distribution_audit = None
+
     def quantize_activation_for_linear(self, x):
         """Quantize an activation, giving the output oracle its executed weight."""
+        if self.distribution_audit is not None:
+            self.distribution_audit.observe(self, x)
         if self.quantizer.quant_dtype != "tile-mix-output-oracle":
             return self.quantizer(x)
         if not self.output_oracle_weight_ready:

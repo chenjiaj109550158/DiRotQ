@@ -110,7 +110,7 @@ def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_on
 
 
 def generate_images(pipeline, output_dir, dataset_json, generation_params, max_images=None,
-                    batch_size=1, save_images=True):
+                    batch_size=1, save_images=True, audit_controller=None):
     """Generate images with deterministic seeding, skipping existing ones."""
     with open(dataset_json) as f:
         samples = json.load(f)
@@ -150,13 +150,19 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
             for _, info in batch:
                 (output_dir / info["category"]).mkdir(parents=True, exist_ok=True)
 
-        with torch.no_grad():
-            result = pipeline(
-                prompts,
-                generator=generators,
-                **({} if save_images else {"output_type": "latent"}),
-                **generation_params,
-            )
+        if audit_controller is not None:
+            audit_controller.start_batch(batch)
+        try:
+            with torch.no_grad():
+                result = pipeline(
+                    prompts,
+                    generator=generators,
+                    **({} if save_images else {"output_type": "latent"}),
+                    **generation_params,
+                )
+        finally:
+            if audit_controller is not None:
+                audit_controller.end_batch()
 
         if save_images:
             for (img_id, info), image in zip(batch, result.images):
@@ -253,6 +259,15 @@ if __name__ == "__main__":
         "--stats-only", action="store_true",
         help="Run denoising for aggregate activation stats without decoding/saving images",
     )
+    parser.add_argument(
+        "--distribution-audit-output", default=None,
+        help=("Directory for streaming block/tile/timestep diagnostics. Requires "
+              "--stats-only and --activation-format tile-mix-oracle."),
+    )
+    parser.add_argument(
+        "--audit-quality-csv", action="append", default=None,
+        help="Existing per-prompt metric CSV used only for exploratory correlations",
+    )
     args = parser.parse_args()
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
@@ -267,8 +282,17 @@ if __name__ == "__main__":
         parser.error("--collect-format-stats and --format-stats-output must be used together")
     if args.fp16_reference and (args.gptq or args.nvfp4 or args.collect_format_stats):
         parser.error("--fp16-reference cannot be combined with quantization or format stats")
-    if args.stats_only and not args.collect_format_stats:
-        parser.error("--stats-only requires --collect-format-stats")
+    if args.stats_only and not (args.collect_format_stats or args.distribution_audit_output):
+        parser.error("--stats-only requires format stats or --distribution-audit-output")
+    if args.distribution_audit_output:
+        if not args.stats_only:
+            parser.error("--distribution-audit-output requires --stats-only")
+        if args.activation_format != "tile-mix-oracle":
+            parser.error("distribution audit requires the existing SSE tile-mix-oracle trajectory")
+        if not (args.gptq and args.nvfp4):
+            parser.error("distribution audit requires NVFP4 E2M1 GPTQ weights")
+        if not args.audit_quality_csv:
+            parser.error("distribution audit requires at least one --audit-quality-csv")
     if args.activation_format == "tile-mix-output-oracle" and not args.gptq:
         parser.error("tile-mix-output-oracle requires GPTQ weights")
     identity_models = {"pixart-sigma", "sana-1.6b"}
@@ -578,6 +602,27 @@ if __name__ == "__main__":
         print(f"Saving quantized weights to cache: {cache_path}")
         torch.save(pipe.transformer.state_dict(), cache_path)
 
+    distribution_audit = None
+    if args.distribution_audit_output:
+        if not cache_path.exists():
+            raise FileNotFoundError(
+                "distribution audit refuses to create a new weight cache: "
+                f"{cache_path}"
+            )
+        from utils.distribution_audit import DistributionAuditCollector
+        distribution_audit = DistributionAuditCollector(
+            model_name=args.model,
+            output_dir=args.distribution_audit_output,
+            dataset_path=args.dataset,
+            quality_csvs=args.audit_quality_csv,
+            quantized_cache=cache_path,
+        )
+        distribution_audit.attach(pipe.transformer, pipe)
+        print(
+            f"Attached streaming distribution audit to "
+            f"{len(distribution_audit.layer_names)} active quantized layers."
+        )
+
     patch_forward()
 
     if args.generate:
@@ -592,6 +637,15 @@ if __name__ == "__main__":
             pipe, args.output_dir, args.dataset, generation_params,
             max_images=args.max_images, batch_size=args.batch_size,
             save_images=not args.stats_only,
+            audit_controller=distribution_audit,
+        )
+
+    if distribution_audit is not None:
+        provenance = distribution_audit.finalize()
+        print(
+            "Distribution audit complete: "
+            f"{args.distribution_audit_output}; exclusions="
+            f"{provenance['excluded_alignment_events']}"
         )
 
     if format_stats is not None:
