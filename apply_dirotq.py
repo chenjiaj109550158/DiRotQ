@@ -31,6 +31,7 @@ from utils.quant_utils import (
 )
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 from utils.tilemixfp4_utils import FormatSelectionStats
+from utils.fouroversix_utils import FOUR_OVER_SIX_FORMATS, FourOverSixStats
 from utils.output_tilemixfp4_utils import OutputOracleFormatStats
 from utils.e0joint_gptq import (
     OBJECTIVE_VERSION as E0JOINT_OBJECTIVE_VERSION,
@@ -211,7 +212,8 @@ if __name__ == "__main__":
         "--activation-format",
         choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
                  "tile-mix-oracle", "tile-mix-output-oracle",
-                 "a16w4-residual"),
+                 "a16w4-residual", "nvfp4-4over6",
+                 "e0m3-gscale1536", "tile-mix-e0-e2-4over6"),
         default="nvfp4",
         help=("Activation fake quant used with --nvfp4 weights: nvfp4 is the "
               "legacy DiRotQ E2M1 baseline; nvfp4-hw is fixed E2M1 with one "
@@ -220,6 +222,10 @@ if __name__ == "__main__":
               "tile-mix-output-oracle is a local partial-output accuracy oracle "
               "and a16w4-residual keeps residual activations in native FP16/BF16 "
               "while retaining PCA/random-R and cached GPTQ W4 weights "
+              "; nvfp4-4over6 is paper-faithful per-block M=4/M=6 E2M1 "
+              "selection with global denominator 1536, e0m3-gscale1536 is its "
+              "fair fixed-E0 comparator, and tile-mix-e0-e2-4over6 selects "
+              "between that E0 candidate and block-adaptive Four Over Six E2 "
               "(default: nvfp4)"),
     )
     parser.add_argument("--a-bits", type=int, default=None,
@@ -299,7 +305,7 @@ if __name__ == "__main__":
     hardware_formats = {
         "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
         "tile-mix-output-oracle",
-    }
+    } | FOUR_OVER_SIX_FORMATS
     if args.collect_format_stats and args.activation_format not in hardware_formats:
         parser.error("--collect-format-stats requires a hardware-faithful activation format")
     if args.collect_format_stats != bool(args.format_stats_output):
@@ -536,10 +542,16 @@ if __name__ == "__main__":
     format_stats = None
     if args.collect_format_stats:
         unit = ({"block-mix-oracle": "block", "tile-mix-oracle": "tile",
-                 "tile-mix-output-oracle": "tile"}.get(args.activation_format, "fixed"))
-        stats_cls = (OutputOracleFormatStats
-                     if args.activation_format == "tile-mix-output-oracle"
-                     else FormatSelectionStats)
+                 "tile-mix-output-oracle": "tile", "nvfp4-4over6": "block",
+                 "tile-mix-e0-e2-4over6": "tile"}.get(
+                     args.activation_format, "fixed"
+                 ))
+        if args.activation_format in FOUR_OVER_SIX_FORMATS:
+            stats_cls = FourOverSixStats
+        elif args.activation_format == "tile-mix-output-oracle":
+            stats_cls = OutputOracleFormatStats
+        else:
+            stats_cls = FormatSelectionStats
         format_stats = stats_cls(selection_unit=unit)
 
     configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg,
@@ -550,7 +562,9 @@ if __name__ == "__main__":
                                  format_stats=format_stats)
 
     cache_path = Path(args.quantized_cache)
-    cache_required_formats = {"tile-mix-output-oracle", "a16w4-residual"}
+    cache_required_formats = {
+        "tile-mix-output-oracle", "a16w4-residual", *FOUR_OVER_SIX_FORMATS,
+    }
     if args.activation_format in cache_required_formats and not cache_path.exists():
         raise FileNotFoundError(
             f"{args.activation_format} requires an existing NVFP4 E2M1 GPTQ "
@@ -754,6 +768,10 @@ if __name__ == "__main__":
             f"{len(distribution_audit.layer_names)} active quantized layers."
         )
 
+    if isinstance(format_stats, FourOverSixStats):
+        format_stats.attach_timestep_source(pipe.transformer, pipe)
+        print("Attached Four Over Six sidecar to true transformer timesteps.")
+
     patch_forward()
 
     if args.generate:
@@ -790,6 +808,17 @@ if __name__ == "__main__":
         with open(stats_path, "w") as f:
             json.dump(stats, f, indent=2)
             f.write("\n")
-        print(f"Format selection stats saved to {stats_path}: {stats}")
+        if isinstance(format_stats, FourOverSixStats):
+            compact = {
+                key: stats[key] for key in (
+                    "m4_ratio", "e0_tile_ratio", "m4_sse", "m6_sse",
+                    "adaptive_sse", "m6_gscale2688_sse",
+                    "m6_gscale1536_sse", "tile_selected_sse",
+                    "selected_saturation_rate", "reconstruction_sse", "qsnr_db",
+                )
+            }
+            print(f"Four Over Six stats saved to {stats_path}: {compact}")
+        else:
+            print(f"Format selection stats saved to {stats_path}: {stats}")
 
     print("All done.")

@@ -206,6 +206,8 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         allowed_formats = {
             "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
             "tile-mix-oracle", "tile-mix-output-oracle", "a16w4-residual",
+            "nvfp4-4over6", "e0m3-gscale1536",
+            "tile-mix-e0-e2-4over6",
         }
         if activation_format not in allowed_formats:
             raise ValueError(f"unsupported PixArt activation format: {activation_format}")
@@ -254,7 +256,11 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
-        module.quantizer.format_stats = format_stats
+        module.quantizer.format_stats = (
+            format_stats.for_layer(name)
+            if format_stats is not None and hasattr(format_stats, "for_layer")
+            else format_stats
+        )
 
         # Skip activation quantization for specified layers (bits=16 = no-op)
         if any(pat in name for pat in skip_quant_layers):

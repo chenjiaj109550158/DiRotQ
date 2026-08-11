@@ -169,6 +169,8 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         allowed_formats = {
             "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
             "tile-mix-output-oracle", "a16w4-residual",
+            "nvfp4-4over6", "e0m3-gscale1536",
+            "tile-mix-e0-e2-4over6",
         }
         if activation_format not in allowed_formats:
             raise ValueError(
@@ -200,7 +202,11 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
-        module.quantizer.format_stats = format_stats
+        module.quantizer.format_stats = (
+            format_stats.for_layer(name)
+            if format_stats is not None and hasattr(format_stats, "for_layer")
+            else format_stats
+        )
 
         if any(pat in name for pat in skip_quant_layers):
             module.quantizer.configure(bits=16, groupsize=-1, sym=True)
@@ -244,7 +250,8 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         # Fail before cache loading/quantization or generation if a future SANA
         # config changes the inherited ActQuantizer default.
         if qdt in {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
-                   "tile-mix-output-oracle"}:
+                   "tile-mix-output-oracle", "nvfp4-4over6",
+                   "e0m3-gscale1536", "tile-mix-e0-e2-4over6"}:
             if module.quantizer.clip_ratio != 1.0:
                 raise ValueError(
                     f"{name}: hardware FP4 requires activation clip_ratio=1.0, "

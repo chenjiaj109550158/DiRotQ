@@ -13,6 +13,7 @@ from apply_dirotq import (
 )
 from utils.quant_utils import ActQuantWrapper
 from utils.tilemixfp4_utils import FormatSelectionStats
+from utils.fouroversix_utils import FOUR_OVER_SIX_FORMATS, FourOverSixStats
 
 
 def _load_sana_model_utils():
@@ -50,12 +51,14 @@ def _orthogonal(n):
 @pytest.mark.parametrize(
     "activation_format",
     ["nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
-     "tile-mix-output-oracle"],
+     "tile-mix-output-oracle", *sorted(FOUR_OVER_SIX_FORMATS)],
 )
 def test_sana_routes_hardware_activation_formats(activation_format):
     model_utils = _load_sana_model_utils()
     transformer = _Transformer()
-    stats = FormatSelectionStats(selection_unit="tile")
+    stats = (FourOverSixStats(selection_unit="tile")
+             if activation_format in FOUR_OVER_SIX_FORMATS
+             else FormatSelectionStats(selection_unit="tile"))
     cfg = {
         "quantization": {"a_bits": 4},
         "dims": {"head": 32},
@@ -81,8 +84,12 @@ def test_sana_routes_hardware_activation_formats(activation_format):
     assert q_quantizer.high_bits_length == 16
     assert out_quantizer.high_bits_length == 4
     assert q_quantizer.clip_ratio == out_quantizer.clip_ratio == 1.0
-    assert q_quantizer.format_stats is stats
-    assert out_quantizer.format_stats is stats
+    if activation_format in FOUR_OVER_SIX_FORMATS:
+        assert q_quantizer.format_stats._root is stats
+        assert out_quantizer.format_stats._root is stats
+    else:
+        assert q_quantizer.format_stats is stats
+        assert out_quantizer.format_stats is stats
 
 
 @pytest.mark.parametrize(

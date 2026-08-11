@@ -8,6 +8,10 @@ import torch.nn as nn
 from . import hadamard_utils
 from .hadamard_utils import fast_hadamard_transform
 from .tilemixfp4_utils import fake_quantize_activation
+from .fouroversix_utils import (
+    FOUR_OVER_SIX_FORMATS,
+    fake_quantize_four_over_six_activation,
+)
 from .output_tilemixfp4_utils import (
     build_output_weight_grams,
     fake_quantize_tile_mix_output_oracle,
@@ -17,7 +21,7 @@ from .output_tilemixfp4_utils import (
 FP4_ACTIVATION_FORMATS = {
     "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
     "tile-mix-output-oracle", "a16w4-residual",
-}
+} | FOUR_OVER_SIX_FORMATS
 EXPERIMENTAL_FP4_ACTIVATION_FORMATS = FP4_ACTIVATION_FORMATS - {"nvfp4"}
 
 
@@ -218,12 +222,20 @@ class ActQuantizer(nn.Module):
         q_len = x.shape[-1] - self.high_bits_length
         x_q = x[..., :q_len]
         x_h = x[..., q_len:] if self.high_bits_length > 0 else None
-        x_q_out = fake_quantize_activation(
-            x_q,
-            self.quant_dtype,
-            clip_ratio=self.clip_ratio,
-            format_stats=self.format_stats,
-        )
+        if self.quant_dtype in FOUR_OVER_SIX_FORMATS:
+            x_q_out = fake_quantize_four_over_six_activation(
+                x_q,
+                self.quant_dtype,
+                clip_ratio=self.clip_ratio,
+                format_stats=self.format_stats,
+            )
+        else:
+            x_q_out = fake_quantize_activation(
+                x_q,
+                self.quant_dtype,
+                clip_ratio=self.clip_ratio,
+                format_stats=self.format_stats,
+            )
         if self.format_stats is not None:
             # x_q is exactly the low-precision operand: the high-precision tail
             # was split above, so it cannot enter activation SSE/QSNR.
