@@ -71,7 +71,7 @@ def _fused_forward_fast(self, x):
             x_flat = x.reshape(-1, init_shape[-1])
             x_rot = (x_flat @ self.rotation).reshape(init_shape)
             self.quantizer.find_params(x_rot)
-            x = self.quantizer(x_rot).to(x_dtype)
+            x = self.quantize_activation_for_linear(x_rot).to(x_dtype)
 
         elif self.rotation_per_head is not None:
             B_T = x.shape[:-1]
@@ -91,7 +91,7 @@ def _fused_forward_fast(self, x):
                 self.quantizer.high_bits_length = H * hlen
                 self.quantizer.groupsize        = d_q if d_q > 0 else -1
                 self.quantizer.find_params(x_rearranged)
-                x_quant = self.quantizer(x_rearranged)
+                x_quant = self.quantize_activation_for_linear(x_rearranged)
                 self.quantizer.high_bits_length = saved_hlen
                 self.quantizer.groupsize        = saved_gs
                 # Re-interleave: [*B_T, H*d_q | H*hlen] -> [*B_T, H*d]
@@ -101,7 +101,7 @@ def _fused_forward_fast(self, x):
             else:
                 x_rot_flat = x_rot_heads.reshape(*B_T, H * d)
                 self.quantizer.find_params(x_rot_flat)
-                x = self.quantizer(x_rot_flat).to(x_dtype)
+                x = self.quantize_activation_for_linear(x_rot_flat).to(x_dtype)
 
         elif getattr(self, 'use_hadamard', False):
             init_shape = x.shape
@@ -125,18 +125,18 @@ def _fused_forward_fast(self, x):
                 x_rot = x_rot_low
 
             self.quantizer.find_params(x_rot)
-            x = self.quantizer(x_rot).to(x_dtype)
+            x = self.quantize_activation_for_linear(x_rot).to(x_dtype)
 
         elif self.perm_idx is not None:
             # PCA-only permutation: O(D) gather, weight already pre-permuted.
             x = x[..., self.perm_idx]
             self.quantizer.find_params(x)
-            x = self.quantizer(x).to(x_dtype)
+            x = self.quantize_activation_for_linear(x).to(x_dtype)
 
     else:
         if self.quantizer.bits < 16:
             self.quantizer.find_params(x)
-            x = self.quantizer(x).to(x_dtype)
+            x = self.quantize_activation_for_linear(x).to(x_dtype)
 
     return self.module(x).to(x_dtype)
 

@@ -8,10 +8,15 @@ import torch.nn as nn
 from . import hadamard_utils
 from .hadamard_utils import fast_hadamard_transform
 from .tilemixfp4_utils import fake_quantize_activation
+from .output_tilemixfp4_utils import (
+    build_output_weight_grams,
+    fake_quantize_tile_mix_output_oracle,
+)
 
 
 FP4_ACTIVATION_FORMATS = {
     "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+    "tile-mix-output-oracle",
 }
 EXPERIMENTAL_FP4_ACTIVATION_FORMATS = FP4_ACTIVATION_FORMATS - {"nvfp4"}
 
@@ -126,6 +131,12 @@ class ActQuantizer(nn.Module):
         # NF4 with groupsize: fp16/bf16 split first, then group only the 4-bit region
         if self.quant_dtype == "nvfp4" and self.groupsize > 0:
             return self._forward_nvfp4_grouped(x, x_dtype)
+
+        if self.quant_dtype == "tile-mix-output-oracle":
+            raise RuntimeError(
+                "tile-mix-output-oracle requires ActQuantWrapper access to the "
+                "executed GPTQ weight"
+            )
 
         # Hardware-oriented FP4 modes use one global scale over exactly this
         # call's low-precision region, then 1x16 E4M3 block scales.  Candidate
@@ -360,6 +371,52 @@ class ActQuantWrapper(nn.Module):
         # Weight is pre-permuted offline (W[:, perm_idx]), no unrotation needed.
         self.perm_idx = None             # [D] int64 tensor or None
 
+        # The local output oracle is armed only after an existing NVFP4 GPTQ
+        # cache has been loaded.  The Gram is derived lazily from module.weight;
+        # no weight copy is placed in the generic ActQuantizer.
+        self.output_oracle_weight_ready = False
+        self._output_oracle_gram_cache = None
+
+    def quantize_activation_for_linear(self, x):
+        """Quantize an activation, giving the output oracle its executed weight."""
+        if self.quantizer.quant_dtype != "tile-mix-output-oracle":
+            return self.quantizer(x)
+        if not self.output_oracle_weight_ready:
+            raise RuntimeError(
+                "tile-mix-output-oracle requires a loaded NVFP4 E2M1 GPTQ cache"
+            )
+
+        q_len = x.shape[-1] - self.quantizer.high_bits_length
+        if q_len < 0 or self.module.weight.shape[1] != x.shape[-1]:
+            raise ValueError("activation/weight/high-tail dimensions are inconsistent")
+        if self.module.weight.device != x.device:
+            raise RuntimeError(
+                "output-oracle activation and executed weight are on different devices; "
+                "CPU fallback is not permitted"
+            )
+
+        cache = self._output_oracle_gram_cache
+        cache_key = (x.device, q_len)
+        if cache is None or cache[0] != cache_key:
+            grams = build_output_weight_grams(self.module.weight[:, :q_len]).detach()
+            self._output_oracle_gram_cache = (cache_key, grams)
+        else:
+            grams = cache[1]
+
+        x_q = x[..., :q_len]
+        x_h = x[..., q_len:] if self.quantizer.high_bits_length > 0 else None
+        x_q_out = fake_quantize_tile_mix_output_oracle(
+            x_q,
+            grams,
+            clip_ratio=self.quantizer.clip_ratio,
+            format_stats=self.quantizer.format_stats,
+        )
+        if self.quantizer.format_stats is not None:
+            self.quantizer.format_stats.record_reconstruction(x_q, x_q_out)
+        if x_h is not None:
+            return torch.cat((x_q_out, x_h), dim=-1).to(x.dtype)
+        return x_q_out.to(x.dtype)
+
     def extra_repr(self):
         s = f"Input Quant: {self.quantizer.bits}b"
         if self.quantizer.high_bits_length > 0:
@@ -384,7 +441,7 @@ class ActQuantWrapper(nn.Module):
             x_flat_fp32 = x.float().reshape(-1, init_shape[-1])  # fp32
             x_rot_3d = (x_flat_fp32 @ U).reshape(init_shape)     # fp32
             self.quantizer.find_params(x_rot_3d)
-            x_quant = self.quantizer(x_rot_3d)                    # fp32 in/out
+            x_quant = self.quantize_activation_for_linear(x_rot_3d)  # fp32 in/out
             self.quantizer.free()
             # Single fp16 cast after the full rotate→quantize→unrotate cycle
             x = (x_quant.reshape(-1, init_shape[-1]) @ U.T).to(x_dtype).reshape(init_shape)
@@ -413,7 +470,7 @@ class ActQuantWrapper(nn.Module):
                 self.quantizer.high_bits_length = H * hlen
                 self.quantizer.groupsize        = d_q if d_q > 0 else -1
                 self.quantizer.find_params(x_rearranged)
-                x_quant = self.quantizer(x_rearranged)                        # fp32
+                x_quant = self.quantize_activation_for_linear(x_rearranged)   # fp32
                 self.quantizer.free()
                 self.quantizer.high_bits_length = saved_hlen
                 self.quantizer.groupsize        = saved_gs
@@ -424,7 +481,7 @@ class ActQuantWrapper(nn.Module):
             else:
                 x_rot_flat = x_rot_heads.reshape(*B_T, H * d)
                 self.quantizer.find_params(x_rot_flat)
-                x_quant_heads = self.quantizer(x_rot_flat).reshape(*B_T, H, d)  # fp32
+                x_quant_heads = self.quantize_activation_for_linear(x_rot_flat).reshape(*B_T, H, d)  # fp32
                 self.quantizer.free()
             x_unrot = torch.einsum('...hd,hde->...he', x_quant_heads,
                                    U_ph.transpose(1, 2))                       # fp32
@@ -458,7 +515,7 @@ class ActQuantWrapper(nn.Module):
             else:
                 x_rot = x_rot_low
             self.quantizer.find_params(x_rot)
-            x_quant = self.quantizer(x_rot)
+            x_quant = self.quantize_activation_for_linear(x_rot)
             self.quantizer.free()
 
             # Inverse FWHT on low part (FWHT is its own inverse when normalized)
@@ -477,14 +534,14 @@ class ActQuantWrapper(nn.Module):
             # The weight is pre-permuted (W[:, perm_idx]) so no unrotation needed.
             x = x[..., self.perm_idx.to(x.device)]
             self.quantizer.find_params(x)
-            x = self.quantizer(x).to(x_dtype)
+            x = self.quantize_activation_for_linear(x).to(x_dtype)
             self.quantizer.free()
 
         else:
             # No rotation: standard activation quantization
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x)
-                x = self.quantizer(x).to(x_dtype)
+                x = self.quantize_activation_for_linear(x).to(x_dtype)
                 self.quantizer.free()
 
         return self.module(x).to(x_dtype)

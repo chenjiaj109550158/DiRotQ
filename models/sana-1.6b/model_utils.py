@@ -168,6 +168,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     if nvfp4:
         allowed_formats = {
             "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+            "tile-mix-output-oracle",
         }
         if activation_format not in allowed_formats:
             raise ValueError(
@@ -242,7 +243,8 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         # The hardware scale hierarchy is defined for the unclipped operand.
         # Fail before cache loading/quantization or generation if a future SANA
         # config changes the inherited ActQuantizer default.
-        if qdt in {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"}:
+        if qdt in {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+                   "tile-mix-output-oracle"}:
             if module.quantizer.clip_ratio != 1.0:
                 raise ValueError(
                     f"{name}: hardware FP4 requires activation clip_ratio=1.0, "

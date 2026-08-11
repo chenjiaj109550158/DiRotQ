@@ -79,7 +79,7 @@ def _fused_forward(self, x):
             x_rot = (x_fp32 @ self.rotation).reshape(init_shape)
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x_rot)
-                x = self.quantizer(x_rot).to(x_dtype)
+                x = self.quantize_activation_for_linear(x_rot).to(x_dtype)
             else:
                 x = x_rot.to(x_dtype)
 
@@ -91,7 +91,7 @@ def _fused_forward(self, x):
             x_rot_flat = torch.einsum('...hd,hde->...he', x_heads, self.rotation_per_head).reshape(*B_T, H * d)
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x_rot_flat)
-                x = self.quantizer(x_rot_flat).to(x_dtype)
+                x = self.quantize_activation_for_linear(x_rot_flat).to(x_dtype)
             else:
                 x = x_rot_flat.to(x_dtype)
 
@@ -120,7 +120,7 @@ def _fused_forward(self, x):
 
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x_rot)
-                x = self.quantizer(x_rot).to(x_dtype)
+                x = self.quantize_activation_for_linear(x_rot).to(x_dtype)
             else:
                 x = x_rot.to(x_dtype)
 
@@ -129,7 +129,7 @@ def _fused_forward(self, x):
             x_perm = x[..., self.perm_idx]
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x_perm)
-                x = self.quantizer(x_perm).to(x_dtype)
+                x = self.quantize_activation_for_linear(x_perm).to(x_dtype)
             else:
                 x = x_perm.to(x_dtype)
 
@@ -137,13 +137,13 @@ def _fused_forward(self, x):
             # Fused but no rotation assigned — just quantize if needed
             if self.quantizer.bits < 16:
                 self.quantizer.find_params(x)
-                x = self.quantizer(x).to(x_dtype)
+                x = self.quantize_activation_for_linear(x).to(x_dtype)
 
     else:
         # No fusion: standard activation quantization
         if self.quantizer.bits < 16:
             self.quantizer.find_params(x)
-            x = self.quantizer(x).to(x_dtype)
+            x = self.quantize_activation_for_linear(x).to(x_dtype)
 
     return self.module(x).to(x_dtype)
 

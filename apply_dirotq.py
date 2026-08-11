@@ -31,6 +31,7 @@ from utils.quant_utils import (
 )
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 from utils.tilemixfp4_utils import FormatSelectionStats
+from utils.output_tilemixfp4_utils import OutputOracleFormatStats
 
 _ROOT = Path(__file__).parent
 
@@ -194,12 +195,14 @@ if __name__ == "__main__":
                         help="Use NF4 (FP4 E2M1) quantization instead of INT4")
     parser.add_argument(
         "--activation-format",
-        choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"),
+        choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
+                 "tile-mix-oracle", "tile-mix-output-oracle"),
         default="nvfp4",
         help=("Activation fake quant used with --nvfp4 weights: nvfp4 is the "
               "legacy DiRotQ E2M1 baseline; nvfp4-hw is fixed E2M1 with one "
-              "FP32 global scale and E4M3 group scales; e0m3 and both oracle "
-              "modes share exactly the nvfp4-hw scale hierarchy "
+              "FP32 global scale and E4M3 group scales; e0m3 and all oracle "
+              "modes share exactly the nvfp4-hw scale hierarchy; "
+              "tile-mix-output-oracle is a local partial-output accuracy oracle "
               "(default: nvfp4)"),
     )
     parser.add_argument("--a-bits", type=int, default=None,
@@ -254,7 +257,10 @@ if __name__ == "__main__":
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
         parser.error("non-default --activation-format requires --nvfp4 weights")
-    hardware_formats = {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"}
+    hardware_formats = {
+        "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+        "tile-mix-output-oracle",
+    }
     if args.collect_format_stats and args.activation_format not in hardware_formats:
         parser.error("--collect-format-stats requires a hardware-faithful activation format")
     if args.collect_format_stats != bool(args.format_stats_output):
@@ -263,6 +269,8 @@ if __name__ == "__main__":
         parser.error("--fp16-reference cannot be combined with quantization or format stats")
     if args.stats_only and not args.collect_format_stats:
         parser.error("--stats-only requires --collect-format-stats")
+    if args.activation_format == "tile-mix-output-oracle" and not args.gptq:
+        parser.error("tile-mix-output-oracle requires GPTQ weights")
     identity_models = {"pixart-sigma", "sana-1.6b"}
     if args.residual_rotation != "random" and args.model not in identity_models:
         parser.error(
@@ -453,9 +461,12 @@ if __name__ == "__main__":
 
     format_stats = None
     if args.collect_format_stats:
-        unit = ({"block-mix-oracle": "block", "tile-mix-oracle": "tile"}
-                .get(args.activation_format, "fixed"))
-        format_stats = FormatSelectionStats(selection_unit=unit)
+        unit = ({"block-mix-oracle": "block", "tile-mix-oracle": "tile",
+                 "tile-mix-output-oracle": "tile"}.get(args.activation_format, "fixed"))
+        stats_cls = (OutputOracleFormatStats
+                     if args.activation_format == "tile-mix-output-oracle"
+                     else FormatSelectionStats)
+        format_stats = stats_cls(selection_unit=unit)
 
     configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=args.nvfp4, hadamard_layers=args.hadamard_layers or [],
@@ -465,6 +476,11 @@ if __name__ == "__main__":
                                  format_stats=format_stats)
 
     cache_path = Path(args.quantized_cache)
+    if args.activation_format == "tile-mix-output-oracle" and not cache_path.exists():
+        raise FileNotFoundError(
+            "tile-mix-output-oracle requires an existing NVFP4 E2M1 GPTQ "
+            f"weight cache; refusing to create a new cache at {cache_path}"
+        )
     if cache_path.exists():
         print(f"Loading quantized weights from cache: {cache_path}")
         state = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -497,6 +513,13 @@ if __name__ == "__main__":
                 getattr(mod, 'perm_idx', None) is not None
             ):
                 mod._unrot_fused = True
+        if args.activation_format == "tile-mix-output-oracle":
+            armed = 0
+            for _, mod in pipe.transformer.named_modules():
+                if isinstance(mod, ActQuantWrapper) and mod.quantizer.bits < 16:
+                    mod.output_oracle_weight_ready = True
+                    armed += 1
+            print(f"Armed local partial-output oracle with {armed} executed GPTQ weights.")
     else:
         if args.gptq:
             print("Moving transformer to CUDA for GPTQ calibration...")

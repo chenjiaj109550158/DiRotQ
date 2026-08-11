@@ -49,7 +49,8 @@ def _orthogonal(n):
 
 @pytest.mark.parametrize(
     "activation_format",
-    ["nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"],
+    ["nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+     "tile-mix-output-oracle"],
 )
 def test_sana_routes_hardware_activation_formats(activation_format):
     model_utils = _load_sana_model_utils()
