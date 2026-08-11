@@ -16,7 +16,7 @@ from .output_tilemixfp4_utils import (
 
 FP4_ACTIVATION_FORMATS = {
     "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
-    "tile-mix-output-oracle",
+    "tile-mix-output-oracle", "a16w4-residual",
 }
 EXPERIMENTAL_FP4_ACTIVATION_FORMATS = FP4_ACTIVATION_FORMATS - {"nvfp4"}
 
@@ -126,6 +126,14 @@ class ActQuantizer(nn.Module):
         x_dtype = x.dtype
 
         if self.bits == 16:
+            return x
+
+        # Activation-side ceiling: keep the low residual operand in the
+        # model's native dtype.  bits deliberately remains 4 so the wrapper
+        # still executes its PCA/random-R projection and the linear still uses
+        # the already-loaded fused NVFP4 E2M1 GPTQ weight (including the
+        # untouched high-precision tail columns).
+        if self.quant_dtype == "a16w4-residual":
             return x
 
         # NF4 with groupsize: fp16/bf16 split first, then group only the 4-bit region
@@ -377,6 +385,10 @@ class ActQuantWrapper(nn.Module):
         self.output_oracle_weight_ready = False
         self._output_oracle_gram_cache = None
 
+        # Armed only after an existing NVFP4 E2M1 GPTQ state dict is loaded.
+        # This prevents the A16W4 ceiling from silently using original W_low.
+        self.a16w4_weight_ready = False
+
         # Optional experiment-only streaming observer.  It must never replace
         # the quantizer output; DistributionAuditCollector only reads x/weight.
         self.distribution_audit = None
@@ -385,6 +397,17 @@ class ActQuantWrapper(nn.Module):
         """Quantize an activation, giving the output oracle its executed weight."""
         if self.distribution_audit is not None:
             self.distribution_audit.observe(self, x)
+        if self.quantizer.quant_dtype == "a16w4-residual":
+            if not self.a16w4_weight_ready:
+                raise RuntimeError(
+                    "a16w4-residual requires a loaded NVFP4 E2M1 GPTQ cache"
+                )
+            if self.module.weight.device != x.device:
+                raise RuntimeError(
+                    "A16W4 activation and cached GPTQ weight are on different "
+                    "devices; CPU fallback is not permitted"
+                )
+            return self.quantizer(x)
         if self.quantizer.quant_dtype != "tile-mix-output-oracle":
             return self.quantizer(x)
         if not self.output_oracle_weight_ready:

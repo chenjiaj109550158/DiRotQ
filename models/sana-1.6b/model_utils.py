@@ -168,7 +168,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     if nvfp4:
         allowed_formats = {
             "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
-            "tile-mix-output-oracle",
+            "tile-mix-output-oracle", "a16w4-residual",
         }
         if activation_format not in allowed_formats:
             raise ValueError(

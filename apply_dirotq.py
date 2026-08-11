@@ -202,13 +202,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--activation-format",
         choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
-                 "tile-mix-oracle", "tile-mix-output-oracle"),
+                 "tile-mix-oracle", "tile-mix-output-oracle",
+                 "a16w4-residual"),
         default="nvfp4",
         help=("Activation fake quant used with --nvfp4 weights: nvfp4 is the "
               "legacy DiRotQ E2M1 baseline; nvfp4-hw is fixed E2M1 with one "
               "FP32 global scale and E4M3 group scales; e0m3 and all oracle "
               "modes share exactly the nvfp4-hw scale hierarchy; "
               "tile-mix-output-oracle is a local partial-output accuracy oracle "
+              "and a16w4-residual keeps residual activations in native FP16/BF16 "
+              "while retaining PCA/random-R and cached GPTQ W4 weights "
               "(default: nvfp4)"),
     )
     parser.add_argument("--a-bits", type=int, default=None,
@@ -295,6 +298,11 @@ if __name__ == "__main__":
             parser.error("distribution audit requires at least one --audit-quality-csv")
     if args.activation_format == "tile-mix-output-oracle" and not args.gptq:
         parser.error("tile-mix-output-oracle requires GPTQ weights")
+    if args.activation_format == "a16w4-residual":
+        if not args.gptq:
+            parser.error("a16w4-residual requires GPTQ weights")
+        if args.residual_rotation != "random":
+            parser.error("a16w4-residual requires the random residual rotation basis")
     identity_models = {"pixart-sigma", "sana-1.6b"}
     if args.residual_rotation != "random" and args.model not in identity_models:
         parser.error(
@@ -500,9 +508,10 @@ if __name__ == "__main__":
                                  format_stats=format_stats)
 
     cache_path = Path(args.quantized_cache)
-    if args.activation_format == "tile-mix-output-oracle" and not cache_path.exists():
+    cache_required_formats = {"tile-mix-output-oracle", "a16w4-residual"}
+    if args.activation_format in cache_required_formats and not cache_path.exists():
         raise FileNotFoundError(
-            "tile-mix-output-oracle requires an existing NVFP4 E2M1 GPTQ "
+            f"{args.activation_format} requires an existing NVFP4 E2M1 GPTQ "
             f"weight cache; refusing to create a new cache at {cache_path}"
         )
     if cache_path.exists():
@@ -516,6 +525,20 @@ if __name__ == "__main__":
         missing = {k for k in (model_keys - cache_keys)
                    if not any(k.endswith(s) for s in _transient)}
         unexpected = cache_keys - model_keys
+        if args.activation_format == "a16w4-residual":
+            required_cached_weights = {
+                f"{name}.module.weight"
+                for name, mod in pipe.transformer.named_modules()
+                if isinstance(mod, ActQuantWrapper) and mod.quantizer.bits < 16
+            }
+            missing_cached_weights = required_cached_weights - cache_keys
+            if missing_cached_weights:
+                preview = ", ".join(sorted(missing_cached_weights)[:5])
+                raise RuntimeError(
+                    "a16w4-residual refuses to use original W_low; the GPTQ "
+                    f"cache is missing {len(missing_cached_weights)} active weights: "
+                    f"{preview}"
+                )
         if missing:
             print(f"WARNING: {len(missing)} keys in model but not in cache (will keep init weights):")
             for k in sorted(missing)[:10]:
@@ -544,6 +567,16 @@ if __name__ == "__main__":
                     mod.output_oracle_weight_ready = True
                     armed += 1
             print(f"Armed local partial-output oracle with {armed} executed GPTQ weights.")
+        elif args.activation_format == "a16w4-residual":
+            armed = 0
+            for _, mod in pipe.transformer.named_modules():
+                if isinstance(mod, ActQuantWrapper) and mod.quantizer.bits < 16:
+                    mod.a16w4_weight_ready = True
+                    armed += 1
+            print(
+                f"Armed A16W4 residual ceiling on {armed} layers with loaded "
+                f"NVFP4 E2M1 GPTQ weights; native activation dtype={torch_dtype}."
+            )
     else:
         if args.gptq:
             print("Moving transformer to CUDA for GPTQ calibration...")

@@ -205,7 +205,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
         allowed_formats = {
             "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
-            "tile-mix-oracle", "tile-mix-output-oracle",
+            "tile-mix-oracle", "tile-mix-output-oracle", "a16w4-residual",
         }
         if activation_format not in allowed_formats:
             raise ValueError(f"unsupported PixArt activation format: {activation_format}")
