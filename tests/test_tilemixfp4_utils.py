@@ -257,6 +257,46 @@ def test_format_counter_matches_actual_choices_without_changing_output(
     assert snapshot["e0m3_ratio"] == pytest.approx(float(expected.float().mean()))
 
 
+def test_reconstruction_counter_matches_direct_sse_without_changing_output():
+    original = torch.tensor([[1.0, -2.0, 3.0], [0.5, -0.25, 0.0]])
+    reconstructed = torch.tensor([[0.75, -2.5, 2.0], [0.5, 0.0, 0.0]])
+    stats = FormatSelectionStats(selection_unit="fixed")
+    before = reconstructed.clone()
+    stats.record_reconstruction(original, reconstructed)
+    snapshot = stats.snapshot()
+    assert torch.equal(reconstructed, before)
+    assert snapshot["signal_energy"] == pytest.approx(
+        float(original.square().sum()), rel=1e-12
+    )
+    expected_sse = float((original - reconstructed).square().sum())
+    assert snapshot["reconstruction_sse"] == pytest.approx(expected_sse, rel=1e-12)
+    assert snapshot["qsnr_db"] == pytest.approx(
+        10.0 * torch.log10(original.square().sum() / expected_sse).item()
+    )
+
+
+def test_act_quantizer_collects_only_low_region_reconstruction_error():
+    torch.manual_seed(26)
+    low = torch.randn(2, 3, 32)
+    tail = torch.full((2, 3, 4), 1.0e20)
+    quantizer = ActQuantizer()
+    stats = FormatSelectionStats(selection_unit="fixed")
+    quantizer.format_stats = stats
+    quantizer.configure(
+        bits=4, groupsize=16, sym=True, high_bits_length=4,
+        quant_dtype="nvfp4-hw",
+    )
+    out = quantizer(torch.cat((low, tail), dim=-1))
+    expected = fake_quantize_nvfp4_hw(low)
+    snapshot = stats.snapshot()
+    assert torch.equal(out[..., :32], expected)
+    assert torch.equal(out[..., 32:], tail)
+    assert snapshot["signal_energy"] == pytest.approx(float(low.square().sum()), rel=1e-6)
+    assert snapshot["reconstruction_sse"] == pytest.approx(
+        float((low - expected).square().sum()), rel=1e-6
+    )
+
+
 @pytest.mark.parametrize(
     "oracle_fn",
     [fake_quantize_block_mix_oracle, fake_quantize_tile_mix_oracle],

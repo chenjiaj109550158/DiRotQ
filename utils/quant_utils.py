@@ -205,6 +205,10 @@ class ActQuantizer(nn.Module):
             clip_ratio=self.clip_ratio,
             format_stats=self.format_stats,
         )
+        if self.format_stats is not None:
+            # x_q is exactly the low-precision operand: the high-precision tail
+            # was split above, so it cannot enter activation SSE/QSNR.
+            self.format_stats.record_reconstruction(x_q, x_q_out)
         if x_h is not None:
             return torch.cat([x_q_out, x_h], dim=-1).to(x_dtype)
         return x_q_out.to(x_dtype)

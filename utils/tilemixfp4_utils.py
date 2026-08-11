@@ -11,6 +11,7 @@ are preserved exactly.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,7 @@ class FormatSelectionStats:
 
     selection_unit: str
     _counts: torch.Tensor | None = None  # [E2M1, E0M3]
+    _error_sums: torch.Tensor | None = None  # [signal energy, reconstruction SSE]
 
     def record(self, choose_e0: torch.Tensor) -> None:
         if choose_e0.dtype != torch.bool:
@@ -55,18 +57,55 @@ class FormatSelectionStats:
         delta = torch.stack((choose_e0.numel() - e0_count, e0_count))
         self._counts.add_(delta)
 
+    def record_reconstruction(
+        self, original: torch.Tensor, reconstructed: torch.Tensor
+    ) -> None:
+        """Accumulate low-precision-region signal energy and reconstruction SSE.
+
+        Reductions stay on the activation device and only their two scalar results
+        are promoted to float64 for accumulation.  No activation tensor or selector
+        map is retained, and host synchronization occurs only in ``snapshot``.
+        """
+        if original.shape != reconstructed.shape:
+            raise ValueError("original and reconstructed shapes must match")
+        if original.device != reconstructed.device:
+            raise ValueError("original and reconstructed devices must match")
+        signal = original.float().square().sum()
+        error = (original - reconstructed).float().square().sum()
+        delta = torch.stack((signal, error)).to(torch.float64)
+        if self._error_sums is None:
+            self._error_sums = torch.zeros(
+                2, dtype=torch.float64, device=original.device
+            )
+        elif self._error_sums.device != original.device:
+            raise RuntimeError("reconstruction-stat counter device changed during generation")
+        self._error_sums.add_(delta)
+
     def snapshot(self) -> dict[str, int | float | str]:
         if self._counts is None:
             e2_count, e0_count = 0, 0
         else:
             e2_count, e0_count = self._counts.detach().cpu().tolist()
+        if self._error_sums is None:
+            signal_energy, reconstruction_sse = 0.0, 0.0
+        else:
+            signal_energy, reconstruction_sse = self._error_sums.detach().cpu().tolist()
         total = e2_count + e0_count
+        if reconstruction_sse == 0.0:
+            qsnr_db = math.inf if signal_energy > 0.0 else 0.0
+        elif signal_energy == 0.0:
+            qsnr_db = -math.inf
+        else:
+            qsnr_db = 10.0 * math.log10(signal_energy / reconstruction_sse)
         return {
             "selection_unit": self.selection_unit,
             "e2m1_count": e2_count,
             "e0m3_count": e0_count,
             "total_count": total,
             "e0m3_ratio": (e0_count / total) if total else 0.0,
+            "signal_energy": signal_energy,
+            "reconstruction_sse": reconstruction_sse,
+            "qsnr_db": qsnr_db,
         }
 
 

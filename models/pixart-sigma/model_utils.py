@@ -28,7 +28,7 @@ generation_params = dict(
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                              hadamard_layers=None, sign_flips_dict=None,
-                             pca_only_layers=None):
+                             pca_only_layers=None, residual_rotation="random"):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     PixArt-Sigma layer mapping:
@@ -54,9 +54,19 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     head_dim = cfg["dims"]["head"]
     intermediate_dim = cfg["dims"]["intermediate"]
 
-    R1     = rotation_dict["R1"].float()
-    R2     = rotation_dict["R2"].float()
-    R_down = rotation_dict["R_down"].float()
+    if residual_rotation not in {"random", "identity"}:
+        raise ValueError(f"unsupported residual rotation: {residual_rotation}")
+
+    # Identity mode deliberately does not access any R tensor.  It retains the
+    # PCA basis/order (and therefore the identical high-precision split) while
+    # removing only the random orthogonal transform inside the residual space.
+    if residual_rotation == "random":
+        R1 = rotation_dict["R1"].float()
+        R2 = rotation_dict["R2"].float()
+        R_down = rotation_dict["R_down"].float()
+
+    def _residual_basis(evec, rotation):
+        return evec if residual_rotation == "identity" else evec @ rotation
 
     def _use_perm(suffix):
         return any(pat.strip() in suffix for pat in pca_only_layers)
@@ -88,7 +98,7 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = evec @ R1
+                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
             assigned += 1
         elif layer_suffix == "attn2.to_q":
             evec = basis_dict[f"layer.{block_idx}.cross_attn_q"].float()
@@ -97,7 +107,7 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = evec @ R1
+                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
             assigned += 1
         elif layer_suffix == "attn1.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
@@ -108,7 +118,10 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.rotation_per_head = (
+                    evec_val if residual_rotation == "identity" else
+                    torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
             assigned += 1
@@ -121,7 +134,10 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.rotation_per_head = (
+                    evec_val_ca if residual_rotation == "identity" else
+                    torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
             assigned += 1
@@ -132,7 +148,7 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = evec @ R1
+                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".2"):
             if use_had:
@@ -152,12 +168,15 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                     module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                     n_perm += 1
                 else:
-                    module.rotation = evec @ R_down
+                    module.rotation = _residual_basis(
+                        evec, R_down if residual_rotation == "random" else None
+                    )
             assigned += 1
 
     print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
           f"({n_perm} perm_idx, {hadamard_count} Hadamard, "
-          f"{assigned - n_perm - hadamard_count} PCA rotation).")
+          f"{assigned - n_perm - hadamard_count} PCA rotation, "
+          f"residual_rotation={residual_rotation}).")
     return assigned
 
 

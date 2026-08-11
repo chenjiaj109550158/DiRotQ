@@ -35,6 +35,36 @@ from utils.tilemixfp4_utils import FormatSelectionStats
 _ROOT = Path(__file__).parent
 
 
+def residual_rotation_cache_tag(mode: str) -> str:
+    """Cache/output tag; random keeps the historical filename regression."""
+    if mode == "random":
+        return ""
+    if mode == "identity":
+        return "_rr-identity"
+    raise ValueError(f"unsupported residual rotation: {mode}")
+
+
+def gptq_hessian_cache_name(num_files: int, num_layers: int, mode: str) -> str:
+    return f"hessians_n{num_files}_l{num_layers}{residual_rotation_cache_tag(mode)}.pt"
+
+
+def quantized_weight_cache_name(prefix: str, mode: str) -> str:
+    """Insert the residual-mode tag before the historical ``_model.pt`` suffix."""
+    return f"{prefix}{residual_rotation_cache_tag(mode)}_model.pt"
+
+
+def identity_rotation_metadata(cfg: dict) -> dict[str, int | float]:
+    """Derive the exact PCA high-tail split without loading random R tensors."""
+    high_fraction = cfg["rotation"]["high_fraction"]
+    dims = cfg["dims"]
+    return {
+        "high_len_hidden": round(high_fraction * dims["hidden"]),
+        "high_len_head": round(high_fraction * dims["head"]),
+        "high_len_down": round(high_fraction * dims["intermediate"]),
+        "high_fraction": high_fraction,
+    }
+
+
 def load_model_config(model_name: str):
     """Load config from models/<model_name>/config.yaml and return derived constants."""
     cfg_path = _ROOT / "models" / model_name / "config.yaml"
@@ -57,7 +87,7 @@ def hash_str_to_int(s: str) -> int:
 
 def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
                            skip_layers=None, hadamard_layers=None, sign_flips_dict=None,
-                           pca_only_layers=None):
+                           pca_only_layers=None, residual_rotation="random"):
     """Wrap linear layers with ActQuantWrapper and assign online PCA rotations."""
     if skip_layers is None:
         skip_layers = cfg["quantization"]["skip_layers"]
@@ -73,11 +103,13 @@ def apply_dirotq_to_model(transformer, basis_dict, rotation_dict, cfg, assign_on
     assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                              hadamard_layers=hadamard_layers or [],
                              sign_flips_dict=sign_flips_dict or {},
-                             pca_only_layers=pca_only_layers)
+                             pca_only_layers=pca_only_layers,
+                             residual_rotation=residual_rotation)
     return transformer
 
 
-def generate_images(pipeline, output_dir, dataset_json, generation_params, max_images=None, batch_size=1):
+def generate_images(pipeline, output_dir, dataset_json, generation_params, max_images=None,
+                    batch_size=1, save_images=True):
     """Generate images with deterministic seeding, skipping existing ones."""
     with open(dataset_json) as f:
         samples = json.load(f)
@@ -88,12 +120,15 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
         target_samples = target_samples[:max_images]
         print(f"Limiting to the first {max_images} images.")
 
-    existing = sum(1 for img_id, info in target_samples
-                   if (output_dir / info["category"] / f"{img_id}.png").exists())
-    print(f"Found {existing}/{len(target_samples)} target images already generated.")
-
-    to_generate = [(img_id, info) for img_id, info in target_samples
-                   if not (output_dir / info["category"] / f"{img_id}.png").exists()]
+    if save_images:
+        existing = sum(1 for img_id, info in target_samples
+                       if (output_dir / info["category"] / f"{img_id}.png").exists())
+        print(f"Found {existing}/{len(target_samples)} target images already generated.")
+        to_generate = [(img_id, info) for img_id, info in target_samples
+                       if not (output_dir / info["category"] / f"{img_id}.png").exists()]
+    else:
+        print("Stats-only generation: images will not be decoded or saved.")
+        to_generate = target_samples
 
     if not to_generate:
         print("Nothing to generate.")
@@ -110,21 +145,27 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
         diffusers.training_utils.set_seed(seeds[0])
         generators = [torch.Generator().manual_seed(seed) for seed in seeds]
 
-        for _, info in batch:
-            (output_dir / info["category"]).mkdir(parents=True, exist_ok=True)
+        if save_images:
+            for _, info in batch:
+                (output_dir / info["category"]).mkdir(parents=True, exist_ok=True)
 
         with torch.no_grad():
-            images = pipeline(
+            result = pipeline(
                 prompts,
                 generator=generators,
+                **({} if save_images else {"output_type": "latent"}),
                 **generation_params,
-            ).images
+            )
 
-        for (img_id, info), image in zip(batch, images):
-            out_path = output_dir / info["category"] / f"{img_id}.png"
-            image.save(out_path)
+        if save_images:
+            for (img_id, info), image in zip(batch, result.images):
+                out_path = output_dir / info["category"] / f"{img_id}.png"
+                image.save(out_path)
 
-    print(f"Done. Images saved to {output_dir}")
+    if save_images:
+        print(f"Done. Images saved to {output_dir}")
+    else:
+        print("Done. Stats-only generation completed without image output.")
 
 
 if __name__ == "__main__":
@@ -178,6 +219,11 @@ if __name__ == "__main__":
                         help="Layer name patterns to use PCA-only channel permutation (O(D) gather) "
                              "instead of full rotation matmul (O(D²)). "
                              "E.g. --pca-only-layers to_q to_k to_v")
+    parser.add_argument(
+        "--residual-rotation", choices=("random", "identity"), default="random",
+        help=("Residual-basis transform after PCA: random preserves the legacy "
+              "DiRotQ U@R behavior; identity uses PCA U only (default: random)"),
+    )
     parser.add_argument("--gptq-calib-files", type=int, default=5120) # 128 samples x 20 steps
     parser.add_argument("--gptq-batch-size", type=int, default=8)
     parser.add_argument("--gptq-block-size", type=int, default=128)
@@ -200,17 +246,29 @@ if __name__ == "__main__":
         "--format-stats-output", default=None,
         help="JSON output path for --collect-format-stats",
     )
+    parser.add_argument(
+        "--stats-only", action="store_true",
+        help="Run denoising for aggregate activation stats without decoding/saving images",
+    )
     args = parser.parse_args()
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
         parser.error("non-default --activation-format requires --nvfp4 weights")
-    oracle_formats = {"block-mix-oracle", "tile-mix-oracle"}
-    if args.collect_format_stats and args.activation_format not in oracle_formats:
-        parser.error("--collect-format-stats requires an oracle activation format")
+    hardware_formats = {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"}
+    if args.collect_format_stats and args.activation_format not in hardware_formats:
+        parser.error("--collect-format-stats requires a hardware-faithful activation format")
     if args.collect_format_stats != bool(args.format_stats_output):
         parser.error("--collect-format-stats and --format-stats-output must be used together")
     if args.fp16_reference and (args.gptq or args.nvfp4 or args.collect_format_stats):
         parser.error("--fp16-reference cannot be combined with quantization or format stats")
+    if args.stats_only and not args.collect_format_stats:
+        parser.error("--stats-only requires --collect-format-stats")
+    identity_models = {"pixart-sigma", "sana-1.6b"}
+    if args.residual_rotation != "random" and args.model not in identity_models:
+        parser.error(
+            "identity residual rotation is currently supported only for "
+            f"{sorted(identity_models)}"
+        )
 
     # Strip any accidental whitespace from list arguments (e.g. backslash-space in shell)
     if args.pca_only_layers:
@@ -291,18 +349,22 @@ if __name__ == "__main__":
     # the same NVFP4 E2M1 GPTQ weights.  It is included only in default output
     # naming to prevent experimental images from colliding with the baseline.
     act_tag = "" if args.activation_format == "nvfp4" else f"_act-{args.activation_format}"
+    residual_tag = residual_rotation_cache_tag(args.residual_rotation)
 
     if args.quantized_cache is None:
         method = "gptq" if args.gptq else "rtn"
-        cache_name = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}_model.pt"
+        cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}"
+        cache_name = quantized_weight_cache_name(cache_prefix, args.residual_rotation)
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
+    elif args.residual_rotation == "identity" and "rr-identity" not in Path(args.quantized_cache).name:
+        parser.error("identity residual rotation requires an identity-tagged quantized cache")
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
     if args.output_dir is None:
         method = "gptq" if args.gptq else "rtn"
-        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{act_tag}")
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{residual_tag}{act_tag}")
 
     if args.nvfp4:
         print(f"Activation fake-quant format: {args.activation_format}")
@@ -345,7 +407,7 @@ if __name__ == "__main__":
         print("All done.")
         raise SystemExit(0)
 
-    if not os.path.exists(rotation_path):
+    if args.residual_rotation == "random" and not os.path.exists(rotation_path):
         print(f"Rotation file not found at {rotation_path}, generating...")
         subprocess.run([sys.executable, str(_ROOT / "gen_rotation.py"), "--model", args.model], check=True)
 
@@ -357,10 +419,18 @@ if __name__ == "__main__":
     basis_dict = torch.load(basis_path, map_location="cpu", weights_only=False)
     print(f"Loaded {len(basis_dict)} basis matrices.")
 
-    print(f"Loading rotations from {rotation_path}...")
-    rotation_dict = torch.load(rotation_path, map_location="cpu", weights_only=False)
-    print("Rotations:", {k: v.shape if isinstance(v, torch.Tensor) else v
-                         for k, v in rotation_dict.items()})
+    if args.residual_rotation == "random":
+        print(f"Loading rotations from {rotation_path}...")
+        rotation_dict = torch.load(rotation_path, map_location="cpu", weights_only=False)
+        print("Rotations:", {k: v.shape if isinstance(v, torch.Tensor) else v
+                             for k, v in rotation_dict.items()})
+    else:
+        # Identity/PCA-only mode needs only the split lengths.  Derive them
+        # from the same config/rounding as gen_rotation.py so no R tensor is
+        # loaded and then ignored.
+        rotation_dict = identity_rotation_metadata(cfg)
+        print("Identity residual basis: random R tensors were not loaded; "
+              f"split metadata={rotation_dict}")
 
     sign_flips_dict = None
     if args.sign_flips:
@@ -374,7 +444,8 @@ if __name__ == "__main__":
     apply_dirotq_to_model(pipe.transformer, basis_dict, rotation_dict, cfg, assign_online_rotations,
                            skip_layers=skip_layers, hadamard_layers=args.hadamard_layers,
                            sign_flips_dict=sign_flips_dict,
-                           pca_only_layers=args.pca_only_layers)
+                           pca_only_layers=args.pca_only_layers,
+                           residual_rotation=args.residual_rotation)
 
     high_len_hidden = rotation_dict["high_len_hidden"]
     high_len_head   = rotation_dict["high_len_head"]
@@ -382,7 +453,8 @@ if __name__ == "__main__":
 
     format_stats = None
     if args.collect_format_stats:
-        unit = "block" if args.activation_format == "block-mix-oracle" else "tile"
+        unit = ({"block-mix-oracle": "block", "tile-mix-oracle": "tile"}
+                .get(args.activation_format, "fixed"))
         format_stats = FormatSelectionStats(selection_unit=unit)
 
     configure_quantizers_by_name(pipe.transformer, high_len_hidden, high_len_head, cfg,
@@ -431,7 +503,9 @@ if __name__ == "__main__":
             pipe.transformer = pipe.transformer.to("cuda")
 
             qlayers = find_qlayers(pipe.transformer, layers=[ActQuantWrapper])
-            hessian_name = f"hessians_n{args.gptq_calib_files}_l{len(qlayers)}.pt"
+            hessian_name = gptq_hessian_cache_name(
+                args.gptq_calib_files, len(qlayers), args.residual_rotation
+            )
             hessian_cache = Path(args.quantized_cache).parent / hessian_name
             if hessian_cache.exists():
                 print(f"Loading cached Hessians from {hessian_cache}...")
@@ -491,11 +565,16 @@ if __name__ == "__main__":
             print(f"enable_model_cpu_offload failed ({e}); falling back to pipe.to('cuda').")
             pipe = pipe.to("cuda")
         preconvert_rotations_to_device(pipe.transformer, device="cuda")
-        generate_images(pipe, args.output_dir, args.dataset, generation_params, max_images=args.max_images, batch_size=args.batch_size)
+        generate_images(
+            pipe, args.output_dir, args.dataset, generation_params,
+            max_images=args.max_images, batch_size=args.batch_size,
+            save_images=not args.stats_only,
+        )
 
     if format_stats is not None:
         stats = {
             "activation_format": args.activation_format,
+            "residual_rotation": args.residual_rotation,
             **format_stats.snapshot(),
         }
         stats_path = Path(args.format_stats_output)

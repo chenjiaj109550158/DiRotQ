@@ -35,7 +35,7 @@ generation_params = dict(
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                              hadamard_layers=None, sign_flips_dict=None,
-                             pca_only_layers=None):
+                             pca_only_layers=None, residual_rotation="random"):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     Sana layer mapping:
@@ -49,14 +49,22 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     Requires eigenvalues in basis_dict (produced by current get_basis.py); falls back to
     rotation if eigenvalues are absent (old basis cache).
     """
+    if residual_rotation not in {"random", "identity"}:
+        raise ValueError(f"unsupported residual rotation: {residual_rotation}")
     if pca_only_layers is None:
         pca_only_layers = []
 
     num_heads = cfg["dims"]["num_heads"]
     head_dim  = cfg["dims"]["head"]
 
-    R1 = rotation_dict["R1"].float()
-    R2 = rotation_dict["R2"].float()
+    # Identity mode deliberately does not access R1/R2.  It keeps the PCA
+    # channel order and high-precision tail split, removing only residual R.
+    if residual_rotation == "random":
+        R1 = rotation_dict["R1"].float()
+        R2 = rotation_dict["R2"].float()
+
+    def _residual_basis(evec, rotation):
+        return evec if residual_rotation == "identity" else evec @ rotation
 
     def _use_perm(suffix):
         return any(pat.strip() in suffix for pat in pca_only_layers)
@@ -84,7 +92,9 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = evec @ R1
+                module.rotation = _residual_basis(
+                    evec, R1 if residual_rotation == "random" else None
+                )
             assigned += 1
         elif layer_suffix == "attn1.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
@@ -95,8 +105,9 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = torch.bmm(
-                    evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+                module.rotation_per_head = (
+                    evec_val if residual_rotation == "identity" else
+                    torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
                 )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
@@ -108,7 +119,9 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = evec @ R1
+                module.rotation = _residual_basis(
+                    evec, R1 if residual_rotation == "random" else None
+                )
             assigned += 1
         elif layer_suffix == "attn2.to_out.0":
             evec_val = basis_dict[f"layer.{block_idx}.cross_attn.value"].float()
@@ -119,39 +132,52 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = torch.bmm(
-                    evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1)
+                module.rotation_per_head = (
+                    evec_val if residual_rotation == "identity" else
+                    torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
                 )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
             assigned += 1
 
     print(f"Assigned rotations to {assigned} ActQuantWrapper layers "
-          f"({n_perm} perm_idx, {assigned - n_perm} rotation).")
+          f"({n_perm} perm_idx, {assigned - n_perm} rotation, "
+          f"residual_rotation={residual_rotation}).")
     return assigned
 
 
 def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=False, hadamard_layers=None, a_groupsize=None,
-                                 high_len_down=0, skip_quant_layers=None):
+                                 high_len_down=0, skip_quant_layers=None,
+                                 activation_format="nvfp4", format_stats=None):
     """Configure mixed-precision activation quantizers by Sana layer type.
 
     INT4 mode:
       - attn1.to_q/k/v, attn2.to_q: groupsize=64, high_bits_length=high_len_hidden
       - attn1.to_out.0, attn2.to_out.0: groupsize=head_dim (32), high_bits_length=high_len_head
 
-    NF4 mode:
+    FP4 mode:
       - attn1.to_q/k/v, attn2.to_q: groupsize=16, symmetric
       - attn1.to_out.0, attn2.to_out.0: groupsize=head_dim (32), symmetric
+      - activation_format selects the shared legacy/hardware FP4 fake quantizer;
+        weight quantization, PCA, and rotation remain unchanged
     """
     a_bits   = cfg["quantization"]["a_bits"]
     head_dim = cfg["dims"]["head"]
 
     if nvfp4:
+        allowed_formats = {
+            "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
+        }
+        if activation_format not in allowed_formats:
+            raise ValueError(
+                f"SANA activation format {activation_format!r} is not enabled; "
+                f"choose one of {sorted(allowed_formats)}"
+            )
         nvfp4_cfg = cfg.get("nvfp4", {})
         a_gs      = nvfp4_cfg.get("a_groupsize", 16)
         a_gs_out  = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
-        qdt       = "nvfp4"
+        qdt       = activation_format
     else:
         a_gs     = 64
         a_gs_out = head_dim
@@ -173,6 +199,7 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
+        module.quantizer.format_stats = format_stats
 
         if any(pat in name for pat in skip_quant_layers):
             module.quantizer.configure(bits=16, groupsize=-1, sym=True)
@@ -211,6 +238,16 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 high_bits_length=0,
                 quant_dtype=qdt,
             )
+
+        # The hardware scale hierarchy is defined for the unclipped operand.
+        # Fail before cache loading/quantization or generation if a future SANA
+        # config changes the inherited ActQuantizer default.
+        if qdt in {"nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle"}:
+            if module.quantizer.clip_ratio != 1.0:
+                raise ValueError(
+                    f"{name}: hardware FP4 requires activation clip_ratio=1.0, "
+                    f"got {module.quantizer.clip_ratio}"
+                )
 
     if n_skipped:
         print(f"Skipped activation quantization for {n_skipped} layers (bits=16).")
