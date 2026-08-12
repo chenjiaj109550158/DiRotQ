@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Callable
 
 import torch
 import torch.nn.functional as F
@@ -203,11 +204,20 @@ def _e4m3_block_scale(
 def _quantize_blocks_e4m3(
     blocks: torch.Tensor,
     magnitudes: tuple[float, ...],
-) -> torch.Tensor:
+    *,
+    capture_codes: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize globally-scaled fp32 blocks with per-block E4M3 scales."""
     scale = _e4m3_block_scale(blocks, magnitudes)
     codes = _round_magnitude(blocks / scale, magnitudes)
-    return codes * scale
+    reconstructed = codes * scale
+    if capture_codes:
+        # ``codes`` is the actual micro-codebook value selected by the runtime
+        # fake quantizer, before either block or tensor-global scale is applied.
+        # Exporters consume this value directly; they never infer a code from
+        # the reconstructed activation.
+        return reconstructed, scale, codes
+    return reconstructed
 
 
 def _pad_k_to(x_2d: torch.Tensor, divisor: int) -> tuple[torch.Tensor, int]:
@@ -220,6 +230,7 @@ def _fixed_format_fake_quant(
     x: torch.Tensor,
     magnitudes: tuple[float, ...],
     clip_ratio: float = 1.0,
+    capture_hook: Callable[[dict], None] | None = None,
 ) -> torch.Tensor:
     _validate_hardware_clip_ratio(clip_ratio)
     flat, shape = _flatten_operand(x)
@@ -229,8 +240,35 @@ def _fixed_format_fake_quant(
     scaled, s32 = _hardware_global_scale(flat)
     padded, _ = _pad_k_to(scaled, FP4_BLOCK_SIZE)
     blocks = padded.reshape(flat.shape[0], -1, FP4_BLOCK_SIZE)
-    quantized = _quantize_blocks_e4m3(blocks, magnitudes) * s32
-    return quantized.reshape(flat.shape[0], -1)[:, :k].reshape(shape).to(x.dtype)
+    if capture_hook is None:
+        quantized = _quantize_blocks_e4m3(blocks, magnitudes) * s32
+        return quantized.reshape(flat.shape[0], -1)[:, :k].reshape(shape).to(x.dtype)
+
+    quantized_scaled, block_scales, logical_codes = _quantize_blocks_e4m3(
+        blocks, magnitudes, capture_codes=True
+    )
+    result = (
+        (quantized_scaled * s32)
+        .reshape(flat.shape[0], -1)[:, :k]
+        .reshape(shape)
+        .to(x.dtype)
+    )
+    # The callback is intentionally synchronous and receives only borrowed
+    # tensors.  A capture controller must select/copy allowlisted rows before
+    # returning; this module never extends a full activation's lifetime.
+    capture_hook({
+        "input_shape": tuple(shape),
+        "original_dtype": x.dtype,
+        "device": x.device,
+        "low_k": k,
+        "global_scale": s32,
+        "global_amax": flat.abs().amax(),
+        "block_scales": block_scales.squeeze(-1),
+        "logical_codes": logical_codes,
+        "reconstructed": result,
+        "magnitudes": magnitudes,
+    })
+    return result
 
 
 def fake_quantize_e2m1(x: torch.Tensor, clip_ratio: float = 1.0) -> torch.Tensor:
@@ -243,9 +281,15 @@ def fake_quantize_nvfp4_hw(x: torch.Tensor, clip_ratio: float = 1.0) -> torch.Te
     return fake_quantize_e2m1(x, clip_ratio)
 
 
-def fake_quantize_e0m3(x: torch.Tensor, clip_ratio: float = 1.0) -> torch.Tensor:
+def fake_quantize_e0m3(
+    x: torch.Tensor,
+    clip_ratio: float = 1.0,
+    capture_hook: Callable[[dict], None] | None = None,
+) -> torch.Tensor:
     """Hardware-faithful E0M3 with FP32 global and E4M3 block scales."""
-    return _fixed_format_fake_quant(x, E0M3_MAGNITUDES, clip_ratio)
+    return _fixed_format_fake_quant(
+        x, E0M3_MAGNITUDES, clip_ratio, capture_hook=capture_hook
+    )
 
 
 def fake_quantize_block_mix_oracle(
@@ -352,6 +396,7 @@ def fake_quantize_activation(
     activation_format: str,
     clip_ratio: float = 1.0,
     format_stats: FormatSelectionStats | None = None,
+    capture_hook: Callable[[dict], None] | None = None,
 ) -> torch.Tensor:
     """Dispatch a legacy or hardware-faithful activation fake-quant mode."""
     if activation_format == "nvfp4":
@@ -359,7 +404,11 @@ def fake_quantize_activation(
     if activation_format == "nvfp4-hw":
         return fake_quantize_nvfp4_hw(x, clip_ratio=clip_ratio)
     if activation_format == "e0m3":
-        return fake_quantize_e0m3(x, clip_ratio=clip_ratio)
+        return fake_quantize_e0m3(
+            x, clip_ratio=clip_ratio, capture_hook=capture_hook
+        )
+    if capture_hook is not None:
+        raise ValueError("real-tile capture is supported only by fixed hardware E0M3")
     if activation_format == "block-mix-oracle":
         return fake_quantize_block_mix_oracle(
             x, clip_ratio=clip_ratio, format_stats=format_stats

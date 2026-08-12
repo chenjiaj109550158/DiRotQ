@@ -121,6 +121,9 @@ class ActQuantizer(nn.Module):
         self.clip_ratio = 1.0
         self.quant_dtype = "int"  # int or one of FP4_ACTIVATION_FORMATS
         self.format_stats = None
+        # Read-only experiment hook.  It is unset in every normal run and is
+        # invoked only from the existing fixed hardware-E0 quantization path.
+        self.real_tile_capture = None
 
     def free(self):
         self.zero = None
@@ -239,6 +242,7 @@ class ActQuantizer(nn.Module):
                 runtime_format,
                 clip_ratio=self.clip_ratio,
                 format_stats=self.format_stats,
+                capture_hook=self.real_tile_capture,
             )
         if self.format_stats is not None:
             # x_q is exactly the low-precision operand: the high-precision tail

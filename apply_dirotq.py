@@ -307,6 +307,12 @@ if __name__ == "__main__":
         help="Run denoising for aggregate activation stats without decoding/saving images",
     )
     parser.add_argument(
+        "--real-tile-export-config", default=None,
+        help=("SANA-only read-only capture config for receiver-schema-v1 real "
+              "FP4 tile packages; requires stats-only fixed e0m3 and an "
+              "existing hardware-fixed-e2 cache"),
+    )
+    parser.add_argument(
         "--distribution-audit-output", default=None,
         help=("Directory for streaming block/tile/timestep diagnostics. Requires "
               "--stats-only and --activation-format tile-mix-oracle."),
@@ -356,8 +362,14 @@ if __name__ == "__main__":
         parser.error("--collect-format-stats and --format-stats-output must be used together")
     if args.fp16_reference and (args.gptq or args.nvfp4 or args.collect_format_stats):
         parser.error("--fp16-reference cannot be combined with quantization or format stats")
-    if args.stats_only and not (args.collect_format_stats or args.distribution_audit_output):
-        parser.error("--stats-only requires format stats or --distribution-audit-output")
+    if args.stats_only and not (
+        args.collect_format_stats or args.distribution_audit_output
+        or args.real_tile_export_config
+    ):
+        parser.error(
+            "--stats-only requires format stats, --distribution-audit-output, "
+            "or --real-tile-export-config"
+        )
     if args.distribution_audit_output:
         if not args.stats_only:
             parser.error("--distribution-audit-output requires --stats-only")
@@ -369,6 +381,21 @@ if __name__ == "__main__":
             parser.error("distribution audit requires at least one --audit-quality-csv")
     if args.activation_format == "tile-mix-output-oracle" and not args.gptq:
         parser.error("tile-mix-output-oracle requires GPTQ weights")
+    if args.real_tile_export_config:
+        if args.model != "sana-1.6b":
+            parser.error("real-tile export is restricted to SANA-1.6B")
+        if not (args.gptq and args.nvfp4 and args.stats_only):
+            parser.error("real-tile export requires --gptq --nvfp4 --stats-only")
+        if args.activation_format != "e0m3" or args.residual_rotation != "random":
+            parser.error("real-tile export requires fixed e0m3 and random residual rotation")
+        if args.hardware_weight_cache_kind != "hardware-fixed-e2":
+            parser.error("real-tile export runtime must load hardware-fixed-e2")
+        if args.max_images != 1 or args.batch_size != 1:
+            parser.error("real-tile export requires --max-images 1 --batch-size 1")
+        if args.collect_format_stats or args.distribution_audit_output:
+            parser.error("real-tile export cannot be combined with other stats collectors")
+        if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
+            parser.error("real-tile export requires the unmodified official SANA routing")
     if args.activation_format == "a16w4-residual":
         if not args.gptq:
             parser.error("a16w4-residual requires GPTQ weights")
@@ -993,6 +1020,22 @@ if __name__ == "__main__":
             metadata_path = write_e0joint_metadata(cache_path, metadata)
             print(f"Saved E0-joint cache metadata: {metadata_path}")
 
+    real_tile_export = None
+    if args.real_tile_export_config:
+        if not cache_path.exists():
+            raise FileNotFoundError(
+                "real-tile export refuses to build a missing quantized cache"
+            )
+        from utils.real_tile_export import RealTileExportController
+        real_tile_export = RealTileExportController.from_file(
+            args.real_tile_export_config, pipe.transformer, pipe, state
+        )
+        print(
+            "Armed read-only real-tile capture for "
+            f"{len(real_tile_export.specs)} allowlisted cases; both packing "
+            "sidecars were validated against their reconstructed BF16 caches."
+        )
+
     distribution_audit = None
     if args.distribution_audit_output:
         if not cache_path.exists():
@@ -1032,8 +1075,20 @@ if __name__ == "__main__":
             pipe, args.output_dir, args.dataset, generation_params,
             max_images=args.max_images, batch_size=args.batch_size,
             save_images=not args.stats_only,
-            audit_controller=distribution_audit,
+            audit_controller=real_tile_export or distribution_audit,
         )
+
+    if real_tile_export is not None:
+        real_tile_report = real_tile_export.finalize()
+        print(
+            "Real-tile packages complete: "
+            f"{json.dumps(real_tile_report['packages'], sort_keys=True)}"
+        )
+        if torch.cuda.is_available():
+            print(
+                "Real-tile peak CUDA allocated bytes: "
+                f"{torch.cuda.max_memory_allocated()}"
+            )
 
     if distribution_audit is not None:
         provenance = distribution_audit.finalize()
