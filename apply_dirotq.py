@@ -48,6 +48,13 @@ from utils.weight_mixfp4 import (
     expected_metadata as expected_weight_mix_metadata,
     validate_cache_metadata as validate_weight_mix_metadata,
 )
+from utils.hardware_weight_fp4 import (
+    FORMATS as HARDWARE_WEIGHT_FORMATS,
+    build_hardware_fixed_caches,
+    expected_metadata as expected_hardware_weight_metadata,
+    validate_metadata as validate_hardware_weight_metadata,
+    validate_runtime_state as validate_hardware_weight_runtime,
+)
 
 _ROOT = Path(__file__).parent
 
@@ -321,6 +328,20 @@ if __name__ == "__main__":
     parser.add_argument("--weight-mix-report-dir", default=None)
     parser.add_argument("--weight-mix-hessian-cache", default=None)
     parser.add_argument("--weight-mix-standard-cache", default=None)
+    parser.add_argument(
+        "--hardware-weight-build", action="store_true",
+        help=("SANA-only calibration command: reuse the existing fixed-E0 "
+              "activation Hessian and build packing-valid hardware-scaled "
+              "fixed E2M1/E0M3 group-16 GPTQ weight caches, then exit"),
+    )
+    parser.add_argument(
+        "--hardware-weight-cache-kind", choices=HARDWARE_WEIGHT_FORMATS, default=None,
+        help="Validate and execute one packing-valid hardware fixed-weight cache",
+    )
+    parser.add_argument("--hardware-weight-report-dir", default=None)
+    parser.add_argument("--hardware-weight-hessian-cache", default=None)
+    parser.add_argument("--hardware-weight-legacy-e2-cache", default=None)
+    parser.add_argument("--hardware-weight-legacy-e0-cache", default=None)
     args = parser.parse_args()
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
@@ -387,6 +408,22 @@ if __name__ == "__main__":
     elif (args.weight_mix_report_dir or args.weight_mix_hessian_cache or
           args.weight_mix_standard_cache):
         parser.error("weight Mix paths require --weight-mix-build or --weight-mix-cache-kind")
+    if args.hardware_weight_build or args.hardware_weight_cache_kind:
+        if args.model != "sana-1.6b":
+            parser.error("hardware fixed-weight feasibility is restricted to SANA-1.6B")
+        if not (args.gptq and args.nvfp4):
+            parser.error("hardware fixed weights require --gptq and --nvfp4")
+        if args.activation_format != "e0m3":
+            parser.error("hardware fixed weights freeze activation at existing e0m3")
+        if args.residual_rotation != "random":
+            parser.error("hardware fixed weights require random residual rotation")
+        if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
+            parser.error("hardware fixed weights require unmodified official SANA routing")
+        if args.e0joint_gptq or args.weight_mix_build or args.weight_mix_cache_kind:
+            parser.error("hardware fixed weights cannot be combined with other weight experiments")
+    elif (args.hardware_weight_report_dir or args.hardware_weight_hessian_cache or
+          args.hardware_weight_legacy_e2_cache or args.hardware_weight_legacy_e0_cache):
+        parser.error("hardware weight paths require a hardware weight build/runtime mode")
     identity_models = {"pixart-sigma", "sana-1.6b"}
     if args.residual_rotation != "random" and args.model not in identity_models:
         parser.error(
@@ -477,7 +514,9 @@ if __name__ == "__main__":
     residual_tag = residual_rotation_cache_tag(args.residual_rotation)
 
     if args.quantized_cache is None:
-        if args.weight_mix_cache_kind:
+        if args.hardware_weight_cache_kind:
+            cache_name = f"nvfp4_g16_e0h_{args.hardware_weight_cache_kind}_gptq_model.pt"
+        elif args.weight_mix_cache_kind:
             cache_name = (
                 f"nvfp4_g16_e0h_weightmix_{args.weight_mix_cache_kind}_gptq_model.pt"
             )
@@ -609,6 +648,50 @@ if __name__ == "__main__":
                                  activation_format=args.activation_format,
                                  format_stats=format_stats)
 
+    if args.hardware_weight_build:
+        if args.generate:
+            print("Hardware fixed-weight build is calibration-only; image generation is disabled.")
+        quantized_dir = _ROOT / "models" / args.model / "quantized_cache"
+        report_dir = Path(
+            args.hardware_weight_report_dir or
+            (_ROOT / "models" / args.model / "hardware_fixed_weight" / "calibration")
+        )
+        hessian_cache = Path(
+            args.hardware_weight_hessian_cache or
+            (quantized_dir / "hessians_e0a_n5120_l120_rr-random_g16_tile64x8.pt")
+        )
+        cache_paths = {
+            fmt: quantized_dir / f"nvfp4_g16_e0h_{fmt}_gptq_model.pt"
+            for fmt in HARDWARE_WEIGHT_FORMATS
+        }
+        legacy_cache_paths = {
+            "hardware-fixed-e2": Path(
+                args.hardware_weight_legacy_e2_cache or
+                (quantized_dir / "nvfp4_g16_e0h_weightmix_fixed-e2_gptq_model.pt")
+            ),
+            "hardware-fixed-e0": Path(
+                args.hardware_weight_legacy_e0_cache or
+                (quantized_dir / "nvfp4_g16_e0h_weightmix_fixed-e0_gptq_model.pt")
+            ),
+        }
+        print("Moving transformer to CUDA for matched hardware fixed-weight GPTQ...")
+        pipe.transformer = pipe.transformer.to("cuda")
+        result = build_hardware_fixed_caches(
+            pipe.transformer,
+            hessian_cache=hessian_cache,
+            cache_paths=cache_paths,
+            legacy_cache_paths=legacy_cache_paths,
+            report_dir=report_dir,
+            basis_path=Path(basis_path),
+            rotation_path=Path(rotation_path),
+            skip_layers=skip_layers,
+            num_calib_files=args.gptq_calib_files,
+            damp_pct=args.gptq_damp_pct,
+            device="cuda",
+        )
+        print("Hardware fixed-weight aggregate losses:", result["aggregate_losses"])
+        raise SystemExit(0)
+
     if args.weight_mix_build:
         if args.generate:
             print("Weight Mix build is calibration-only; image generation is disabled.")
@@ -689,6 +772,31 @@ if __name__ == "__main__":
             f"Validated E0-Hessian weight cache kind={args.weight_mix_cache_kind}: "
             f"{cache_path}"
         )
+    if args.hardware_weight_cache_kind:
+        if not cache_path.exists():
+            raise FileNotFoundError(f"missing requested hardware weight cache: {cache_path}")
+        quantized_dir = _ROOT / "models" / args.model / "quantized_cache"
+        hessian_cache = Path(
+            args.hardware_weight_hessian_cache or
+            (quantized_dir / "hessians_e0a_n5120_l120_rr-random_g16_tile64x8.pt")
+        )
+        validate_hardware_weight_metadata(
+            cache_path,
+            expected_hardware_weight_metadata(
+                model=args.model,
+                fmt=args.hardware_weight_cache_kind,
+                calibration_count=args.gptq_calib_files,
+                damp_pct=args.gptq_damp_pct,
+                basis_path=Path(basis_path),
+                rotation_path=Path(rotation_path),
+                hessian_cache=hessian_cache,
+                skip_layers=skip_layers,
+            ),
+        )
+        print(
+            f"Validated packing-valid hardware weight cache "
+            f"kind={args.hardware_weight_cache_kind}: {cache_path}"
+        )
     if cache_path.exists():
         if args.e0joint_gptq:
             validate_e0joint_metadata(cache_path, {
@@ -739,6 +847,14 @@ if __name__ == "__main__":
                 print(f"  {k}")
             if len(unexpected) > 10:
                 print(f"  ... and {len(unexpected) - 10} more")
+        if args.hardware_weight_cache_kind:
+            runtime_audit = validate_hardware_weight_runtime(
+                pipe.transformer, state, cache_path, args.hardware_weight_cache_kind
+            )
+            print(
+                "Verified packed payload/E4M3 scales/global scale against "
+                f"reconstructed runtime weights: {runtime_audit}"
+            )
         pipe.transformer.load_state_dict(state, strict=False)
         for _, mod in pipe.transformer.named_modules():
             if isinstance(mod, ActQuantWrapper) and (
