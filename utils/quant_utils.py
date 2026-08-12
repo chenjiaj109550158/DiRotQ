@@ -20,7 +20,7 @@ from .output_tilemixfp4_utils import (
 
 FP4_ACTIVATION_FORMATS = {
     "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle", "tile-mix-oracle",
-    "tile-mix-output-oracle", "a16w4-residual",
+    "tile-mix-output-oracle", "a16w4-residual", "e0a-w16-residual",
 } | FOUR_OVER_SIX_FORMATS
 EXPERIMENTAL_FP4_ACTIVATION_FORMATS = FP4_ACTIVATION_FORMATS - {"nvfp4"}
 
@@ -230,9 +230,13 @@ class ActQuantizer(nn.Module):
                 format_stats=self.format_stats,
             )
         else:
+            runtime_format = (
+                "e0m3" if self.quant_dtype == "e0a-w16-residual"
+                else self.quant_dtype
+            )
             x_q_out = fake_quantize_activation(
                 x_q,
-                self.quant_dtype,
+                runtime_format,
                 clip_ratio=self.clip_ratio,
                 format_stats=self.format_stats,
             )
@@ -401,6 +405,13 @@ class ActQuantWrapper(nn.Module):
         # This prevents the A16W4 ceiling from silently using original W_low.
         self.a16w4_weight_ready = False
 
+        # E0A x W16 is a guarded weight-side ceiling.  Its weight is the
+        # original model weight transformed into the exact same PCA/random-R
+        # basis as GPTQ, never the untransformed nn.Linear weight.  The flag is
+        # armed only after the standard cache provenance has been validated and
+        # the captured transformed W16 weight has been installed.
+        self.e0a_w16_weight_ready = False
+
         # Optional experiment-only streaming observer.  It must never replace
         # the quantizer output; DistributionAuditCollector only reads x/weight.
         self.distribution_audit = None
@@ -418,6 +429,18 @@ class ActQuantWrapper(nn.Module):
                 raise RuntimeError(
                     "A16W4 activation and cached GPTQ weight are on different "
                     "devices; CPU fallback is not permitted"
+                )
+            return self.quantizer(x)
+        if self.quantizer.quant_dtype == "e0a-w16-residual":
+            if not self.e0a_w16_weight_ready:
+                raise RuntimeError(
+                    "e0a-w16-residual requires a verified original transformed "
+                    "low residual weight"
+                )
+            if self.module.weight.device != x.device:
+                raise RuntimeError(
+                    "E0A-W16 activation and transformed W16 weight are on "
+                    "different devices; CPU fallback is not permitted"
                 )
             return self.quantizer(x)
         if self.quantizer.quant_dtype != "tile-mix-output-oracle":
@@ -845,6 +868,88 @@ def _rotate_and_split_W(qlayer, W):
     def _identity(W_q):
         return W_q
     return W_f32.contiguous(), None, _identity, None
+
+
+@torch.no_grad()
+def capture_transformed_w16_weights(model):
+    """Capture native-dtype, rotation-fused weights for the E0A x W16 ceiling.
+
+    This must run after rotations and quantizer split lengths are configured,
+    but before any quantized state dict is loaded.  Only active wrappers are
+    captured.  The returned CPU tensors are full stitched weights in the
+    runtime rotated layout; their low columns are the original transformed
+    residual ``W_l`` and their high columns are the unchanged native branch.
+    """
+    captured = {}
+    qlayers = find_qlayers(model, layers=[ActQuantWrapper])
+    for name, layer in qlayers.items():
+        if layer.quantizer.bits >= 16:
+            continue
+        if not (
+            layer.rotation is not None
+            or layer.rotation_per_head is not None
+            or getattr(layer, "use_hadamard", False)
+            or getattr(layer, "perm_idx", None) is not None
+        ):
+            raise RuntimeError(
+                f"e0a-w16-residual refuses untransformed active weight {name!r}"
+            )
+        original_dtype = layer.module.weight.dtype
+        low, _tail, stitch, _ = _rotate_and_split_W(
+            layer, layer.module.weight.detach()
+        )
+        fused = stitch(low).to(dtype=original_dtype).contiguous().cpu()
+        if fused.shape != layer.module.weight.shape or not torch.isfinite(fused).all():
+            raise RuntimeError(
+                f"invalid transformed W16 weight for {name}: shape={tuple(fused.shape)}"
+            )
+        captured[name] = fused
+    if not captured:
+        raise RuntimeError("e0a-w16-residual found no active rotated wrappers")
+    return captured
+
+
+@torch.no_grad()
+def install_transformed_w16_weights(model, captured, cache_state):
+    """Install a verified E0A x W16 ceiling state after standard-cache load.
+
+    ``cache_state`` is used only as provenance/coverage evidence: every active
+    wrapper must exist in the standard NVFP4 E2M1 GPTQ state dict.  The executed
+    low weight comes exclusively from ``captured`` and is therefore the
+    original transformed FP16/BF16 residual, not the standard quantized weight
+    and not the untransformed original linear weight.
+    """
+    qlayers = find_qlayers(model, layers=[ActQuantWrapper])
+    active = {name: layer for name, layer in qlayers.items()
+              if layer.quantizer.bits < 16}
+    if set(captured) != set(active):
+        missing = sorted(set(active) - set(captured))
+        extra = sorted(set(captured) - set(active))
+        raise RuntimeError(
+            "transformed W16 capture does not match active wrappers: "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    missing_cache = [name for name in active
+                     if f"{name}.module.weight" not in cache_state]
+    if missing_cache:
+        raise RuntimeError(
+            "standard GPTQ provenance is missing active weights: "
+            + ", ".join(missing_cache[:5])
+        )
+
+    for name, layer in active.items():
+        weight = captured[name]
+        if weight.dtype != layer.module.weight.dtype:
+            raise RuntimeError(
+                f"native dtype mismatch for {name}: captured={weight.dtype}, "
+                f"model={layer.module.weight.dtype}"
+            )
+        layer.module.weight.data.copy_(
+            weight.to(device=layer.module.weight.device, non_blocking=False)
+        )
+        layer._unrot_fused = True
+        layer.e0a_w16_weight_ready = True
+    return len(active)
 
 
 def _quant_group_int(W, bits, groupsize, sym):

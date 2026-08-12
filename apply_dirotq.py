@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from utils.quant_utils import (
     ActQuantWrapper, add_actquant, find_qlayers,
     rtn_quantize_weights, nvfp4_rtn_quantize_weights,
+    capture_transformed_w16_weights, install_transformed_w16_weights,
 )
 from utils.gptq_utils import collect_hessians, gptq_quantize_weights
 from utils.tilemixfp4_utils import FormatSelectionStats
@@ -40,6 +41,12 @@ from utils.e0joint_gptq import (
     validate_e0joint_cache_path,
     validate_e0joint_metadata,
     write_e0joint_metadata,
+)
+from utils.weight_mixfp4 import (
+    PRODUCTION_MODES as WEIGHT_MIX_MODES,
+    build_weight_mix_caches,
+    expected_metadata as expected_weight_mix_metadata,
+    validate_cache_metadata as validate_weight_mix_metadata,
 )
 
 _ROOT = Path(__file__).parent
@@ -212,7 +219,7 @@ if __name__ == "__main__":
         "--activation-format",
         choices=("nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
                  "tile-mix-oracle", "tile-mix-output-oracle",
-                 "a16w4-residual", "nvfp4-4over6",
+                 "a16w4-residual", "e0a-w16-residual", "nvfp4-4over6",
                  "e0m3-gscale1536", "tile-mix-e0-e2-4over6"),
         default="nvfp4",
         help=("Activation fake quant used with --nvfp4 weights: nvfp4 is the "
@@ -222,6 +229,9 @@ if __name__ == "__main__":
               "tile-mix-output-oracle is a local partial-output accuracy oracle "
               "and a16w4-residual keeps residual activations in native FP16/BF16 "
               "while retaining PCA/random-R and cached GPTQ W4 weights "
+              "; e0a-w16-residual is a guarded ceiling with fixed hardware "
+              "E0M3 residual activations and original transformed native-dtype "
+              "low weights "
               "; nvfp4-4over6 is paper-faithful per-block M=4/M=6 E2M1 "
               "selection with global denominator 1536, e0m3-gscale1536 is its "
               "fair fixed-E0 comparator, and tile-mix-e0-e2-4over6 selects "
@@ -298,6 +308,19 @@ if __name__ == "__main__":
         "--audit-quality-csv", action="append", default=None,
         help="Existing per-prompt metric CSV used only for exploratory correlations",
     )
+    parser.add_argument(
+        "--weight-mix-build", action="store_true",
+        help=("SANA-only calibration command: build common fixed-E0 activation "
+              "Hessian plus reoptimized fixed-E2, fixed-E0 and 64x8 Weight "
+              "TileMix GPTQ caches, then exit"),
+    )
+    parser.add_argument(
+        "--weight-mix-cache-kind", choices=WEIGHT_MIX_MODES, default=None,
+        help="Validate and execute one previously built E0-Hessian weight cache",
+    )
+    parser.add_argument("--weight-mix-report-dir", default=None)
+    parser.add_argument("--weight-mix-hessian-cache", default=None)
+    parser.add_argument("--weight-mix-standard-cache", default=None)
     args = parser.parse_args()
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
@@ -330,6 +353,11 @@ if __name__ == "__main__":
             parser.error("a16w4-residual requires GPTQ weights")
         if args.residual_rotation != "random":
             parser.error("a16w4-residual requires the random residual rotation basis")
+    if args.activation_format == "e0a-w16-residual":
+        if not args.gptq:
+            parser.error("e0a-w16-residual requires standard GPTQ cache provenance")
+        if args.residual_rotation != "random":
+            parser.error("e0a-w16-residual requires the random residual rotation basis")
     if args.e0joint_gptq:
         if args.model != "sana-1.6b":
             parser.error("--e0joint-gptq is restricted to SANA-1.6B")
@@ -343,6 +371,22 @@ if __name__ == "__main__":
             parser.error("--e0joint-gptq requires the unmodified official SANA routing")
     elif args.e0joint_standard_cache or args.e0joint_report_dir:
         parser.error("E0-joint cache/report options require --e0joint-gptq")
+    if args.weight_mix_build or args.weight_mix_cache_kind:
+        if args.model != "sana-1.6b":
+            parser.error("weight Mix feasibility is initially restricted to SANA-1.6B")
+        if not (args.gptq and args.nvfp4):
+            parser.error("weight Mix feasibility requires --gptq and --nvfp4")
+        if args.activation_format != "e0m3":
+            parser.error("weight Mix freezes activation at hardware-faithful fixed e0m3")
+        if args.residual_rotation != "random":
+            parser.error("weight Mix feasibility requires random residual rotation")
+        if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
+            parser.error("weight Mix feasibility requires unmodified official SANA routing")
+        if args.e0joint_gptq:
+            parser.error("weight Mix cannot be combined with E0-joint GPTQ")
+    elif (args.weight_mix_report_dir or args.weight_mix_hessian_cache or
+          args.weight_mix_standard_cache):
+        parser.error("weight Mix paths require --weight-mix-build or --weight-mix-cache-kind")
     identity_models = {"pixart-sigma", "sana-1.6b"}
     if args.residual_rotation != "random" and args.model not in identity_models:
         parser.error(
@@ -433,7 +477,11 @@ if __name__ == "__main__":
     residual_tag = residual_rotation_cache_tag(args.residual_rotation)
 
     if args.quantized_cache is None:
-        if args.e0joint_gptq:
+        if args.weight_mix_cache_kind:
+            cache_name = (
+                f"nvfp4_g16_e0h_weightmix_{args.weight_mix_cache_kind}_gptq_model.pt"
+            )
+        elif args.e0joint_gptq:
             cache_name = "nvfp4_g16_e0joint_gptq_model.pt"
         else:
             method = "gptq" if args.gptq else "rtn"
@@ -561,14 +609,85 @@ if __name__ == "__main__":
                                  activation_format=args.activation_format,
                                  format_stats=format_stats)
 
+    if args.weight_mix_build:
+        if args.generate:
+            print("Weight Mix build is calibration-only; image generation is disabled.")
+        report_dir = Path(
+            args.weight_mix_report_dir or
+            (_ROOT / "models" / args.model / "weight_mix_feasibility" / "calibration")
+        )
+        quantized_dir = _ROOT / "models" / args.model / "quantized_cache"
+        hessian_cache = Path(
+            args.weight_mix_hessian_cache or
+            (quantized_dir / "hessians_e0a_n5120_l120_rr-random_g16_tile64x8.pt")
+        )
+        standard_cache = Path(
+            args.weight_mix_standard_cache or
+            (quantized_dir / "nvfp4_g16_gptq_model.pt")
+        )
+        cache_paths = {
+            mode: quantized_dir / f"nvfp4_g16_e0h_weightmix_{mode}_gptq_model.pt"
+            for mode in WEIGHT_MIX_MODES
+        }
+        print("Moving transformer to CUDA for fixed-E0 Hessian/Weight Mix GPTQ...")
+        pipe.transformer = pipe.transformer.to("cuda")
+        result = build_weight_mix_caches(
+            pipe.transformer,
+            calib_dir=calib_dir,
+            hessian_cache=hessian_cache,
+            cache_paths=cache_paths,
+            standard_cache=standard_cache,
+            report_dir=report_dir,
+            basis_path=Path(basis_path),
+            rotation_path=Path(rotation_path),
+            skip_layers=skip_layers,
+            num_calib_files=args.gptq_calib_files,
+            batch_size=args.gptq_batch_size,
+            damp_pct=args.gptq_damp_pct,
+            device="cuda",
+        )
+        print("Weight Mix calibration gate:", result["calibration_gate"])
+        raise SystemExit(0)
+
+    transformed_w16 = None
+    if args.activation_format == "e0a-w16-residual":
+        # Capture before loading the standard quantized state dict.  This is
+        # the only point at which the original model weight and the configured
+        # PCA/random-R split coexist.  The helper refuses unrotated wrappers.
+        transformed_w16 = capture_transformed_w16_weights(pipe.transformer)
+        print(
+            f"Captured {len(transformed_w16)} original transformed native-dtype "
+            "W16 weights before standard-cache validation."
+        )
+
     cache_path = Path(args.quantized_cache)
     cache_required_formats = {
-        "tile-mix-output-oracle", "a16w4-residual", *FOUR_OVER_SIX_FORMATS,
+        "tile-mix-output-oracle", "a16w4-residual", "e0a-w16-residual",
+        *FOUR_OVER_SIX_FORMATS,
     }
     if args.activation_format in cache_required_formats and not cache_path.exists():
         raise FileNotFoundError(
             f"{args.activation_format} requires an existing NVFP4 E2M1 GPTQ "
             f"weight cache; refusing to create a new cache at {cache_path}"
+        )
+    if args.weight_mix_cache_kind:
+        if not cache_path.exists():
+            raise FileNotFoundError(f"missing requested weight-Mix cache: {cache_path}")
+        validate_weight_mix_metadata(
+            cache_path,
+            expected_weight_mix_metadata(
+                model=args.model,
+                mode=args.weight_mix_cache_kind,
+                calibration_count=args.gptq_calib_files,
+                damp_pct=args.gptq_damp_pct,
+                basis_path=Path(basis_path),
+                rotation_path=Path(rotation_path),
+                skip_layers=skip_layers,
+            ),
+        )
+        print(
+            f"Validated E0-Hessian weight cache kind={args.weight_mix_cache_kind}: "
+            f"{cache_path}"
         )
     if cache_path.exists():
         if args.e0joint_gptq:
@@ -645,6 +764,17 @@ if __name__ == "__main__":
             print(
                 f"Armed A16W4 residual ceiling on {armed} layers with loaded "
                 f"NVFP4 E2M1 GPTQ weights; native activation dtype={torch_dtype}."
+            )
+        elif args.activation_format == "e0a-w16-residual":
+            armed = install_transformed_w16_weights(
+                pipe.transformer, transformed_w16, state
+            )
+            transformed_w16 = None
+            print(
+                f"Armed E0A x W16 residual ceiling on {armed} layers: fixed "
+                f"hardware E0M3 activation, original transformed {torch_dtype} "
+                "low weight; standard E2 GPTQ cache used only for verified "
+                "coverage/provenance."
             )
     else:
         e0joint_result = None
