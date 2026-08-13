@@ -346,6 +346,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--hardware-weight-report-dir", default=None)
     parser.add_argument("--hardware-weight-hessian-cache", default=None)
+    parser.add_argument(
+        "--hardware-weight-hessian-sha256", default=None,
+        help=("Read-only runtime provenance alternative when the calibration "
+              "Hessian is intentionally absent; cache building still requires "
+              "--hardware-weight-hessian-cache"),
+    )
     parser.add_argument("--hardware-weight-legacy-e2-cache", default=None)
     parser.add_argument("--hardware-weight-legacy-e0-cache", default=None)
     args = parser.parse_args()
@@ -440,8 +446,16 @@ if __name__ == "__main__":
             parser.error("hardware fixed-weight feasibility is restricted to SANA-1.6B")
         if not (args.gptq and args.nvfp4):
             parser.error("hardware fixed weights require --gptq and --nvfp4")
-        if args.activation_format != "e0m3":
-            parser.error("hardware fixed weights freeze activation at existing e0m3")
+        if args.hardware_weight_build and args.activation_format != "e0m3":
+            parser.error("hardware fixed-weight cache build freezes activation at e0m3")
+        if args.hardware_weight_cache_kind:
+            from utils.asymmetric_tilemix_stats import (
+                validate_fixed_e0_weight_activation_format,
+            )
+            try:
+                validate_fixed_e0_weight_activation_format(args.activation_format)
+            except ValueError as error:
+                parser.error(str(error))
         if args.residual_rotation != "random":
             parser.error("hardware fixed weights require random residual rotation")
         if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
@@ -449,6 +463,7 @@ if __name__ == "__main__":
         if args.e0joint_gptq or args.weight_mix_build or args.weight_mix_cache_kind:
             parser.error("hardware fixed weights cannot be combined with other weight experiments")
     elif (args.hardware_weight_report_dir or args.hardware_weight_hessian_cache or
+          args.hardware_weight_hessian_sha256 or
           args.hardware_weight_legacy_e2_cache or args.hardware_weight_legacy_e0_cache):
         parser.error("hardware weight paths require a hardware weight build/runtime mode")
     identity_models = {"pixart-sigma", "sana-1.6b"}
@@ -664,6 +679,9 @@ if __name__ == "__main__":
             stats_cls = FourOverSixStats
         elif args.activation_format == "tile-mix-output-oracle":
             stats_cls = OutputOracleFormatStats
+        elif args.activation_format == "tile-mix-oracle":
+            from utils.asymmetric_tilemix_stats import TileMixTrajectoryStats
+            stats_cls = TileMixTrajectoryStats
         else:
             stats_cls = FormatSelectionStats
         format_stats = stats_cls(selection_unit=unit)
@@ -807,6 +825,21 @@ if __name__ == "__main__":
             args.hardware_weight_hessian_cache or
             (quantized_dir / "hessians_e0a_n5120_l120_rr-random_g16_tile64x8.pt")
         )
+        if hessian_cache.exists():
+            expected_hessian_path = hessian_cache
+            expected_hessian_sha256 = args.hardware_weight_hessian_sha256
+        elif args.hardware_weight_hessian_sha256:
+            expected_hessian_path = None
+            expected_hessian_sha256 = args.hardware_weight_hessian_sha256
+            print(
+                "Validating hardware weight cache against manifest-provided "
+                f"Hessian SHA-256 {expected_hessian_sha256}; Hessian file is absent."
+            )
+        else:
+            raise FileNotFoundError(
+                "hardware weight provenance requires the Hessian cache or "
+                "--hardware-weight-hessian-sha256"
+            )
         validate_hardware_weight_metadata(
             cache_path,
             expected_hardware_weight_metadata(
@@ -816,7 +849,8 @@ if __name__ == "__main__":
                 damp_pct=args.gptq_damp_pct,
                 basis_path=Path(basis_path),
                 rotation_path=Path(rotation_path),
-                hessian_cache=hessian_cache,
+                hessian_cache=expected_hessian_path,
+                hessian_cache_sha256=expected_hessian_sha256,
                 skip_layers=skip_layers,
             ),
         )
@@ -1057,9 +1091,9 @@ if __name__ == "__main__":
             f"{len(distribution_audit.layer_names)} active quantized layers."
         )
 
-    if isinstance(format_stats, FourOverSixStats):
+    if format_stats is not None and hasattr(format_stats, "attach_timestep_source"):
         format_stats.attach_timestep_source(pipe.transformer, pipe)
-        print("Attached Four Over Six sidecar to true transformer timesteps.")
+        print("Attached format-stat sidecar to true transformer timesteps.")
 
     patch_forward()
 
@@ -1075,8 +1109,16 @@ if __name__ == "__main__":
             pipe, args.output_dir, args.dataset, generation_params,
             max_images=args.max_images, batch_size=args.batch_size,
             save_images=not args.stats_only,
-            audit_controller=real_tile_export or distribution_audit,
+            audit_controller=real_tile_export or distribution_audit or (
+                format_stats if hasattr(format_stats, "start_batch") else None
+            ),
         )
+        if torch.cuda.is_available():
+            print(
+                "Process peak CUDA memory: "
+                f"allocated={torch.cuda.max_memory_allocated()} bytes, "
+                f"reserved={torch.cuda.max_memory_reserved()} bytes"
+            )
 
     if real_tile_export is not None:
         real_tile_report = real_tile_export.finalize()

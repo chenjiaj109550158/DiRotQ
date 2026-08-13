@@ -139,6 +139,23 @@ def test_hardware_e2_e0_cache_metadata_isolated(tmp_path):
     assert e2["hessian_cache_sha256"] == e0["hessian_cache_sha256"]
     assert e2["weight_format"] != e0["weight_format"]
 
+    handoff = expected_metadata(
+        fmt="hardware-fixed-e2",
+        **{key: value for key, value in common.items() if key != "hessian_cache"},
+        hessian_cache_sha256=e2["hessian_cache_sha256"],
+    )
+    assert handoff == e2
+    with pytest.raises(ValueError, match="64 lowercase hex"):
+        expected_metadata(
+            fmt="hardware-fixed-e2",
+            **{key: value for key, value in common.items() if key != "hessian_cache"},
+            hessian_cache_sha256="not-a-sha",
+        )
+    with pytest.raises(RuntimeError, match="does not match"):
+        expected_metadata(
+            fmt="hardware-fixed-e2", **common, hessian_cache_sha256="0" * 64
+        )
+
     cache = tmp_path / "hardware-fixed-e2.pt"
     cache.write_bytes(b"cache")
     packing_path(cache).write_bytes(b"packing")

@@ -14,6 +14,7 @@ import gc
 import hashlib
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -367,10 +368,21 @@ def _base_cache_state(transformer) -> dict:
 
 def expected_metadata(
     *, model: str, fmt: str, calibration_count: int, damp_pct: float,
-    basis_path: Path, rotation_path: Path, hessian_cache: Path,
-    skip_layers: list[str],
+    basis_path: Path, rotation_path: Path, skip_layers: list[str],
+    hessian_cache: Path | None = None, hessian_cache_sha256: str | None = None,
 ) -> dict:
     _format_short(fmt)
+    if hessian_cache is not None:
+        observed_hessian_sha256 = sha256_file(hessian_cache)
+        if (hessian_cache_sha256 is not None and
+                hessian_cache_sha256 != observed_hessian_sha256):
+            raise RuntimeError("provided Hessian SHA-256 does not match the cache file")
+    elif hessian_cache_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", hessian_cache_sha256):
+            raise ValueError("Hessian SHA-256 must be 64 lowercase hex characters")
+        observed_hessian_sha256 = hessian_cache_sha256
+    else:
+        raise ValueError("either hessian_cache or hessian_cache_sha256 is required")
     return {
         "model": model,
         "objective_version": OBJECTIVE_VERSION,
@@ -385,7 +397,7 @@ def expected_metadata(
         "skip_layer_hash": skip_layer_hash(skip_layers),
         "basis_sha256": sha256_file(basis_path),
         "rotation_sha256": sha256_file(rotation_path),
-        "hessian_cache_sha256": sha256_file(hessian_cache),
+        "hessian_cache_sha256": observed_hessian_sha256,
         "active_layers": REQUIRED_ACTIVE_LAYERS,
     }
 

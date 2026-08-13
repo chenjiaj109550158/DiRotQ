@@ -353,7 +353,18 @@ def fake_quantize_tile_mix_oracle(
     ).sum(dim=(1, 3))
     choose_e0 = err_e0 < err_e2  # strict comparison: ties select E2M1
     if format_stats is not None:
-        format_stats.record(choose_e0)
+        if hasattr(format_stats, "record_tilemix"):
+            # Candidate SSE was evaluated on Z=A/alpha.  Convert it back to
+            # the original low-activation units for observational reporting.
+            scale_sq = s32.double().square()
+            format_stats.record_tilemix(
+                choose_e0,
+                err_e0.double() * scale_sq,
+                err_e2.double() * scale_sq,
+                original_shape=shape,
+            )
+        else:
+            format_stats.record(choose_e0)
 
     q_e2_tiles = q_e2.reshape(mt, TILE_ROWS, kt, TILE_COLS)
     q_e0_tiles = q_e0.reshape(mt, TILE_ROWS, kt, TILE_COLS)
