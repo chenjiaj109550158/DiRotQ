@@ -8,6 +8,8 @@ import torch
 from torch import nn
 
 from utils.quant_utils import ActQuantWrapper
+from dirotq_fused_unrotation import preconvert_rotations_to_device as preconvert_slow
+from dirotq_fused_unrotation_fast import preconvert_rotations_to_device as preconvert_fast
 from utils.shared_pca_basis import (
     FAMILIES,
     PixArtBasisConfig,
@@ -173,3 +175,27 @@ def test_pixart_routing_reuses_materialized_shared_rotation():
     assert report["assignments"] == 8
     assert report["unique_storages"] == 2
     assert report["unique_storage_bytes"] < report["logical_assignment_bytes"]
+
+
+@pytest.mark.parametrize("preconvert", [preconvert_slow, preconvert_fast])
+def test_preconvert_does_not_materialize_skipped_rotation(preconvert):
+    active = ActQuantWrapper(nn.Linear(8, 8, bias=False))
+    skipped = ActQuantWrapper(nn.Linear(8, 8, bias=False))
+    active.quantizer.configure(bits=4, groupsize=4, sym=True)
+    skipped.quantizer.configure(bits=16, groupsize=-1, sym=True)
+    shared = torch.eye(8)
+    active.rotation = shared
+    skipped.rotation = torch.eye(8) * 2
+    skipped_before = skipped.rotation
+    transformer = nn.Module()
+    transformer.active = active
+    transformer.skipped = skipped
+
+    assert preconvert(transformer, device="cpu") == 1
+    assert active.rotation.device.type == "cpu"
+    # Object identity proves the skipped tensor was not converted/replaced.
+    assert skipped.rotation is skipped_before
+    report = rotation_storage_report(transformer)
+    assert report["assignments"] == 2
+    assert report["active_assignments"] == 1
+    assert report["active_unique_storage_bytes"] == shared.untyped_storage().nbytes()

@@ -47,6 +47,10 @@ def preconvert_rotations_to_device(transformer, device="cuda", dtype=None):
     for name, mod in transformer.named_modules():
         if not isinstance(mod, ActQuantWrapper):
             continue
+        # Skipped bits=16 wrappers bypass every rotation branch in forward.
+        # Do not materialize their otherwise-unused basis on the GPU.
+        if mod.quantizer.bits >= 16:
+            continue
 
         if mod.rotation is not None:
             mod.rotation = _convert_once(mod.rotation, dtype)

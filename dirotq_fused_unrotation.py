@@ -52,6 +52,12 @@ def preconvert_rotations_to_device(transformer, device="cuda"):
     for name, mod in transformer.named_modules():
         if not isinstance(mod, ActQuantWrapper):
             continue
+        # A bits=16 wrapper takes the ordinary Linear path and never reads
+        # its assigned rotation.  Keeping a skipped layer's (notably the
+        # PixArt 4608x4608 ff.net.2) basis on CPU avoids charging dead storage
+        # to the generation-time rotation footprint.
+        if mod.quantizer.bits >= 16:
+            continue
         if mod.rotation is not None:
             mod.rotation = _convert_once(mod.rotation, torch.float32)
             n += 1

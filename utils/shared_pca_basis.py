@@ -273,28 +273,43 @@ def rotation_storage_report(transformer) -> dict:
     from .quant_utils import ActQuantWrapper
 
     assignments = []
+    active_assignments = []
     for module in transformer.modules():
         if not isinstance(module, ActQuantWrapper):
             continue
         tensor = module.rotation if module.rotation is not None else module.rotation_per_head
         if tensor is not None:
             assignments.append(tensor)
-    seen = set()
-    unique_bytes = 0
-    for tensor in assignments:
-        storage = tensor.untyped_storage()
-        key = (
-            tensor.device.type, tensor.device.index, storage.data_ptr(),
-            storage.nbytes(),
-        )
-        if key not in seen:
-            seen.add(key)
-            unique_bytes += storage.nbytes()
+            if module.quantizer.bits < 16:
+                active_assignments.append(tensor)
+
+    def _unique(values):
+        seen = set()
+        unique_bytes = 0
+        for tensor in values:
+            storage = tensor.untyped_storage()
+            key = (
+                tensor.device.type, tensor.device.index, storage.data_ptr(),
+                storage.nbytes(),
+            )
+            if key not in seen:
+                seen.add(key)
+                unique_bytes += storage.nbytes()
+        return len(seen), unique_bytes
+
+    unique_storages, unique_bytes = _unique(assignments)
+    active_unique_storages, active_unique_bytes = _unique(active_assignments)
     return {
         "assignments": len(assignments),
-        "unique_storages": len(seen),
+        "unique_storages": unique_storages,
         "logical_assignment_bytes": sum(t.numel() * t.element_size() for t in assignments),
         "unique_storage_bytes": unique_bytes,
+        "active_assignments": len(active_assignments),
+        "active_unique_storages": active_unique_storages,
+        "active_logical_assignment_bytes": sum(
+            t.numel() * t.element_size() for t in active_assignments
+        ),
+        "active_unique_storage_bytes": active_unique_bytes,
     }
 
 

@@ -101,8 +101,18 @@ def main():
     summary = []
     for name, _ in candidates:
         selected = [row for row in rows if row["scheme"] == name]
-        for family in (*FAMILIES, "ALL_EQUAL_SOURCE"):
-            subset = selected if family == "ALL_EQUAL_SOURCE" else [row for row in selected if row["family"] == family]
+        aggregates = {
+            "ALL_EQUAL_SOURCE": selected,
+            # Official PixArt W4A4 quality commands preserve ff.net.2 in
+            # high precision, so its basis is not part of the active method.
+            "ALL_ACTIVE_EQUAL_SOURCE": [
+                row for row in selected if row["family"] != "ffn.down_proj"
+            ],
+        }
+        for family in (*FAMILIES, *aggregates):
+            subset = aggregates[family] if family in aggregates else [
+                row for row in selected if row["family"] == family
+            ]
             values = torch.tensor([row["protected_energy_fraction"] for row in subset])
             ratios = torch.tensor([row["relative_to_per_layer"] for row in subset])
             summary.append({
