@@ -99,15 +99,24 @@ def _head_diagonal(H: torch.Tensor, cfg: PixArtBasisConfig) -> torch.Tensor:
 
 
 def _source_covariance(
-    hessians: dict[str, torch.Tensor], block: int, family: str,
+    source_basis: dict, hessians: dict[str, torch.Tensor], block: int, family: str,
     cfg: PixArtBasisConfig,
 ) -> torch.Tensor:
+    if family in HEAD_FAMILIES:
+        # PixArt's published quality path derives output-projection PCA from
+        # the per-head output of to_v, not from the later post-attention input
+        # seen by to_out/GPTQ.  Reconstruct that exact covariance source from
+        # its eigensystem.  The stored isotropic damping does not change the
+        # pooled eigenvectors because it only adds a scalar identity per head.
+        key = basis_key(block, family)
+        U = source_basis[key].detach().cpu().double()
+        evals = source_basis[f"{key}.eigenvalues"].detach().cpu().double()
+        H = U @ torch.diag_embed(evals) @ U.transpose(-1, -2)
+        return H
     key = hessian_key(block, family)
     if key not in hessians:
         raise KeyError(f"missing pre-rotation Hessian {key}")
     H = hessians[key].detach().to(device="cpu", dtype=torch.float64)
-    if family in HEAD_FAMILIES:
-        H = _head_diagonal(H, cfg)
     expected = (
         (cfg.num_heads, cfg.head_dim, cfg.head_dim)
         if family in HEAD_FAMILIES else
@@ -198,7 +207,7 @@ def build_shared_basis(
         # float64 Hessians temporarily exceeds 9 GiB and is unnecessary.
         pooled = None
         for block, family in members:
-            covariance = _source_covariance(hessians, block, family, cfg)
+            covariance = _source_covariance(source_basis, hessians, block, family, cfg)
             if pooled is None:
                 pooled = torch.zeros_like(covariance)
             pooled.add_(covariance)

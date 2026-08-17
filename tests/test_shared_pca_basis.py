@@ -91,6 +91,9 @@ def test_per_head_covariance_uses_head_blocks_only():
     U = derived[basis_key(0, "self_attn.value")]
     assert tuple(U.shape) == (2, 4, 4)
     assert torch.allclose(U.transpose(-1, -2) @ U, torch.eye(4)[None], atol=1e-5)
+    # The huge cross-head values in the GPTQ Hessian must not affect the
+    # to_v-derived basis source; the diagonal eigensystems stay canonical.
+    assert torch.allclose(U.abs(), torch.eye(4)[None].expand(2, -1, -1), atol=1e-5)
 
 
 def test_speedup_rotation_requires_counter_rotated_weight():
