@@ -356,7 +356,8 @@ def test_cuda_gptq_is_deterministic_and_device_resident():
 def test_ada_per_token_per_channel_e4_native_raw_mma_epilogue_parity():
     torch.manual_seed(17)
     activation = torch.randn(16, 64, device="cuda")
-    weight = torch.randn(8, 64, device="cuda")
+    # Public Ada cuBLASLt path requires N to be 16-aligned.
+    weight = torch.randn(16, 64, device="cuda")
     qa = quantize_plain_e4m3_per_token(activation)
     qw, _ = quantize_e4_per_channel_rtn(weight)
     raw = torch._scaled_mm(
