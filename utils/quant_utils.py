@@ -283,7 +283,9 @@ class ActQuantizer(nn.Module):
         self.sym = sym
         self.clip_ratio = clip_ratio
         self.high_bits_length = high_bits_length
-        if high_quant_format not in {"bf16", "e4m3", "mxfp8"}:
+        if high_quant_format not in {
+            "bf16", "e4m3", "mxfp8", "e4m3-token", "mxfp8-nosat", "mxfp8-neighbor",
+        }:
             raise ValueError(f"unsupported high quantization format {high_quant_format!r}")
         self.high_quant_format = high_quant_format
 

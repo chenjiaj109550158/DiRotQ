@@ -17,7 +17,9 @@ from typing import Literal
 import torch
 
 
-HighFormat = Literal["bf16", "e4m3", "mxfp8"]
+HighFormat = Literal[
+    "bf16", "e4m3", "mxfp8", "e4m3-token", "mxfp8-nosat", "mxfp8-neighbor",
+]
 E4M3_MAX = 448.0
 MX_BLOCK_SIZE = 32
 MX_SCALE_BIAS = 127
@@ -87,6 +89,10 @@ class HighFormatStats:
             amax = source.float().abs().amax()
             scales = torch.where(amax == 0, torch.ones_like(amax), amax / E4M3_MAX).reshape(1)
             normalized = source.float() / scales[0]
+        elif fmt == "e4m3-token":
+            amax = source.float().abs().amax(dim=-1, keepdim=True)
+            scales = torch.where(amax == 0, torch.ones_like(amax), amax / E4M3_MAX)
+            normalized = source.float() / scales
         elif fmt == "mxfp8":
             k = source.shape[-1]
             padded_k = ((k + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE) * MX_BLOCK_SIZE
@@ -94,6 +100,15 @@ class HighFormatStats:
             padded = torch.nn.functional.pad(flat, (0, padded_k - k))
             blocks = padded.reshape(flat.shape[0], -1, MX_BLOCK_SIZE)
             scale_bytes = _mx_scale_bytes(blocks.abs().amax(dim=-1))
+            scales = decode_ue8m0(scale_bytes)
+            normalized = blocks / scales.unsqueeze(-1)
+        elif fmt in {"mxfp8-nosat", "mxfp8-neighbor"}:
+            k = source.shape[-1]
+            padded_k = ((k + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE) * MX_BLOCK_SIZE
+            flat = source.float().reshape(-1, k)
+            padded = torch.nn.functional.pad(flat, (0, padded_k - k))
+            blocks = padded.reshape(flat.shape[0], -1, MX_BLOCK_SIZE)
+            scale_bytes = _mx_activation_scale_bytes(blocks, fmt.removeprefix("mxfp8-"))
             scales = decode_ue8m0(scale_bytes)
             normalized = blocks / scales.unsqueeze(-1)
         elif fmt == "bf16":
@@ -325,6 +340,27 @@ def quantize_plain_e4m3(source: torch.Tensor) -> PlainE4M3Result:
     )
 
 
+def quantize_plain_e4m3_per_token(source: torch.Tensor) -> PlainE4M3Result:
+    """Signed E4M3 with one dynamic FP32 scale per complete high vector.
+
+    The scale is computed over the final, unpadded K dimension for every
+    logical token/row.  This is the conditional W8A8 contract; the older
+    whole-call ``e4m3`` path remains unchanged for historical controls.
+    """
+    if source.ndim < 1 or not source.is_floating_point() or not torch.isfinite(source).all():
+        raise ValueError("per-token E4M3 source must be a finite floating tensor")
+    amax = source.float().abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax == 0, torch.ones_like(amax), amax / E4M3_MAX).float()
+    payload, saturation_count = _e4m3_payload_from_scaled(source.float() / scale)
+    decoded = decode_e4m3_bytes(payload)
+    reconstructed = decoded * scale
+    return PlainE4M3Result(
+        payload=payload, scale=scale, decoded_fp32=decoded,
+        reconstructed=reconstructed.to(source.dtype),
+        saturation_count=saturation_count,
+    )
+
+
 def decode_ue8m0(scale_bytes: torch.Tensor) -> torch.Tensor:
     """Decode finite UE8M0/E8M0 bytes; 0xff is the NaN encoding."""
     if scale_bytes.dtype != torch.uint8:
@@ -379,6 +415,68 @@ def quantize_mxfp8_e4m3(source: torch.Tensor) -> MXFP8Result:
         original_shape=original_shape,
         padded_k=padded_k,
         saturation_count=saturation_count,
+    )
+
+
+def _mx_activation_scale_bytes(blocks: torch.Tensor, recipe: str) -> torch.Tensor:
+    amax = blocks.abs().amax(dim=-1)
+    nonzero = amax > 0
+    safe = torch.where(nonzero, amax, torch.ones_like(amax))
+    if recipe == "nosat":
+        exponent = torch.ceil(torch.log2(safe / E4M3_MAX))
+        exponent = exponent.clamp(MX_MIN_SCALE_EXP, MX_MAX_SCALE_EXP).to(torch.int16)
+    elif recipe == "neighbor":
+        center = torch.ceil(torch.log2(safe / E4M3_MAX))
+        center = center.clamp(MX_MIN_SCALE_EXP, MX_MAX_SCALE_EXP).to(torch.int16)
+        candidates = torch.stack([
+            (center - 1).clamp(MX_MIN_SCALE_EXP, MX_MAX_SCALE_EXP),
+            center,
+            (center + 1).clamp(MX_MIN_SCALE_EXP, MX_MAX_SCALE_EXP),
+        ])
+        losses = []
+        for index in range(3):
+            scale = torch.pow(
+                torch.tensor(2.0, device=blocks.device), candidates[index].float()
+            )
+            payload, _ = _e4m3_payload_from_scaled(blocks / scale.unsqueeze(-1))
+            decoded = decode_e4m3_bytes(payload) * scale.unsqueeze(-1)
+            losses.append((blocks - decoded).double().square().sum(dim=-1))
+        matrix = torch.stack(losses)
+        # Strict comparison with center first makes ties deterministic.
+        best = torch.ones(center.shape, dtype=torch.long, device=blocks.device)
+        best_loss = matrix[1].clone()
+        for index in (0, 2):
+            better = matrix[index] < best_loss
+            best = torch.where(better, torch.full_like(best, index), best)
+            best_loss = torch.where(better, matrix[index], best_loss)
+        exponent = torch.gather(candidates, 0, best.unsqueeze(0)).squeeze(0)
+    else:
+        raise ValueError(f"unsupported MXFP8 activation recipe {recipe!r}")
+    exponent = torch.where(nonzero, exponent, torch.zeros_like(exponent))
+    return (exponent + MX_SCALE_BIAS).to(torch.uint8)
+
+
+def quantize_mxfp8_e4m3_activation(source: torch.Tensor, recipe: str) -> MXFP8Result:
+    """K32 MXFP8 activation with frozen no-sat or local-SSE exponent rule."""
+    if source.ndim < 1 or not source.is_floating_point() or not torch.isfinite(source).all():
+        raise ValueError("MXFP8 activation source must be a finite floating tensor")
+    original_shape = tuple(source.shape)
+    k = source.shape[-1]
+    padded_k = ((k + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE) * MX_BLOCK_SIZE
+    flat = source.float().reshape(-1, k)
+    padded = torch.nn.functional.pad(flat, (0, padded_k - k)) if padded_k != k else flat
+    blocks = padded.reshape(flat.shape[0], -1, MX_BLOCK_SIZE)
+    scale_bytes = _mx_activation_scale_bytes(blocks, recipe)
+    scales = decode_ue8m0(scale_bytes)
+    payload, saturation = _e4m3_payload_from_scaled(blocks / scales.unsqueeze(-1))
+    decoded = (decode_e4m3_bytes(payload) * scales.unsqueeze(-1)).reshape(
+        flat.shape[0], padded_k
+    )[:, :k].reshape(original_shape)
+    return MXFP8Result(
+        payload=payload.reshape(flat.shape[0], padded_k), scale_bytes=scale_bytes,
+        decoded_fp32=decoded, reconstructed=decoded.to(source.dtype),
+        original_shape=original_shape, padded_k=padded_k,
+        saturation_count=saturation,
     )
 
 
@@ -440,6 +538,12 @@ def quantize_high(source: torch.Tensor, fmt: HighFormat) -> torch.Tensor:
         return quantize_plain_e4m3(source).reconstructed
     if fmt == "mxfp8":
         return quantize_mxfp8_e4m3(source).reconstructed
+    if fmt == "e4m3-token":
+        return quantize_plain_e4m3_per_token(source).reconstructed
+    if fmt == "mxfp8-nosat":
+        return quantize_mxfp8_e4m3_activation(source, "nosat").reconstructed
+    if fmt == "mxfp8-neighbor":
+        return quantize_mxfp8_e4m3_activation(source, "neighbor").reconstructed
     raise ValueError(f"unsupported high format {fmt!r}")
 
 
