@@ -246,7 +246,12 @@ def collect_teacher_cache(
     num_steps: int = 20, guidance_scale: float = 4.5,
 ) -> dict:
     """Collect stock-BF16 teacher calls without VAE decoding or images."""
-    output_dir.mkdir(parents=True, exist_ok=False)
+    if output_dir.exists():
+        raise FileExistsError(f"refusing to overwrite teacher cache: {output_dir}")
+    temporary = output_dir.with_name(output_dir.name + ".incomplete")
+    if temporary.exists():
+        raise FileExistsError(f"stale incomplete teacher cache requires audit: {temporary}")
+    temporary.mkdir(parents=True, exist_ok=False)
     capture = TeacherCapture()
     hook = pipeline.transformer.register_forward_hook(capture, with_kwargs=True)
     manifest_rows = []
@@ -274,7 +279,7 @@ def collect_teacher_cache(
                         "guidance": guidance, "prompt_sha256": row["exact_prompt_sha256"],
                     })
                     name = f"{row['image_id']}-{step:05d}-{guidance}.pt"
-                    path = output_dir / name
+                    path = temporary / name
                     torch.save(cache, path)
                     manifest_rows.append({
                         "file": name, "sha256": sha256_file(path),
@@ -292,7 +297,8 @@ def collect_teacher_cache(
         "cache_count": len(manifest_rows), "elapsed_seconds": time.perf_counter() - started,
         "files": manifest_rows,
     }
-    _write_json(output_dir / "manifest.json", manifest)
+    _write_json(temporary / "manifest.json", manifest)
+    temporary.rename(output_dir)
     return manifest
 
 

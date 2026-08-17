@@ -17,7 +17,9 @@ from utils.fp8_high_e0_low import (
     validate_residual_rotation,
 )
 from utils.quant_utils import ActQuantizer
-from utils.fp8_high_e0_low_experiment import dev_gate, stitch_low_high
+from utils.fp8_high_e0_low_experiment import (
+    collect_teacher_cache, dev_gate, stitch_low_high,
+)
 from utils.quant_utils import ActQuantWrapper
 
 
@@ -187,6 +189,32 @@ def test_dev_gate_uses_raw_mass_prompt_and_timestep_groups():
     assert report["arms"]["E4-AW"]["passed"]
     assert not report["arms"]["MX-AW"]["passed"]
     assert report["continue"]
+
+
+def test_teacher_cache_failure_is_visibly_incomplete(tmp_path):
+    class FailedPipeline:
+        def __init__(self):
+            self.transformer = nn.Linear(2, 2)
+            self.device = torch.device("cpu")
+
+        def set_progress_bar_config(self, **_kwargs):
+            pass
+
+        def __call__(self, *_args, **_kwargs):
+            raise RuntimeError("intentional collection failure")
+
+    rows = [{
+        "image_id": "a" * 40, "prompt": "test", "seed": 1,
+        "exact_prompt_sha256": "b" * 64,
+    }]
+    output = tmp_path / "fit"
+    with pytest.raises(RuntimeError, match="intentional"):
+        collect_teacher_cache(
+            FailedPipeline(), rows, output, selected_steps=(0,),
+            num_steps=1, guidance_scale=1.0,
+        )
+    assert not output.exists()
+    assert output.with_name("fit.incomplete").is_dir()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
