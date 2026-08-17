@@ -64,33 +64,98 @@ class HighFormatStats:
         self.square_source = None
         self.elements = None
         self.calls = None
+        self.saturation_count = None
+        self.scale_count = None
+        self.scale_sum = None
+        self.scale_square_sum = None
+        self.scale_min = None
+        self.scale_max = None
+        # Integer log2 bins [-127, 127].  For MXFP8 these are exactly the
+        # decoded UE8M0 exponents; for plain E4M3 they summarize the per-call
+        # FP32 global scale without changing its value.
+        self.scale_log2_histogram = None
 
     @torch.no_grad()
-    def observe(self, source: torch.Tensor, reconstructed: torch.Tensor, _fmt: str) -> None:
+    def observe(self, source: torch.Tensor, reconstructed: torch.Tensor, fmt: str) -> None:
         if source.device != reconstructed.device:
             raise RuntimeError("high-format stats forbid CPU/device fallback")
         error = (source.float() - reconstructed.float()).square().sum(dtype=torch.float64)
         energy = source.float().square().sum(dtype=torch.float64)
         count = torch.tensor(source.numel(), dtype=torch.int64, device=source.device)
         one = torch.ones((), dtype=torch.int64, device=source.device)
+        if fmt == "e4m3":
+            amax = source.float().abs().amax()
+            scales = torch.where(amax == 0, torch.ones_like(amax), amax / E4M3_MAX).reshape(1)
+            normalized = source.float() / scales[0]
+        elif fmt == "mxfp8":
+            k = source.shape[-1]
+            padded_k = ((k + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE) * MX_BLOCK_SIZE
+            flat = source.float().reshape(-1, k)
+            padded = torch.nn.functional.pad(flat, (0, padded_k - k))
+            blocks = padded.reshape(flat.shape[0], -1, MX_BLOCK_SIZE)
+            scale_bytes = _mx_scale_bytes(blocks.abs().amax(dim=-1))
+            scales = decode_ue8m0(scale_bytes)
+            normalized = blocks / scales.unsqueeze(-1)
+        elif fmt == "bf16":
+            scales = torch.ones(1, dtype=torch.float32, device=source.device)
+            normalized = torch.zeros(1, dtype=torch.float32, device=source.device)
+        else:
+            raise ValueError(f"unsupported high-format statistics mode: {fmt}")
+        saturation = (normalized.abs() > E4M3_MAX).sum(dtype=torch.int64)
+        scale_values = scales.float().reshape(-1)
+        scale_logs = torch.floor(torch.log2(scale_values)).clamp(-127, 127).to(torch.int64)
+        scale_histogram = torch.bincount(scale_logs + 127, minlength=255)
+        scale_count = torch.tensor(scale_values.numel(), dtype=torch.int64, device=source.device)
+        scale_sum = scale_values.sum(dtype=torch.float64)
+        scale_square_sum = scale_values.square().sum(dtype=torch.float64)
+        scale_min, scale_max = scale_values.amin(), scale_values.amax()
         if self.square_error is None:
             self.square_error, self.square_source = error, energy
             self.elements, self.calls = count, one
+            self.saturation_count = saturation
+            self.scale_count = scale_count
+            self.scale_sum, self.scale_square_sum = scale_sum, scale_square_sum
+            self.scale_min, self.scale_max = scale_min, scale_max
+            self.scale_log2_histogram = scale_histogram
         else:
             self.square_error.add_(error)
             self.square_source.add_(energy)
             self.elements.add_(count)
             self.calls.add_(one)
+            self.saturation_count.add_(saturation)
+            self.scale_count.add_(scale_count)
+            self.scale_sum.add_(scale_sum)
+            self.scale_square_sum.add_(scale_square_sum)
+            self.scale_min.copy_(torch.minimum(self.scale_min, scale_min))
+            self.scale_max.copy_(torch.maximum(self.scale_max, scale_max))
+            self.scale_log2_histogram.add_(scale_histogram)
 
     def snapshot(self) -> dict:
         if self.square_error is None:
             return {"calls": 0, "elements": 0, "sse": 0.0, "relative_sse": 0.0}
         sse = float(self.square_error.cpu())
         energy = float(self.square_source.cpu())
+        scale_count = int(self.scale_count.cpu())
+        scale_mean = float(self.scale_sum.cpu()) / scale_count
+        scale_variance = max(
+            0.0, float(self.scale_square_sum.cpu()) / scale_count - scale_mean ** 2
+        )
+        histogram = self.scale_log2_histogram.cpu().tolist()
         return {
             "calls": int(self.calls.cpu()), "elements": int(self.elements.cpu()),
             "sse": sse, "source_square_sum": energy,
             "relative_sse": sse / energy if energy else 0.0,
+            "saturation_count": int(self.saturation_count.cpu()),
+            "saturation_rate": int(self.saturation_count.cpu()) / int(self.elements.cpu()),
+            "scale_count": scale_count,
+            "scale_min": float(self.scale_min.cpu()),
+            "scale_max": float(self.scale_max.cpu()),
+            "scale_mean": scale_mean,
+            "scale_std": math.sqrt(scale_variance),
+            "scale_log2_histogram": {
+                str(index - 127): int(value)
+                for index, value in enumerate(histogram) if value
+            },
         }
 
 

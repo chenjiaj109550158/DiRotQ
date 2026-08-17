@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from utils.fp8_high_e0_low import (
+    HighFormatStats,
     decode_e4m3_bytes,
     decode_ue8m0,
     derive_rank_contract,
@@ -36,6 +37,22 @@ def test_rank_contract_matches_sana_baseline_and_triple():
     assert (baseline.high_per_head, baseline.low_per_head) == (4, 28)
     assert (triple.high_hidden, triple.low_hidden) == (864, 1376)
     assert (triple.high_per_head, triple.low_per_head) == (12, 20)
+
+
+@pytest.mark.parametrize("fmt", ("e4m3", "mxfp8"))
+def test_high_format_stats_include_device_side_saturation_and_scale_distribution(fmt):
+    source = torch.tensor([[0.0, 1.0, 2.0, 448.0] * 8], dtype=torch.float32)
+    result = quantize_plain_e4m3(source) if fmt == "e4m3" else quantize_mxfp8_e4m3(source)
+    stats = HighFormatStats()
+    stats.observe(source, result.reconstructed, fmt)
+    snapshot = stats.snapshot()
+    assert snapshot["calls"] == 1
+    assert snapshot["elements"] == source.numel()
+    assert snapshot["scale_count"] == (1 if fmt == "e4m3" else 1)
+    assert snapshot["scale_min"] > 0
+    assert snapshot["scale_max"] >= snapshot["scale_min"]
+    assert sum(snapshot["scale_log2_histogram"].values()) == snapshot["scale_count"]
+    assert 0 <= snapshot["saturation_rate"] <= 1
 
 
 def test_matched_residual_rotation_is_deterministic_and_tail_isolated():
