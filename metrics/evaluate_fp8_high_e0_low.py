@@ -7,6 +7,11 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 import torch
 import yaml
@@ -37,7 +42,6 @@ from utils.fp8_high_e0_low_experiment import (
 from utils.quant_utils import ActQuantWrapper
 
 
-ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUN = ROOT / "models/sana-1.6b/fp8_high3x_e0_low_ada"
 
 
