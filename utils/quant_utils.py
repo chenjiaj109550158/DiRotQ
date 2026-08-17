@@ -16,6 +16,7 @@ from .output_tilemixfp4_utils import (
     build_output_weight_grams,
     fake_quantize_tile_mix_output_oracle,
 )
+from .fp8_high_e0_low import quantize_high
 
 
 FP4_ACTIVATION_FORMATS = {
@@ -121,6 +122,11 @@ class ActQuantizer(nn.Module):
         self.clip_ratio = 1.0
         self.quant_dtype = "int"  # int or one of FP4_ACTIVATION_FORMATS
         self.format_stats = None
+        # Accuracy-only protected-subspace format.  The default is the exact
+        # historical BF16/FP16 passthrough; changing it never changes the low
+        # E0 quantizer or its full-call global scale.
+        self.high_quant_format = "bf16"
+        self.high_format_stats = None
         # Read-only experiment hook.  It is unset in every normal run and is
         # invoked only from the existing fixed hardware-E0 quantization path.
         self.real_tile_capture = None
@@ -249,6 +255,12 @@ class ActQuantizer(nn.Module):
             # was split above, so it cannot enter activation SSE/QSNR.
             self.format_stats.record_reconstruction(x_q, x_q_out)
         if x_h is not None:
+            x_h_original = x_h
+            x_h = quantize_high(x_h, self.high_quant_format)
+            if self.high_format_stats is not None:
+                self.high_format_stats.observe(
+                    x_h_original, x_h, self.high_quant_format
+                )
             return torch.cat([x_q_out, x_h], dim=-1).to(x_dtype)
         return x_q_out.to(x_dtype)
 
@@ -260,6 +272,7 @@ class ActQuantizer(nn.Module):
         clip_ratio=1.0,
         high_bits_length=0,
         quant_dtype="int",
+        high_quant_format="bf16",
     ):
         self.quant_dtype = quant_dtype
         if quant_dtype in FP4_ACTIVATION_FORMATS:
@@ -270,6 +283,9 @@ class ActQuantizer(nn.Module):
         self.sym = sym
         self.clip_ratio = clip_ratio
         self.high_bits_length = high_bits_length
+        if high_quant_format not in {"bf16", "e4m3", "mxfp8"}:
+            raise ValueError(f"unsupported high quantization format {high_quant_format!r}")
+        self.high_quant_format = high_quant_format
 
     def find_params_per_token_groupwise(self, x, maxq):
         xmax = torch.amax(x, dim=-1, keepdim=True) * self.clip_ratio

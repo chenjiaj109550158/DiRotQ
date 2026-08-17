@@ -149,7 +149,8 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=False, hadamard_layers=None, a_groupsize=None,
                                  high_len_down=0, skip_quant_layers=None,
-                                 activation_format="nvfp4", format_stats=None):
+                                 activation_format="nvfp4", format_stats=None,
+                                 high_quant_format="bf16"):
     """Configure mixed-precision activation quantizers by Sana layer type.
 
     INT4 mode:
@@ -226,24 +227,28 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
+                high_quant_format=high_quant_format,
             )
         elif is_self_attn_qkv:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=high_len_hidden,
                 quant_dtype=qdt,
+                high_quant_format=high_quant_format,
             )
         elif is_attn_out:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs_out, sym=nvfp4,
                 high_bits_length=high_len_head,
                 quant_dtype=qdt,
+                high_quant_format=high_quant_format,
             )
         else:
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
                 high_bits_length=0,
                 quant_dtype=qdt,
+                high_quant_format="bf16",
             )
 
         # The hardware scale hierarchy is defined for the unclipped operand.
