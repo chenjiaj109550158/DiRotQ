@@ -21,8 +21,9 @@ The four pre-registered schemes are:
 4. [fixed representative layer per operator](04_representative_operator.md)
 
 The speed implementation audit and its fail-closed interpretation are in
-[00_speedup_audit.md](00_speedup_audit.md).  Results are added to the
-individual files only after each arm is frozen and run.
+[00_speedup_audit.md](00_speedup_audit.md).  The frozen PixArt-128 result is
+summarized in [05_results.md](05_results.md) and recorded separately in each
+scheme file.
 
 ## Pre-registered execution ladder
 
@@ -50,3 +51,17 @@ supports degradation, and CLIP is not significantly worse.  Passing this
 screen makes it eligible for the full official 5K FID/PSNR run; it does not by
 itself reproduce the paper number.
 
+## Final decision
+
+None of the four shared-basis schemes passed the screen. Every arm had a
+statistically supported PSNR, LPIPS, and SSIM regression relative to the
+matched per-linear PCA baseline. The best image arm, pooled per operator,
+changed PSNR by -0.550 dB (95% CI [-0.867, -0.222]) and LPIPS by +0.02822
+([+0.01692, +0.03920]). Consequently no arm was promoted to the official
+5000-image FID run.
+
+The per-linear baseline reached 19.501 dB on this fixed first-128 pilot; the
+best shared arm reached 18.951 dB. This pilot therefore does not support the
+claim that the speed/memory sharing assumption retains the paper's 19.1 dB
+quality result. It cannot by itself estimate or refute the paper's 15.9 FID,
+because FID is not meaningful at this sample count.

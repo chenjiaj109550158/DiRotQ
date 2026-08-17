@@ -20,5 +20,20 @@ less memory reduction and online reuse than a single per-family basis.
 
 ## Result
 
-Pending formal run.
+Failed the quality screen.
 
+- Active online basis storage: 33,177,600 bytes (7.0x reduction).
+- Mean protected-energy retention over active sources: 82.82%, the best of
+  the shared schemes.
+- 128-image means: PSNR 18.8378 dB, LPIPS 0.25391, SSIM 0.70920, CLIP 26.7850.
+- Paired versus per-linear PCA: PSNR -0.6631 dB, 95% CI
+  [-1.0335, -0.3252], win rate 35.9%; LPIPS +0.02870,
+  [+0.01613, +0.04286], win rate 34.4%; SSIM -0.02498,
+  [-0.03536, -0.01574].
+- CLIP delta +0.1166 had CI [-0.1420, +0.3755].
+
+Conclusion: coarse depth conditioning recovers calibration protected energy,
+but did not recover image quality and was slightly worse than the cheaper
+per-operator pooled scheme. Protected-energy retention alone is therefore
+not a sufficient selector for a shared basis. This arm is not eligible for
+5K.
