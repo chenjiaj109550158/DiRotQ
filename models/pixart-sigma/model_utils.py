@@ -65,8 +65,32 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
         R2 = rotation_dict["R2"].float()
         R_down = rotation_dict["R_down"].float()
 
-    def _residual_basis(evec, rotation):
-        return evec if residual_rotation == "identity" else evec @ rotation
+    # Derived shared-basis artifacts map every legacy per-layer key to a
+    # canonical group.  Cache the post-residual rotation too: merely aliasing
+    # PCA tensors on disk is not a memory reduction if ``evec @ R`` is
+    # materialized again for every Linear.
+    shared_map = basis_dict.get("__shared_basis_map__", {})
+    rotation_cache = {}
+
+    def _canonical(key):
+        return shared_map.get(key, key)
+
+    def _residual_basis(key, evec, rotation, kind):
+        cache_key = (_canonical(key), residual_rotation, kind)
+        if cache_key not in rotation_cache:
+            rotation_cache[cache_key] = (
+                evec if residual_rotation == "identity" else evec @ rotation
+            )
+        return rotation_cache[cache_key]
+
+    def _residual_basis_per_head(key, evec, rotation):
+        cache_key = (_canonical(key), residual_rotation, "per_head")
+        if cache_key not in rotation_cache:
+            rotation_cache[cache_key] = (
+                evec if residual_rotation == "identity" else
+                torch.bmm(evec, rotation.unsqueeze(0).expand(num_heads, -1, -1))
+            )
+        return rotation_cache[cache_key]
 
     def _use_perm(suffix):
         return any(pat.strip() in suffix for pat in pca_only_layers)
@@ -92,63 +116,72 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
         use_had = any(pat in layer_suffix for pat in hadamard_layers)
 
         if layer_suffix in ("attn1.to_q", "attn1.to_k", "attn1.to_v"):
-            evec = basis_dict[f"layer.{block_idx}.self_attn"].float()
-            evals_key = f"layer.{block_idx}.self_attn.eigenvalues"
+            basis_key = f"layer.{block_idx}.self_attn"
+            evec = basis_dict[basis_key].float()
+            evals_key = f"{basis_key}.eigenvalues"
             if _use_perm(layer_suffix) and evals_key in basis_dict:
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
+                module.rotation = _residual_basis(
+                    basis_key, evec, R1 if residual_rotation == "random" else None, "hidden"
+                )
             assigned += 1
         elif layer_suffix == "attn2.to_q":
-            evec = basis_dict[f"layer.{block_idx}.cross_attn_q"].float()
-            evals_key = f"layer.{block_idx}.cross_attn_q.eigenvalues"
+            basis_key = f"layer.{block_idx}.cross_attn_q"
+            evec = basis_dict[basis_key].float()
+            evals_key = f"{basis_key}.eigenvalues"
             if _use_perm(layer_suffix) and evals_key in basis_dict:
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
+                module.rotation = _residual_basis(
+                    basis_key, evec, R1 if residual_rotation == "random" else None, "hidden"
+                )
             assigned += 1
         elif layer_suffix == "attn1.to_out.0":
-            evec_val = basis_dict[f"layer.{block_idx}.self_attn.value"].float()
-            evals_key = f"layer.{block_idx}.self_attn.value.eigenvalues"
+            basis_key = f"layer.{block_idx}.self_attn.value"
+            evec_val = basis_dict[basis_key].float()
+            evals_key = f"{basis_key}.eigenvalues"
             if _use_perm(layer_suffix) and evals_key in basis_dict:
                 module.perm_idx = perm_idx_from_eigendecomp_per_head(
                     evec_val, basis_dict[evals_key].float()
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = (
-                    evec_val if residual_rotation == "identity" else
-                    torch.bmm(evec_val, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.rotation_per_head = _residual_basis_per_head(
+                    basis_key, evec_val, R2 if residual_rotation == "random" else None
                 )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
             assigned += 1
         elif layer_suffix == "attn2.to_out.0":
-            evec_val_ca = basis_dict[f"layer.{block_idx}.cross_attn_q.value"].float()
-            evals_key = f"layer.{block_idx}.cross_attn_q.value.eigenvalues"
+            basis_key = f"layer.{block_idx}.cross_attn_q.value"
+            evec_val_ca = basis_dict[basis_key].float()
+            evals_key = f"{basis_key}.eigenvalues"
             if _use_perm(layer_suffix) and evals_key in basis_dict:
                 module.perm_idx = perm_idx_from_eigendecomp_per_head(
                     evec_val_ca, basis_dict[evals_key].float()
                 )
                 n_perm += 1
             else:
-                module.rotation_per_head = (
-                    evec_val_ca if residual_rotation == "identity" else
-                    torch.bmm(evec_val_ca, R2.unsqueeze(0).expand(num_heads, -1, -1))
+                module.rotation_per_head = _residual_basis_per_head(
+                    basis_key, evec_val_ca, R2 if residual_rotation == "random" else None
                 )
                 module.num_heads = num_heads
                 module.head_dim  = head_dim
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".proj"):
-            evec = basis_dict[f"layer.{block_idx}.ffn"].float()
-            evals_key = f"layer.{block_idx}.ffn.eigenvalues"
+            basis_key = f"layer.{block_idx}.ffn"
+            evec = basis_dict[basis_key].float()
+            evals_key = f"{basis_key}.eigenvalues"
             if _use_perm(layer_suffix) and evals_key in basis_dict:
                 module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                 n_perm += 1
             else:
-                module.rotation = _residual_basis(evec, R1 if residual_rotation == "random" else None)
+                module.rotation = _residual_basis(
+                    basis_key, evec, R1 if residual_rotation == "random" else None, "hidden"
+                )
             assigned += 1
         elif "ff.net" in layer_suffix and layer_suffix.endswith(".2"):
             if use_had:
@@ -162,14 +195,17 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                     module.hadamard_sign_flips = generate_sign_flips(low_dim, seed=42 + block_idx)
                 hadamard_count += 1
             else:
-                evec = basis_dict[f"layer.{block_idx}.ffn.down_proj"].float()
-                evals_key = f"layer.{block_idx}.ffn.down_proj.eigenvalues"
+                basis_key = f"layer.{block_idx}.ffn.down_proj"
+                evec = basis_dict[basis_key].float()
+                evals_key = f"{basis_key}.eigenvalues"
                 if _use_perm(layer_suffix) and evals_key in basis_dict:
                     module.perm_idx = perm_idx_from_eigendecomp(evec, basis_dict[evals_key].float())
                     n_perm += 1
                 else:
                     module.rotation = _residual_basis(
-                        evec, R_down if residual_rotation == "random" else None
+                        basis_key, evec,
+                        R_down if residual_rotation == "random" else None,
+                        "down",
                     )
             assigned += 1
 
@@ -177,6 +213,9 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
           f"({n_perm} perm_idx, {hadamard_count} Hadamard, "
           f"{assigned - n_perm - hadamard_count} PCA rotation, "
           f"residual_rotation={residual_rotation}).")
+    if shared_map:
+        print(f"Shared PCA basis: {len(set(shared_map.values()))} canonical groups, "
+              f"{len(rotation_cache)} materialized post-R rotations.")
     return assigned
 
 

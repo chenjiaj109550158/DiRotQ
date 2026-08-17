@@ -207,6 +207,12 @@ if __name__ == "__main__":
                         help="Model name (subdirectory under models/, default: pixart-sigma)")
     parser.add_argument("--dataset", default=str(_ROOT / "datasets" / "mjhq_5000_samples.json"),
                         help="Path to dataset JSON (default: datasets/mjhq_5000_samples.json)")
+    parser.add_argument(
+        "--basis-path", default=None,
+        help=("Override the model PCA artifact. Shared-basis experiments must "
+              "use a derived artifact carrying __shared_basis_map__; the file "
+              "hash is included in cache/output names."),
+    )
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: models/pixart-sigma/generated_images_gptq or models/pixart-sigma/generated_images_rtn)")
     parser.add_argument("--max-images", type=int, default=None,
@@ -501,7 +507,8 @@ if __name__ == "__main__":
     preprocess_transformer = getattr(model_utils, "preprocess_transformer", None)
 
     model_id      = cfg["model_id"]
-    basis_path    = str(_ROOT / cfg["basis"]["output_path"])
+    default_basis_path = str(_ROOT / cfg["basis"]["output_path"])
+    basis_path    = str(Path(args.basis_path).resolve()) if args.basis_path else default_basis_path
     rotation_path = str(_ROOT / cfg["rotation"]["output_path"])
     calib_dir     = str(_ROOT / cfg["calib"]["cache_dir"])
     w_bits        = cfg["quantization"]["w_bits"]
@@ -533,6 +540,17 @@ if __name__ == "__main__":
     # bits<16 — skipped layers have unfused weights, so a cache built with a
     # different skip config can't be reused.
     import hashlib
+    if args.basis_path:
+        basis_file = Path(basis_path)
+        if not basis_file.is_file():
+            parser.error(f"--basis-path does not exist: {basis_file}")
+        digest = hashlib.sha256()
+        with basis_file.open("rb") as handle:
+            while chunk := handle.read(8 << 20):
+                digest.update(chunk)
+        basis_tag = "_basis" + digest.hexdigest()[:12]
+    else:
+        basis_tag = ""
     if args.skip_quant_layers:
         key = ",".join(sorted(args.skip_quant_layers))
         skip_tag = "_skip" + hashlib.md5(key.encode()).hexdigest()[:8]
@@ -566,7 +584,7 @@ if __name__ == "__main__":
             cache_name = "nvfp4_g16_e0joint_gptq_model.pt"
         else:
             method = "gptq" if args.gptq else "rtn"
-            cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}"
+            cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{basis_tag}"
             cache_name = quantized_weight_cache_name(cache_prefix, args.residual_rotation)
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
     elif args.residual_rotation == "identity" and "rr-identity" not in Path(args.quantized_cache).name:
@@ -581,7 +599,7 @@ if __name__ == "__main__":
 
     if args.output_dir is None:
         method = "gptq" if args.gptq else "rtn"
-        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{residual_tag}{act_tag}")
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{basis_tag}{residual_tag}{act_tag}")
 
     if args.nvfp4:
         print(f"Activation fake-quant format: {args.activation_format}")
@@ -635,6 +653,12 @@ if __name__ == "__main__":
     print(f"Loading PCA basis from {basis_path}...")
     basis_dict = torch.load(basis_path, map_location="cpu", weights_only=False)
     print(f"Loaded {len(basis_dict)} basis matrices.")
+    shared_basis_scheme = basis_dict.get("__shared_basis_scheme__")
+    if args.basis_path and shared_basis_scheme is None:
+        print("WARNING: overridden basis has no shared-basis metadata; it will "
+              "remain cache-isolated but is not claimed as a shared-memory arm.")
+    elif shared_basis_scheme is not None:
+        print(f"Shared PCA basis scheme: {shared_basis_scheme}")
 
     if args.residual_rotation == "random":
         print(f"Loading rotations from {rotation_path}...")
@@ -1105,6 +1129,11 @@ if __name__ == "__main__":
             print(f"enable_model_cpu_offload failed ({e}); falling back to pipe.to('cuda').")
             pipe = pipe.to("cuda")
         preconvert_rotations_to_device(pipe.transformer, device="cuda")
+        if shared_basis_scheme is not None:
+            from utils.shared_pca_basis import rotation_storage_report
+            print("Shared rotation storage:", json.dumps(
+                rotation_storage_report(pipe.transformer), sort_keys=True
+            ))
         generate_images(
             pipe, args.output_dir, args.dataset, generation_params,
             max_images=args.max_images, batch_size=args.batch_size,

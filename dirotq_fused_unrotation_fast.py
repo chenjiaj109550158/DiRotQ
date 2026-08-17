@@ -31,15 +31,28 @@ def preconvert_rotations_to_device(transformer, device="cuda", dtype=None):
         dtype = next(transformer.parameters()).dtype
 
     n = 0
+    converted = {}
+
+    def _convert_once(tensor, target_dtype):
+        storage = tensor.untyped_storage()
+        key = (
+            tensor.device.type, tensor.device.index, storage.data_ptr(),
+            tensor.storage_offset(), tuple(tensor.shape), tuple(tensor.stride()),
+            str(tensor.dtype), str(target_dtype), str(device),
+        )
+        if key not in converted:
+            converted[key] = tensor.to(device=device, dtype=target_dtype)
+        return converted[key]
+
     for name, mod in transformer.named_modules():
         if not isinstance(mod, ActQuantWrapper):
             continue
 
         if mod.rotation is not None:
-            mod.rotation = mod.rotation.to(device=device, dtype=dtype)
+            mod.rotation = _convert_once(mod.rotation, dtype)
             n += 1
         elif mod.rotation_per_head is not None:
-            mod.rotation_per_head = mod.rotation_per_head.to(device=device, dtype=dtype)
+            mod.rotation_per_head = _convert_once(mod.rotation_per_head, dtype)
             n += 1
         elif getattr(mod, 'perm_idx', None) is not None:
             # perm_idx is int64 — move to device but keep dtype (no fp conversion)
@@ -49,7 +62,8 @@ def preconvert_rotations_to_device(transformer, device="cuda", dtype=None):
         if getattr(mod, 'hadamard_sign_flips', None) is not None:
             mod.hadamard_sign_flips = mod.hadamard_sign_flips.to(device=device, dtype=dtype)
 
-    print(f"Preconverted {n} rotation/permutation tensors to {device}.")
+    print(f"Preconverted {n} rotation/permutation assignments to {device} "
+          f"using {len(converted)} unique tensor storages.")
     return n
 
 
