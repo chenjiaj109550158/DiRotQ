@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from utils.flux_shared_pca_basis import (  # noqa: E402
     SCHEMES,
+    FluxBasisConfig,
     build_flux_shared_basis,
     validate_flux_shared_basis,
 )
@@ -28,7 +29,12 @@ def main() -> None:
     parser.add_argument("--source-basis", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--scheme", choices=(*SCHEMES, "all"), default="all")
+    parser.add_argument(
+        "--exclude-down", action="store_true",
+        help="Build the speed-compatible no-rotation FFN-down audit arms",
+    )
     args = parser.parse_args()
+    cfg = FluxBasisConfig(include_down=not args.exclude_down)
 
     source_sha = sha256_file(args.source_basis)
     source = torch.load(args.source_basis, map_location="cpu", weights_only=False)
@@ -38,9 +44,9 @@ def main() -> None:
     schemes = SCHEMES if args.scheme == "all" else (args.scheme,)
     for scheme in schemes:
         derived, manifest = build_flux_shared_basis(
-            source, scheme, source_basis_sha256=source_sha,
+            source, scheme, cfg=cfg, source_basis_sha256=source_sha,
         )
-        validation = validate_flux_shared_basis(derived)
+        validation = validate_flux_shared_basis(derived, cfg=cfg)
         output = args.output_dir / f"U-{args.model}-{scheme}.pt"
         temporary = output.with_suffix(".pt.tmp")
         torch.save(derived, temporary)

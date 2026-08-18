@@ -345,7 +345,11 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
             # as double-block ff.net.2.
             module.quantizer.configure(
                 bits=a_bits, groupsize=a_gs, sym=nvfp4,
-                high_bits_length=high_len_down,
+                # The FLUX speed path deliberately leaves FFN-down without a
+                # PCA rotation.  In that case there is no meaningful PCA high
+                # tail: quantize the full original activation instead of
+                # silently preserving its arbitrary last channels.
+                high_bits_length=(high_len_down if module.rotation is not None else 0),
                 quant_dtype=qdt,
             )
         else:

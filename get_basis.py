@@ -92,6 +92,11 @@ if __name__ == "__main__":
                         help="Override calibration cache dir from config")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Forward-pass batch size for basis collection (default: model-specific)")
+    parser.add_argument(
+        "--exclude-down", action="store_true",
+        help=("Do not collect FFN-down PCA sources. This is the FLUX speed-path "
+              "no-rotation-ffdown contract, not a generic approximation."),
+    )
     args = parser.parse_args()
 
     cfg = load_model_config(args.model)
@@ -134,6 +139,8 @@ if __name__ == "__main__":
         collect_kwargs = {}
         if args.batch_size is not None:
             collect_kwargs["batch_size"] = args.batch_size
+        if args.exclude_down:
+            collect_kwargs["include_down"] = False
         basis_dict = collect_basis(pipe.transformer, cache_files, cfg, **collect_kwargs)
 
         del pipe

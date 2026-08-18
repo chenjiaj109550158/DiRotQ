@@ -51,7 +51,9 @@ from split_proj_out import split_flux_single_proj_out
 _GPU_H_MAX_D = 4096
 
 
-def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
+def collect_basis(
+    transformer, cache_files: list, cfg: dict, *, include_down: bool = True,
+) -> dict:
     dims              = cfg["dims"]
     hidden            = dims["hidden"]
     head_dim          = dims["head"]
@@ -92,14 +94,17 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     H_txt_attn_out = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
     H_img_ffn      = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
     H_txt_ffn      = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_double_layers)]
-    H_img_down     = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
-    H_txt_down     = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_double_layers)]
+    H_img_down     = ([(_gpu if on_gpu_inter else _cpu)((inter, inter))
+                       for _ in range(num_double_layers)] if include_down else [])
+    H_txt_down     = ([(_gpu if on_gpu_inter else _cpu)((inter, inter))
+                       for _ in range(num_double_layers)] if include_down else [])
 
     # Single-block accumulators
     H_sattn    = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
     H_smlp     = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
     H_sattnout = [(_gpu if on_gpu_hidden else _cpu)((hidden, hidden)) for _ in range(num_single_layers)]
-    H_smlpdown = [(_gpu if on_gpu_inter  else _cpu)((inter,  inter))  for _ in range(num_single_layers)]
+    H_smlpdown = ([(_gpu if on_gpu_inter else _cpu)((inter, inter))
+                   for _ in range(num_single_layers)] if include_down else [])
 
     cnt_img_attn     = [0] * num_double_layers
     cnt_txt_attn     = [0] * num_double_layers
@@ -156,25 +161,34 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
         hooks.append(block.attn.to_q.register_forward_hook(_input_hook(i, H_img_attn, cnt_img_attn)))
         hooks.append(block.attn.to_out[0].register_forward_hook(_input_hook(i, H_img_attn_out, cnt_img_attn_out)))
         hooks.append(block.ff.net[0].proj.register_forward_hook(_input_hook(i, H_img_ffn,  cnt_img_ffn)))
-        hooks.append(block.ff.net[2].register_forward_hook(      _input_hook(i, H_img_down, cnt_img_down)))
+        if include_down:
+            hooks.append(block.ff.net[2].register_forward_hook(
+                _input_hook(i, H_img_down, cnt_img_down)))
         hooks.append(block.attn.add_q_proj.register_forward_hook(_input_hook(i, H_txt_attn, cnt_txt_attn)))
         hooks.append(block.attn.to_add_out.register_forward_hook(_input_hook(i, H_txt_attn_out, cnt_txt_attn_out)))
         hooks.append(block.ff_context.net[0].proj.register_forward_hook(_input_hook(i, H_txt_ffn,  cnt_txt_ffn)))
-        hooks.append(block.ff_context.net[2].register_forward_hook(      _input_hook(i, H_txt_down, cnt_txt_down)))
+        if include_down:
+            hooks.append(block.ff_context.net[2].register_forward_hook(
+                _input_hook(i, H_txt_down, cnt_txt_down)))
 
     for i, block in enumerate(transformer.single_transformer_blocks):
         hooks.append(block.attn.to_q.register_forward_hook(_input_hook(i, H_sattn, cnt_sattn)))
         hooks.append(block.proj_mlp.register_forward_hook(  _input_hook(i, H_smlp,  cnt_smlp)))
         hooks.append(block.proj_out.linears[0].register_forward_hook(
             _input_hook(i, H_sattnout, cnt_sattnout)))
-        hooks.append(block.proj_out.linears[1].register_forward_hook(
-            _input_hook(i, H_smlpdown, cnt_smlpdown)))
+        if include_down:
+            hooks.append(block.proj_out.linears[1].register_forward_hook(
+                _input_hook(i, H_smlpdown, cnt_smlpdown)))
 
-    n_gpu = sum(1 for h in [H_img_attn[0], H_img_down[0]] if h.device.type == "cuda")
+    placement_examples = [H_img_attn[0]]
+    if include_down:
+        placement_examples.append(H_img_down[0])
+    n_gpu = sum(1 for h in placement_examples if h.device.type == "cuda")
     print(f"Registered {len(hooks)} hooks across "
           f"{num_double_layers} double + {num_single_layers} single blocks. "
           f"Hidden accumulators on {'GPU' if on_gpu_hidden else 'CPU'}, "
-          f"inter accumulators on {'GPU' if on_gpu_inter else 'CPU'}.")
+          f"inter accumulators "
+          f"{'disabled (no-rotation ffdown)' if not include_down else ('on GPU' if on_gpu_inter else 'on CPU')}.")
 
     # -----------------------------------------------------------------------
     # Forward pass with background file prefetch
@@ -217,16 +231,40 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
                 else:
                     input_kwargs[k] = v
 
-            try:
-                transformer(*input_args, **input_kwargs)
-            except Exception as e:
-                print(f"Warning: {e}")
+            # Fail closed.  An earlier implementation swallowed CUDA OOM here
+            # and later produced zero-count eigensystems for unvisited layers.
+            transformer(*input_args, **input_kwargs)
 
             # Drain pending large-D XTX transfers without stalling the forward pass
             _flush()
 
     for h in hooks:
         h.remove()
+
+    active_counts = {
+        "img_attn": cnt_img_attn,
+        "txt_attn": cnt_txt_attn,
+        "img_attn_out": cnt_img_attn_out,
+        "txt_attn_out": cnt_txt_attn_out,
+        "img_ffn": cnt_img_ffn,
+        "txt_ffn": cnt_txt_ffn,
+        "single_attn": cnt_sattn,
+        "single_mlp": cnt_smlp,
+        "single_attn_out": cnt_sattnout,
+    }
+    if include_down:
+        active_counts.update({
+            "img_down": cnt_img_down,
+            "txt_down": cnt_txt_down,
+            "single_mlp_down": cnt_smlpdown,
+        })
+    bad_counts = {
+        name: [index for index, value in enumerate(values) if value == 0]
+        for name, values in active_counts.items()
+        if any(value == 0 for value in values)
+    }
+    if bad_counts:
+        raise RuntimeError(f"FLUX PCA collection has zero-count sources: {bad_counts}")
 
     torch.cuda.empty_cache()
 
@@ -246,27 +284,33 @@ def collect_basis(transformer, cache_files: list, cfg: dict) -> dict:
     basis_dict = {}
 
     for i in tqdm(range(num_double_layers), desc="double blocks"):
-        for key, H_acc, cnt in [
+        items = [
             (f"layer.{i}.img_attn",       H_img_attn[i],     cnt_img_attn[i]),
             (f"layer.{i}.txt_attn",       H_txt_attn[i],     cnt_txt_attn[i]),
             (f"layer.{i}.img_attn.value", H_img_attn_out[i], cnt_img_attn_out[i]),
             (f"layer.{i}.txt_attn.value", H_txt_attn_out[i], cnt_txt_attn_out[i]),
             (f"layer.{i}.img_ffn",        H_img_ffn[i],      cnt_img_ffn[i]),
             (f"layer.{i}.txt_ffn",        H_txt_ffn[i],      cnt_txt_ffn[i]),
-            (f"layer.{i}.img_ffn.down",   H_img_down[i],     cnt_img_down[i]),
-            (f"layer.{i}.txt_ffn.down",   H_txt_down[i],     cnt_txt_down[i]),
-        ]:
+        ]
+        if include_down:
+            items.extend([
+                (f"layer.{i}.img_ffn.down", H_img_down[i], cnt_img_down[i]),
+                (f"layer.{i}.txt_ffn.down", H_txt_down[i], cnt_txt_down[i]),
+            ])
+        for key, H_acc, cnt in items:
             evec, evals = _eigh(_to_f64_cpu(H_acc, cnt))
             basis_dict[key] = evec
             basis_dict[f"{key}.eigenvalues"] = evals
 
     for i in tqdm(range(num_single_layers), desc="single blocks"):
-        for key, H_acc, cnt in [
+        items = [
             (f"single.{i}.attn",           H_sattn[i],    cnt_sattn[i]),
             (f"single.{i}.mlp",            H_smlp[i],     cnt_smlp[i]),
             (f"single.{i}.attn_out.value", H_sattnout[i], cnt_sattnout[i]),
-            (f"single.{i}.mlp.down",       H_smlpdown[i], cnt_smlpdown[i]),
-        ]:
+        ]
+        if include_down:
+            items.append((f"single.{i}.mlp.down", H_smlpdown[i], cnt_smlpdown[i]))
+        for key, H_acc, cnt in items:
             evec, evals = _eigh(_to_f64_cpu(H_acc, cnt))
             basis_dict[key] = evec
             basis_dict[f"{key}.eigenvalues"] = evals

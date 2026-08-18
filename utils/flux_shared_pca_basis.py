@@ -53,6 +53,7 @@ class FluxBasisConfig:
     representative_double: int = 9
     representative_single: int = 19
     num_stages: int = 4
+    include_down: bool = True
 
 
 @dataclass(frozen=True)
@@ -67,12 +68,16 @@ class Source:
 def iter_sources(cfg: FluxBasisConfig = FluxBasisConfig()):
     for block in range(cfg.num_double_layers):
         for family in DOUBLE_FAMILIES:
+            if not cfg.include_down and family in DOWN_FAMILIES:
+                continue
             yield Source(
                 "double", block, family, f"layer.{block}.{family}",
                 "down" if family in DOWN_FAMILIES else "hidden",
             )
     for block in range(cfg.num_single_layers):
         for family in SINGLE_FAMILIES:
+            if not cfg.include_down and family in DOWN_FAMILIES:
+                continue
             yield Source(
                 "single", block, family, f"single.{block}.{family}",
                 "down" if family in DOWN_FAMILIES else "hidden",

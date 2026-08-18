@@ -46,8 +46,9 @@ def main():
     parser.add_argument("--source-basis", type=Path, required=True)
     parser.add_argument("--basis", action="append", type=parse_basis, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--exclude-down", action="store_true")
     args = parser.parse_args()
-    cfg = FluxBasisConfig()
+    cfg = FluxBasisConfig(include_down=not args.exclude_down)
     source = torch.load(args.source_basis, map_location="cpu", weights_only=False)
     candidates = [("per-layer-pca", source)] + [
         (name, torch.load(path, map_location="cpu", weights_only=False))
@@ -86,7 +87,9 @@ def main():
             ]
             values = torch.tensor([row["protected_energy_fraction"] for row in selected])
             relative = torch.tensor([row["relative_to_per_layer"] for row in selected])
-            memory = theoretical_basis_bytes(None if name == "per-layer-pca" else name)
+            memory = theoretical_basis_bytes(
+                None if name == "per-layer-pca" else name, cfg=cfg,
+            )
             summary.append({
                 "scheme": name,
                 "family": family,
@@ -97,7 +100,7 @@ def main():
                 "relative_to_per_layer_min": float(relative.min()),
                 "runtime_rotation_bytes_bf16": memory["total_bytes"],
                 "runtime_rotation_reduction": (
-                    theoretical_basis_bytes(None)["total_bytes"] / memory["total_bytes"]
+                    theoretical_basis_bytes(None, cfg=cfg)["total_bytes"] / memory["total_bytes"]
                 ),
             })
 

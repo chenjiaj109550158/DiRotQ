@@ -91,6 +91,20 @@ def test_flux_dense_rotation_memory_is_exact_and_monotonic():
     assert width["total_bytes"] == (cfg.hidden**2 + cfg.intermediate**2) * 2
 
 
+def test_flux_no_rotation_ffdown_memory_contract():
+    cfg = FluxBasisConfig(include_down=False)
+    baseline = theoretical_basis_bytes(None, cfg=cfg)
+    width = theoretical_basis_bytes("shared-width", cfg=cfg)
+    operator = theoretical_basis_bytes("shared-operator", cfg=cfg)
+    stage = theoretical_basis_bytes("shared-operator-stage4", cfg=cfg)
+    assert baseline["unique_groups"] == 228
+    assert baseline["down_bytes"] == 0
+    assert width["unique_groups"] == 1
+    assert operator["unique_groups"] == 9
+    assert stage["unique_groups"] == 36
+    assert width["total_bytes"] == cfg.hidden**2 * 2
+
+
 def wrapped(d):
     wrapper = ActQuantWrapper(nn.Linear(d, d, bias=False))
     wrapper.quantizer.configure(bits=4, groupsize=4, sym=True)
@@ -192,6 +206,38 @@ def test_flux_routing_preserves_shared_materialized_rotations():
     assert double[0].attn.to_q.rotation is double[3].ff.net[0].proj.rotation
     assert double[0].attn.to_q.rotation is single[7].attn.to_v.rotation
     assert double[0].ff.net[2].rotation is single[7].proj_out.linears[1].rotation
+
+
+def test_flux_no_rotation_ffdown_has_no_arbitrary_high_tail():
+    cfg = FluxBasisConfig(
+        num_double_layers=1, num_single_layers=1, hidden=8, intermediate=12,
+        representative_double=0, representative_single=0, include_down=False,
+    )
+    source = {}
+    for item in iter_sources(cfg):
+        source[item.key] = torch.eye(cfg.hidden)
+        source[f"{item.key}.eigenvalues"] = torch.arange(cfg.hidden).float()
+    derived, _ = build_flux_shared_basis(source, "shared-width", cfg=cfg)
+    transformer = Transformer(cfg)
+    model_utils = load_flux_model_utils()
+    model_utils.assign_online_rotations(
+        transformer,
+        derived,
+        {"R1": torch.eye(8), "R2": torch.eye(4), "R_down": torch.eye(12)},
+        {"dims": {"num_heads": 2, "head": 4}},
+    )
+    model_utils.configure_quantizers_by_name(
+        transformer, 4, 1,
+        {
+            "dims": {"head": 4, "intermediate": 12},
+            "quantization": {"a_bits": 4},
+        },
+        high_len_down=4,
+    )
+    assert transformer.transformer_blocks[0].ff.net[2].rotation is None
+    assert transformer.transformer_blocks[0].ff.net[2].quantizer.high_bits_length == 0
+    assert transformer.single_transformer_blocks[0].proj_out.linears[1].rotation is None
+    assert transformer.single_transformer_blocks[0].proj_out.linears[1].quantizer.high_bits_length == 0
 
 
 def test_flux_unquantized_shared_rotation_product_parity():
