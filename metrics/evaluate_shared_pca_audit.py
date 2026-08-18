@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Matched PixArt-128 evaluator for shared-PCA quality arms."""
+"""Matched image-quality evaluator for shared-PCA audit arms."""
 
 from __future__ import annotations
 
@@ -218,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

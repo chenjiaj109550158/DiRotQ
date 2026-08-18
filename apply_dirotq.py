@@ -293,6 +293,11 @@ if __name__ == "__main__":
     parser.add_argument("--gptq-block-size", type=int, default=128)
     parser.add_argument("--gptq-damp-pct", type=float, default=0.01)
     parser.add_argument(
+        "--gptq-rtn-layers", nargs="*", default=None,
+        help=("Explicit layer patterns quantized with RTN inside an otherwise "
+              "GPTQ run. This is a named protocol choice, never a fallback."),
+    )
+    parser.add_argument(
         "--e0joint-gptq", action="store_true",
         help=("SANA-only feasibility objective min ||AW-Q_E0(A) Q_E2(W)||²; "
               "requires fixed e0m3 activation, random-R, NVFP4 and GPTQ"),
@@ -501,6 +506,8 @@ if __name__ == "__main__":
         args.skip_quant_layers = [p.strip() for p in args.skip_quant_layers if p.strip()]
     if args.hadamard_layers:
         args.hadamard_layers = [p.strip() for p in args.hadamard_layers if p.strip()]
+    if args.gptq_rtn_layers:
+        args.gptq_rtn_layers = [p.strip() for p in args.gptq_rtn_layers if p.strip()]
 
     if args.slow_unrotation:
         from dirotq_fused_unrotation import patch_forward, preconvert_rotations_to_device
@@ -577,6 +584,11 @@ if __name__ == "__main__":
         skip_tag = "_skip" + hashlib.md5(key.encode()).hexdigest()[:8]
     else:
         skip_tag = ""
+    if args.gptq_rtn_layers:
+        key = ",".join(sorted(args.gptq_rtn_layers))
+        rtn_tag = "_rtn" + hashlib.md5(key.encode()).hexdigest()[:8]
+    else:
+        rtn_tag = ""
 
     # pca_tag encodes --pca-only-layers: weight columns are permuted (not rotated)
     # for matching layers, so caches from different pca configs are incompatible.
@@ -605,7 +617,7 @@ if __name__ == "__main__":
             cache_name = "nvfp4_g16_e0joint_gptq_model.pt"
         else:
             method = "gptq" if args.gptq else "rtn"
-            cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{basis_tag}"
+            cache_prefix = f"{fmt_tag}_g{w_groupsize}_{method}{a_tag}{had_tag}{skip_tag}{rtn_tag}{pca_tag}{basis_tag}"
             cache_name = quantized_weight_cache_name(cache_prefix, args.residual_rotation)
         args.quantized_cache = str(_ROOT / "models" / args.model / "quantized_cache" / cache_name)
     elif args.residual_rotation == "identity" and "rr-identity" not in Path(args.quantized_cache).name:
@@ -620,7 +632,7 @@ if __name__ == "__main__":
 
     if args.output_dir is None:
         method = "gptq" if args.gptq else "rtn"
-        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{pca_tag}{basis_tag}{residual_tag}{act_tag}")
+        args.output_dir = str(_ROOT / "models" / args.model / f"generated_images_{fmt_tag}_{method}{a_tag}{had_tag}{skip_tag}{rtn_tag}{pca_tag}{basis_tag}{residual_tag}{act_tag}")
 
     if args.nvfp4:
         print(f"Activation fake-quant format: {args.activation_format}")
@@ -1070,6 +1082,7 @@ if __name__ == "__main__":
                 block_size=args.gptq_block_size,
                 device="cuda",
                 nvfp4=args.nvfp4,
+                rtn_names=args.gptq_rtn_layers,
             )
             del hessians
         elif args.nvfp4:

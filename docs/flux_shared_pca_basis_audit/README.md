@@ -20,7 +20,9 @@ GPTQ; only the PCA sharing rule changes.
 - calibration: repository FLUX.1-dev protocol (128 prompts x 25 steps);
 - FFN-down contract: no PCA rotation and no protected tail, matching the
   checked speed scripts' `no-rot ff_down` contract.  FFN-down remains INT4
-  W4A4/GPTQ in its original basis in every arm;
+  W4A4 with explicitly configured RTN in its original basis in every arm;
+  this is a frozen protocol choice and is reported separately from GPTQ
+  fallback (which must remain zero);
 - reference: untouched BF16 FLUX.1-dev generated in the same batch shape;
 - quality: paired PSNR, LPIPS, SSIM and CLIP, with 5000 prompt bootstrap
   resamples.  FID is not estimated from 32 images.

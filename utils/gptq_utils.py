@@ -430,6 +430,7 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
 
 def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                            skip_names=None,
+                           rtn_names=None,
                            damp_pct=0.01, block_size=128, num_inv_tries=250,
                            device="cuda", nvfp4=False):
     """Apply GPTQ weight quantization to all ActQuantWrapper layers.
@@ -453,10 +454,13 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
     """
     if skip_names is None:
         skip_names = []
+    if rtn_names is None:
+        rtn_names = []
 
     qlayers = find_qlayers(model, layers=[ActQuantWrapper])
     n_gptq = 0
     n_rtn_fail = 0
+    n_rtn_configured = 0
 
     def _rtn_low(W_low, gs):
         if nvfp4:
@@ -469,6 +473,13 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
 
         W = qlayer.module.weight.data
         orig_dtype = W.dtype
+        if _match_skip(name, rtn_names):
+            # Explicit experiment contract, not a fallback.  This is used by
+            # the FLUX speed-compatible no-rotation FFN-down path, whose
+            # checked kernel scripts use RTN and have no PCA high branch.
+            qlayer.module.weight.data = _rtn_low(W.float(), groupsize).to(orig_dtype)
+            n_rtn_configured += 1
+            continue
         rotate_hidden = (qlayer.quantizer.bits < 16 and qlayer.rotation is not None)
         rotate_head   = (qlayer.quantizer.bits < 16 and qlayer.rotation_per_head is not None)
         rotate_had    = (qlayer.quantizer.bits < 16 and getattr(qlayer, 'use_hadamard', False))
@@ -689,4 +700,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 n_gptq += 1
             qlayer.module.weight.data = W_q.to(orig_dtype)
 
-    print(f"GPTQ: {n_gptq} GPTQ, {n_rtn_fail} RTN fallback (Cholesky failure).")
+    print(
+        f"GPTQ: {n_gptq} GPTQ, {n_rtn_configured} configured RTN, "
+        f"{n_rtn_fail} RTN fallback (missing Hessian/Cholesky failure)."
+    )
