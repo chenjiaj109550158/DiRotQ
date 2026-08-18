@@ -213,6 +213,11 @@ if __name__ == "__main__":
               "use a derived artifact carrying __shared_basis_map__; the file "
               "hash is included in cache/output names."),
     )
+    parser.add_argument(
+        "--calib-dir", default=None,
+        help=("Override the read-only calibration activation-cache directory. "
+              "Useful for large FLUX experiments stored outside the repository."),
+    )
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: models/pixart-sigma/generated_images_gptq or models/pixart-sigma/generated_images_rtn)")
     parser.add_argument("--max-images", type=int, default=None,
@@ -510,7 +515,10 @@ if __name__ == "__main__":
     default_basis_path = str(_ROOT / cfg["basis"]["output_path"])
     basis_path    = str(Path(args.basis_path).resolve()) if args.basis_path else default_basis_path
     rotation_path = str(_ROOT / cfg["rotation"]["output_path"])
-    calib_dir     = str(_ROOT / cfg["calib"]["cache_dir"])
+    calib_dir     = (
+        str(Path(args.calib_dir).resolve())
+        if args.calib_dir else str(_ROOT / cfg["calib"]["cache_dir"])
+    )
     w_bits        = cfg["quantization"]["w_bits"]
 
     # Override activation bits if specified on CLI

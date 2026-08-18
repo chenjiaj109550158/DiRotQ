@@ -80,7 +80,7 @@ def _block_idx(name: str) -> int | None:
 
 def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                              hadamard_layers=None, sign_flips_dict=None,
-                             pca_only_layers=None):
+                             pca_only_layers=None, residual_rotation="random"):
     """Assign online PCA rotation matrices to each ActQuantWrapper.
 
     FLUX layer mapping (only applied if the matching basis key is present):
@@ -116,6 +116,8 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     num_heads = cfg["dims"]["num_heads"]
     head_dim  = cfg["dims"]["head"]
 
+    if residual_rotation not in {"random", "identity"}:
+        raise ValueError(f"unsupported residual rotation: {residual_rotation}")
     R1     = rotation_dict["R1"].float()     if rotation_dict and "R1"     in rotation_dict else None
     R2     = rotation_dict["R2"].float()     if rotation_dict and "R2"     in rotation_dict else None
     R_down = rotation_dict["R_down"].float() if rotation_dict and "R_down" in rotation_dict else None
@@ -129,7 +131,10 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
     def _use_perm(suffix):
         return any(pat.strip() in suffix for pat in pca_only_layers)
 
-    def _assign_perm_or_rot(module, key, suffix, rot_fn):
+    shared_aliases = basis_dict.get("__shared_basis_map__", {})
+    materialized_shared = {}
+
+    def _assign_perm_or_rot(module, key, suffix, rot_fn, rot_kind):
         """Assign perm_idx if pca_only matches and eigenvalues exist, else rotation."""
         if key not in basis_dict:
             return False
@@ -140,7 +145,15 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
                     basis_dict[key].float(), basis_dict[evals_key].float()
                 )
                 return True
-        module.rotation = rot_fn(basis_dict[key])
+        # Even the per-source baseline intentionally routes Q/K/V wrappers to
+        # one PCA key because those linears consume the same activation.  Do
+        # not materialize three identical U@R tensors.  A derived shared basis
+        # expands that reuse from one source key to its declared group.
+        alias = shared_aliases.get(key, f"source:{key}")
+        cache_key = (alias, rot_kind, residual_rotation)
+        if cache_key not in materialized_shared:
+            materialized_shared[cache_key] = rot_fn(basis_dict[key])
+        module.rotation = materialized_shared[cache_key]
         return True
 
     assigned = 0
@@ -163,41 +176,41 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
         if is_single:
             if suffix in ("attn.to_q", "attn.to_k", "attn.to_v"):
-                if _assign_perm_or_rot(module, f"single.{bi}.attn", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"single.{bi}.attn", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "proj_mlp":
-                if _assign_perm_or_rot(module, f"single.{bi}.mlp", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"single.{bi}.mlp", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "proj_out.linears.0":
-                if _assign_perm_or_rot(module, f"single.{bi}.attn_out.value", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"single.{bi}.attn_out.value", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "proj_out.linears.1":
-                if _assign_perm_or_rot(module, f"single.{bi}.mlp.down", suffix, _down):
+                if _assign_perm_or_rot(module, f"single.{bi}.mlp.down", suffix, _down, "down"):
                     assigned += 1
         else:
             if suffix in ("attn.to_q", "attn.to_k", "attn.to_v"):
-                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix in ("attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"):
-                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "attn.to_out.0":
-                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn.value", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_attn.value", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "attn.to_add_out":
-                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn.value", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_attn.value", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "ff.net.0.proj":
-                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "ff.net.2":
-                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn.down", suffix, _down):
+                if _assign_perm_or_rot(module, f"layer.{bi}.img_ffn.down", suffix, _down, "down"):
                     assigned += 1
             elif suffix == "ff_context.net.0.proj":
-                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn", suffix, _hidden):
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn", suffix, _hidden, "hidden"):
                     assigned += 1
             elif suffix == "ff_context.net.2":
-                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn.down", suffix, _down):
+                if _assign_perm_or_rot(module, f"layer.{bi}.txt_ffn.down", suffix, _down, "down"):
                     assigned += 1
 
         if module.perm_idx is not None and prev_perm is None:
@@ -210,7 +223,8 @@ def assign_online_rotations(transformer, basis_dict, rotation_dict, cfg,
 
 def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cfg,
                                  nvfp4=False, hadamard_layers=None, a_groupsize=None,
-                                 high_len_down=0, skip_quant_layers=None):
+                                 high_len_down=0, skip_quant_layers=None,
+                                 activation_format="nvfp4", format_stats=None):
     """Configure mixed-precision activation quantizers by FLUX layer type.
 
     Layer buckets:
@@ -233,7 +247,15 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
         nvfp4_cfg = cfg.get("nvfp4", {})
         a_gs     = nvfp4_cfg.get("a_groupsize", 16)
         a_gs_out = nvfp4_cfg.get("a_groupsize_attn_out", head_dim)
-        qdt      = "nvfp4"
+        allowed_formats = {
+            "nvfp4", "nvfp4-hw", "e0m3", "block-mix-oracle",
+            "tile-mix-oracle", "tile-mix-output-oracle",
+            "a16w4-residual", "e0a-w16-residual", "nvfp4-4over6",
+            "e0m3-gscale1536", "tile-mix-e0-e2-4over6",
+        }
+        if activation_format not in allowed_formats:
+            raise ValueError(f"unsupported FLUX activation format: {activation_format}")
+        qdt      = activation_format
     else:
         a_gs     = 64
         a_gs_out = head_dim
@@ -265,6 +287,11 @@ def configure_quantizers_by_name(transformer, high_len_hidden, high_len_head, cf
     for name, module in transformer.named_modules():
         if not isinstance(module, ActQuantWrapper):
             continue
+        module.quantizer.format_stats = (
+            format_stats.for_layer(name)
+            if format_stats is not None and hasattr(format_stats, "for_layer")
+            else format_stats
+        )
 
         if any(pat in name for pat in skip_quant_layers):
             module.quantizer.configure(bits=16, groupsize=-1, sym=True)
