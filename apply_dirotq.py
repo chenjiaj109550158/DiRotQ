@@ -218,6 +218,11 @@ if __name__ == "__main__":
         help=("Override the read-only calibration activation-cache directory. "
               "Useful for large FLUX experiments stored outside the repository."),
     )
+    parser.add_argument(
+        "--rotation-path", default=None,
+        help=("Override the residual-rotation artifact. The default remains the "
+              "model config path; experiments should pass an immutable file."),
+    )
     parser.add_argument("--output-dir", default=None,
                         help="Output directory (default: models/pixart-sigma/generated_images_gptq or models/pixart-sigma/generated_images_rtn)")
     parser.add_argument("--max-images", type=int, default=None,
@@ -514,7 +519,10 @@ if __name__ == "__main__":
     model_id      = cfg["model_id"]
     default_basis_path = str(_ROOT / cfg["basis"]["output_path"])
     basis_path    = str(Path(args.basis_path).resolve()) if args.basis_path else default_basis_path
-    rotation_path = str(_ROOT / cfg["rotation"]["output_path"])
+    rotation_path = (
+        str(Path(args.rotation_path).resolve())
+        if args.rotation_path else str(_ROOT / cfg["rotation"]["output_path"])
+    )
     calib_dir     = (
         str(Path(args.calib_dir).resolve())
         if args.calib_dir else str(_ROOT / cfg["calib"]["cache_dir"])
