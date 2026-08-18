@@ -19,6 +19,7 @@ from utils.flux_shared_pca_basis import (
 )
 from utils.quant_utils import ActQuantWrapper
 from utils.shared_pca_basis import rotation_storage_report
+from metrics.analyze_flux_shared_pca import summary_families
 
 
 def tiny_source():
@@ -103,6 +104,8 @@ def test_flux_no_rotation_ffdown_memory_contract():
     assert operator["unique_groups"] == 9
     assert stage["unique_groups"] == 36
     assert width["total_bytes"] == cfg.hidden**2 * 2
+    assert summary_families(cfg) == ("ALL", "hidden")
+    assert summary_families(FluxBasisConfig()) == ("ALL", "hidden", "down")
 
 
 def wrapped(d):

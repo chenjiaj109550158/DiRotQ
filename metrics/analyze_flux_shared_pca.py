@@ -41,6 +41,10 @@ def protected_fraction(H: torch.Tensor, U: torch.Tensor, high: int) -> float:
     return float((protected.T @ H @ protected).diagonal().sum() / H.diagonal().sum())
 
 
+def summary_families(cfg: FluxBasisConfig) -> tuple[str, ...]:
+    return ("ALL", "hidden", "down") if cfg.include_down else ("ALL", "hidden")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-basis", type=Path, required=True)
@@ -81,7 +85,7 @@ def main():
     summary = []
     for name, _ in candidates:
         subset = [row for row in rows if row["scheme"] == name]
-        for family in ("ALL", "hidden", "down"):
+        for family in summary_families(cfg):
             selected = subset if family == "ALL" else [
                 row for row in subset if row["width"] == family
             ]
