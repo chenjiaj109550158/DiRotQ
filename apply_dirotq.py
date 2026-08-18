@@ -205,6 +205,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="pixart-sigma",
                         help="Model name (subdirectory under models/, default: pixart-sigma)")
+    parser.add_argument(
+        "--model-id", default=None,
+        help=("Override the configured Hugging Face ID with an immutable local "
+              "snapshot or alternate model ID."),
+    )
     parser.add_argument("--dataset", default=str(_ROOT / "datasets" / "mjhq_5000_samples.json"),
                         help="Path to dataset JSON (default: datasets/mjhq_5000_samples.json)")
     parser.add_argument(
@@ -516,7 +521,7 @@ if __name__ == "__main__":
     generation_params = model_utils.generation_params
     preprocess_transformer = getattr(model_utils, "preprocess_transformer", None)
 
-    model_id      = cfg["model_id"]
+    model_id      = args.model_id or cfg["model_id"]
     default_basis_path = str(_ROOT / cfg["basis"]["output_path"])
     basis_path    = str(Path(args.basis_path).resolve()) if args.basis_path else default_basis_path
     rotation_path = (

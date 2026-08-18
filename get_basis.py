@@ -79,6 +79,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True,
                         help="Model name (must match a folder under models/)")
+    parser.add_argument(
+        "--model-id", default=None,
+        help=("Override the configured Hugging Face ID with an immutable local "
+              "snapshot or alternate model ID."),
+    )
     parser.add_argument("--max-files", type=int, default=None,
                         help="Limit number of calibration cache files (for testing)")
     parser.add_argument("--output", default=None,
@@ -117,9 +122,10 @@ if __name__ == "__main__":
                       "fp16": torch.float16,  "float16":  torch.float16,
                       "fp32": torch.float32,  "float32":  torch.float32}
         torch_dtype = _dtype_map.get(cfg.get("dtype", "float32"), torch.float32)
-        print(f"Loading {cfg['model_id']} ({pipeline_cls_path}) in {torch_dtype}...")
+        model_id = args.model_id or cfg["model_id"]
+        print(f"Loading {model_id} ({pipeline_cls_path}) in {torch_dtype}...")
         pipe = PipelineClass.from_pretrained(
-            cfg["model_id"], torch_dtype=torch_dtype, use_safetensors=True
+            model_id, torch_dtype=torch_dtype, use_safetensors=True
         )
         pipe = pipe.to("cuda")
         pipe.transformer.eval()
