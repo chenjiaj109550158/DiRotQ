@@ -317,6 +317,23 @@ if __name__ == "__main__":
     parser.add_argument("--quantized-cache", default=None,
                         help="Path to save/load quantized transformer weights. "
                              "If file exists, skips GPTQ/RTN and loads from cache.")
+    parser.add_argument(
+        "--real-int4", action="store_true",
+        help=("FLUX INT-W4A4 only: execute a persistent packed signed-INT4 "
+              "weight plus dynamic packed unsigned-INT4 activation path. "
+              "The low dot uses CUDA integer GEMM; this is not a claim of a "
+              "native packed-INT4 tensor-core kernel."),
+    )
+    parser.add_argument(
+        "--real-int4-build", action="store_true",
+        help=("Build the exact packed sidecar from the original transformed "
+              "weight, existing Hessian and GPTQ codes/scales. Never infers "
+              "payload from a BF16 reconstructed cache."),
+    )
+    parser.add_argument(
+        "--real-int4-cache", default=None,
+        help="Packed INT4 sidecar path for --real-int4 build/runtime.",
+    )
     parser.add_argument("--slow-unrotation", action="store_true",
                         help="Use fp32 fused-unrotation path (debug/fallback). "
                              "Default is the fast bf16/fp16 path.")
@@ -381,6 +398,22 @@ if __name__ == "__main__":
     parser.add_argument("--hardware-weight-legacy-e2-cache", default=None)
     parser.add_argument("--hardware-weight-legacy-e0-cache", default=None)
     args = parser.parse_args()
+
+    if args.real_int4_build:
+        args.real_int4 = True
+    if args.real_int4:
+        if args.model != "flux-dev":
+            parser.error("--real-int4 is restricted to the five FLUX.1-dev basis arms")
+        if not args.gptq or args.nvfp4:
+            parser.error("--real-int4 requires INT4 --gptq and forbids --nvfp4")
+        if args.activation_format != "nvfp4":
+            parser.error("--real-int4 uses the frozen legacy INT activation contract")
+        if args.residual_rotation != "random":
+            parser.error("--real-int4 requires the matched random residual rotation")
+        if args.hadamard_layers or args.pca_only_layers or args.skip_quant_layers:
+            parser.error("--real-int4 forbids alternate rotation/skip routing")
+    elif args.real_int4_cache:
+        parser.error("--real-int4-cache requires --real-int4")
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
         parser.error("non-default --activation-format requires --nvfp4 weights")
@@ -627,6 +660,23 @@ if __name__ == "__main__":
     except ValueError as exc:
         parser.error(str(exc))
 
+    real_int4_cache_path = None
+    if args.real_int4:
+        if w_bits != 4 or w_groupsize != 64 or a_bits != 4:
+            parser.error(
+                "FLUX real INT4 requires the frozen W4A4 group-64 configuration"
+            )
+        dense_path = Path(args.quantized_cache)
+        real_int4_cache_path = Path(
+            args.real_int4_cache
+            or dense_path.with_name(dense_path.stem + ".packed-int4.pt")
+        )
+        if not args.real_int4_build and not real_int4_cache_path.is_file():
+            parser.error(
+                "packed sidecar does not exist; run once with --real-int4-build: "
+                f"{real_int4_cache_path}"
+            )
+
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
@@ -846,6 +896,49 @@ if __name__ == "__main__":
         )
 
     cache_path = Path(args.quantized_cache)
+    real_int4_info = None
+    exact_packed_states = None
+    if args.real_int4:
+        if not cache_path.is_file():
+            raise FileNotFoundError(
+                "real INT4 build/runtime requires the matched fake-quant cache "
+                f"as immutable provenance: {cache_path}"
+            )
+        qlayer_count = len(find_qlayers(pipe.transformer, layers=[ActQuantWrapper]))
+        hessian_path = cache_path.parent / gptq_hessian_cache_name(
+            args.gptq_calib_files, qlayer_count, args.residual_rotation
+        )
+        if not hessian_path.is_file():
+            raise FileNotFoundError(
+                "real INT4 refuses to recollect Hessians; missing "
+                f"{hessian_path}"
+            )
+        real_int4_provenance = {
+            "model": args.model,
+            "model_id": str(model_id),
+            "basis_sha256": sha256_file(Path(basis_path)),
+            "rotation_sha256": sha256_file(Path(rotation_path)),
+            "fake_quant_cache_sha256": sha256_file(cache_path),
+            "hessian_sha256": sha256_file(hessian_path),
+            "gptq_calibration_files": args.gptq_calib_files,
+            "gptq_block_size": args.gptq_block_size,
+            "gptq_damp_pct": args.gptq_damp_pct,
+            "group_size": w_groupsize,
+            "activation_bits": a_bits,
+            "weight_bits": w_bits,
+            "residual_rotation": args.residual_rotation,
+            "shared_basis_scheme": shared_basis_scheme or "per-layer-pca",
+            "gptq_rtn_layers": sorted(args.gptq_rtn_layers or []),
+        }
+        if not args.real_int4_build:
+            from utils.flux_real_quant import load_packed_cache
+            real_int4_info = load_packed_cache(
+                pipe.transformer,
+                real_int4_cache_path,
+                require_cuda=True,
+                expected_provenance=real_int4_provenance,
+            )
+            print("Loaded exact packed INT4 sidecar:", json.dumps(real_int4_info, sort_keys=True))
     cache_required_formats = {
         "tile-mix-output-oracle", "a16w4-residual", "e0a-w16-residual",
         *FOUR_OVER_SIX_FORMATS,
@@ -915,7 +1008,11 @@ if __name__ == "__main__":
             f"Validated packing-valid hardware weight cache "
             f"kind={args.hardware_weight_cache_kind}: {cache_path}"
         )
-    if cache_path.exists():
+    if args.real_int4 and not args.real_int4_build:
+        # The sidecar installed all active transformed weights directly.  The
+        # dense fake-quant state is used only for hash provenance above.
+        pass
+    elif cache_path.exists() and not args.real_int4_build:
         if args.e0joint_gptq:
             validate_e0joint_metadata(cache_path, {
                 "objective_version": E0JOINT_OBJECTIVE_VERSION,
@@ -1074,7 +1171,9 @@ if __name__ == "__main__":
                 print("Hessians cached.")
 
             print(f"Applying GPTQ weight quantization (W4, {fmt_tag}, group_size={w_groupsize})...")
-            gptq_quantize_weights(
+            if args.real_int4_build:
+                exact_packed_states = {}
+            gptq_summary = gptq_quantize_weights(
                 pipe.transformer, hessians,
                 bits=w_bits, groupsize=w_groupsize, sym=True,
                 skip_names=skip_layers,
@@ -1083,6 +1182,7 @@ if __name__ == "__main__":
                 device="cuda",
                 nvfp4=args.nvfp4,
                 rtn_names=args.gptq_rtn_layers,
+                packed_state_out=exact_packed_states,
             )
             del hessians
         elif args.nvfp4:
@@ -1100,9 +1200,38 @@ if __name__ == "__main__":
             if isinstance(mod, ActQuantWrapper):
                 mod.quantizer.free()
 
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Saving quantized weights to cache: {cache_path}")
-        torch.save(pipe.transformer.state_dict(), cache_path)
+        if args.real_int4_build:
+            from utils.flux_real_quant import (
+                exact_gptq_cache_from_states,
+                install_packed_states,
+                save_packed_cache,
+                validate_states_against_fake_quant_cache,
+            )
+            exact_cache, exact_report = exact_gptq_cache_from_states(
+                exact_packed_states,
+                expected_layers=len(find_qlayers(pipe.transformer, layers=[ActQuantWrapper])),
+                gptq_summary=gptq_summary,
+            )
+            fake_parity = validate_states_against_fake_quant_cache(
+                exact_packed_states, cache_path
+            )
+            exact_report["aggregate"]["fake_quant_bf16_parity"] = fake_parity
+            print("Packed/fake BF16 weight parity:", json.dumps(fake_parity, sort_keys=True))
+            manifest = save_packed_cache(
+                exact_cache,
+                exact_report,
+                real_int4_cache_path,
+                provenance=real_int4_provenance,
+            )
+            real_int4_info = install_packed_states(
+                pipe.transformer, exact_packed_states, require_cuda=True
+            )
+            real_int4_info.update(manifest)
+            print("Built exact packed INT4 sidecar:", json.dumps(manifest, sort_keys=True))
+        else:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"Saving quantized weights to cache: {cache_path}")
+            torch.save(pipe.transformer.state_dict(), cache_path)
         if e0joint_result is not None:
             metadata = {
                 **e0joint_result,
@@ -1153,7 +1282,11 @@ if __name__ == "__main__":
         format_stats.attach_timestep_source(pipe.transformer, pipe)
         print("Attached format-stat sidecar to true transformer timesteps.")
 
-    patch_forward()
+    if args.real_int4:
+        from utils.flux_real_quant import patch_real_int4_forward
+        patch_real_int4_forward()
+    else:
+        patch_forward()
 
     if args.generate:
         print("Enabling model CPU offload (text encoders/VAE swap to CUDA on demand)...")
@@ -1163,6 +1296,15 @@ if __name__ == "__main__":
             print(f"enable_model_cpu_offload failed ({e}); falling back to pipe.to('cuda').")
             pipe = pipe.to("cuda")
         preconvert_rotations_to_device(pipe.transformer, device="cuda")
+        setup_peak_allocated = setup_peak_reserved = 0
+        if args.real_int4:
+            from utils.flux_real_quant import real_int4_storage_report
+            storage_report = real_int4_storage_report(pipe.transformer)
+            print("Real INT4 persistent storage:", json.dumps(storage_report, sort_keys=True))
+            if torch.cuda.is_available():
+                setup_peak_allocated = torch.cuda.max_memory_allocated()
+                setup_peak_reserved = torch.cuda.max_memory_reserved()
+                torch.cuda.reset_peak_memory_stats()
         if shared_basis_scheme is not None:
             from utils.shared_pca_basis import rotation_storage_report
             print("Shared rotation storage:", json.dumps(
@@ -1177,8 +1319,14 @@ if __name__ == "__main__":
             ),
         )
         if torch.cuda.is_available():
+            if args.real_int4:
+                print(
+                    "Real INT4 setup peak CUDA memory: "
+                    f"allocated={setup_peak_allocated} bytes, "
+                    f"reserved={setup_peak_reserved} bytes"
+                )
             print(
-                "Process peak CUDA memory: "
+                "Inference-only peak CUDA memory: "
                 f"allocated={torch.cuda.max_memory_allocated()} bytes, "
                 f"reserved={torch.cuda.max_memory_reserved()} bytes"
             )

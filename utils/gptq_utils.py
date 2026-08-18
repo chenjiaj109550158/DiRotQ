@@ -39,6 +39,7 @@ from .quant_utils import (
     perm_idx_from_eigendecomp, perm_idx_from_eigendecomp_per_head,
 )
 from .hadamard_utils import fast_hadamard_transform
+from .packed_int4_runtime import pack_signed_int4
 
 
 class _NewlineStream:
@@ -432,7 +433,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                            skip_names=None,
                            rtn_names=None,
                            damp_pct=0.01, block_size=128, num_inv_tries=250,
-                           device="cuda", nvfp4=False):
+                           device="cuda", nvfp4=False,
+                           packed_state_out=None):
     """Apply GPTQ weight quantization to all ActQuantWrapper layers.
 
     For layers with hidden-dim rotation (bits<16): rotate H into the PCA
@@ -462,6 +464,71 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
     n_rtn_fail = 0
     n_rtn_configured = 0
 
+    if packed_state_out is not None and (bits != 4 or not sym or nvfp4):
+        raise ValueError(
+            "packed GPTQ export currently requires symmetric INT4 "
+            "(bits=4, sym=True, nvfp4=False)"
+        )
+
+    def _record_packed(name, qlayer, W_target, W_q, W_tail, gs, method):
+        """Save the exact codes/scales used before the dense BF16 cache cast.
+
+        Scales are recomputed from the same original transformed target used by
+        GPTQ.  Codes are recovered losslessly from the float32 GPTQ result,
+        whose columns are exactly ``integer_code * frozen_scale``.  This hook
+        therefore records the actual quantizer state, not a re-quantization of
+        the later BF16 reconstructed cache.
+        """
+        if packed_state_out is None:
+            return
+        if gs <= 0:
+            gs = W_target.shape[1]
+        out_features, logical_k = W_target.shape
+        pad = (-logical_k) % gs
+        target_pad = torch.nn.functional.pad(W_target.float(), (0, pad)) if pad else W_target.float()
+        quant_pad = torch.nn.functional.pad(W_q.float(), (0, pad)) if pad else W_q.float()
+        target_groups = target_pad.reshape(out_features, -1, gs)
+        scales = target_groups.abs().amax(dim=-1).clamp(min=1e-5) / 7.0
+        q = torch.round(
+            quant_pad.reshape(out_features, -1, gs) / scales[..., None]
+        ).clamp(-8, 7).to(torch.int8)
+        decoded = q.float() * scales[..., None]
+        max_error = float(
+            (decoded.reshape(out_features, -1)[:, :logical_k] - W_q.float())
+            .abs().max().item()
+        )
+        if max_error > 2e-6:
+            raise RuntimeError(
+                f"{name}: exact GPTQ packing recovery failed, max error={max_error:.8g}"
+            )
+        if qlayer.rotation_per_head is not None and W_tail is not None:
+            stored_layout = "per-head-interleaved"
+            layout_metadata = {
+                "num_heads": int(qlayer.num_heads),
+                "head_dim": int(qlayer.head_dim),
+                "high_per_head": int(qlayer.quantizer.high_bits_length),
+            }
+        elif W_tail is not None:
+            stored_layout = "low-then-high"
+            layout_metadata = {}
+        else:
+            stored_layout = "low-only"
+            layout_metadata = {}
+        packed_state_out[name] = {
+            "qweight": pack_signed_int4(q.reshape(out_features, -1)).cpu(),
+            "weight_scales": scales.cpu(),
+            "high_weight": None if W_tail is None else W_tail.to(qlayer.module.weight.dtype).cpu(),
+            "bias": None if qlayer.module.bias is None else qlayer.module.bias.detach().cpu(),
+            "logical_low_k": logical_k,
+            "group_size": gs,
+            "in_features": qlayer.module.in_features,
+            "out_features": qlayer.module.out_features,
+            "quantization_method": method,
+            "packing_max_abs_error_fp32": max_error,
+            "stored_layout": stored_layout,
+            **layout_metadata,
+        }
+
     def _rtn_low(W_low, gs):
         if nvfp4:
             return _quant_group_nvfp4(W_low, gs)
@@ -477,7 +544,12 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             # Explicit experiment contract, not a fallback.  This is used by
             # the FLUX speed-compatible no-rotation FFN-down path, whose
             # checked kernel scripts use RTN and have no PCA high branch.
-            qlayer.module.weight.data = _rtn_low(W.float(), groupsize).to(orig_dtype)
+            W_target = W.float()
+            W_q = _rtn_low(W_target, groupsize)
+            _record_packed(
+                name, qlayer, W_target, W_q, None, groupsize, "configured-rtn"
+            )
+            qlayer.module.weight.data = W_q.to(orig_dtype)
             n_rtn_configured += 1
             continue
         rotate_hidden = (qlayer.quantizer.bits < 16 and qlayer.rotation is not None)
@@ -515,7 +587,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 )
                 del H_low
 
-            if W_low_q is None:
+            used_fallback = W_low_q is None
+            if used_fallback:
                 if H_raw is None:
                     print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
                 else:
@@ -525,6 +598,10 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             else:
                 n_gptq += 1
 
+            _record_packed(
+                name, qlayer, W_low, W_low_q, W_tail, groupsize,
+                "rtn-fallback" if used_fallback else "gptq",
+            )
             qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
             qlayer._unrot_fused = True
 
@@ -576,7 +653,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 )
                 del H_rot_low
 
-            if W_low_q is None:
+            used_fallback = W_low_q is None
+            if used_fallback:
                 if H_raw is None:
                     print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
                 else:
@@ -586,6 +664,10 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             else:
                 n_gptq += 1
 
+            _record_packed(
+                name, qlayer, W_low, W_low_q, W_tail, gs,
+                "rtn-fallback" if used_fallback else "gptq",
+            )
             qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
             qlayer._unrot_fused = True
 
@@ -627,7 +709,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 )
                 del H_rot_low
 
-            if W_low_q is None:
+            used_fallback = W_low_q is None
+            if used_fallback:
                 if H_raw is None:
                     print(f"  WARNING: no Hessian for {name}, falling back to rotated RTN")
                 else:
@@ -637,6 +720,10 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             else:
                 n_gptq += 1
 
+            _record_packed(
+                name, qlayer, W_low, W_low_q, W_tail, gs,
+                "rtn-fallback" if used_fallback else "gptq",
+            )
             qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
             qlayer._unrot_fused = True
 
@@ -665,7 +752,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 )
                 del H_low
 
-            if W_low_q is None:
+            used_fallback = W_low_q is None
+            if used_fallback:
                 if H_raw is None:
                     print(f"  WARNING: no Hessian for {name}, falling back to permuted RTN")
                 else:
@@ -675,6 +763,10 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             else:
                 n_gptq += 1
 
+            _record_packed(
+                name, qlayer, W_low, W_low_q, W_tail, groupsize,
+                "rtn-fallback" if used_fallback else "gptq",
+            )
             qlayer.module.weight.data = stitch(W_low_q).to(orig_dtype)
             qlayer._unrot_fused = True
 
@@ -689,7 +781,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                     damp_pct, block_size, num_inv_tries, device,
                     nvfp4=nvfp4,
                 )
-            if W_q is None:
+            used_fallback = W_q is None
+            if used_fallback:
                 if H_raw is None:
                     print(f"  WARNING: no Hessian for {name}, falling back to RTN")
                 else:
@@ -698,9 +791,19 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 n_rtn_fail += 1
             else:
                 n_gptq += 1
+            _record_packed(
+                name, qlayer, W_fp32, W_q, None, groupsize,
+                "rtn-fallback" if used_fallback else "gptq",
+            )
             qlayer.module.weight.data = W_q.to(orig_dtype)
 
     print(
         f"GPTQ: {n_gptq} GPTQ, {n_rtn_configured} configured RTN, "
         f"{n_rtn_fail} RTN fallback (missing Hessian/Cholesky failure)."
     )
+    return {
+        "gptq_layers": n_gptq,
+        "configured_rtn_layers": n_rtn_configured,
+        "rtn_fallback_layers": n_rtn_fail,
+        "packed_layers": 0 if packed_state_out is None else len(packed_state_out),
+    }
