@@ -334,6 +334,30 @@ if __name__ == "__main__":
         "--real-int4-cache", default=None,
         help="Packed INT4 sidecar path for --real-int4 build/runtime.",
     )
+    parser.add_argument(
+        "--real-int4-fake-cache-sha256", default=None,
+        help=("Immutable producer fake-cache SHA-256. Allows inference-only "
+              "handoff without transferring the dense fake-quant cache."),
+    )
+    parser.add_argument(
+        "--real-int4-hessian-sha256", default=None,
+        help=("Immutable producer Hessian SHA-256. Allows inference-only "
+              "handoff without transferring the read-only Hessian."),
+    )
+    parser.add_argument(
+        "--real-w4a16-modulators", action="store_true",
+        help=("FLUX real-INT4 only: replace norm1.linear, "
+              "norm1_context.linear and single-block norm.linear with "
+              "persistent signed-INT4 K64 weights and native A16 input."),
+    )
+    parser.add_argument(
+        "--real-w4a16-build", action="store_true",
+        help="Build the immutable shared W4A16 modulator sidecar, then install it.",
+    )
+    parser.add_argument(
+        "--real-w4a16-cache", default=None,
+        help="Shared packed W4A16 modulator sidecar path.",
+    )
     parser.add_argument("--slow-unrotation", action="store_true",
                         help="Use fp32 fused-unrotation path (debug/fallback). "
                              "Default is the fast bf16/fp16 path.")
@@ -401,6 +425,8 @@ if __name__ == "__main__":
 
     if args.real_int4_build:
         args.real_int4 = True
+    if args.real_w4a16_build:
+        args.real_w4a16_modulators = True
     if args.real_int4:
         if args.model != "flux-dev":
             parser.error("--real-int4 is restricted to the five FLUX.1-dev basis arms")
@@ -414,6 +440,14 @@ if __name__ == "__main__":
             parser.error("--real-int4 forbids alternate rotation/skip routing")
     elif args.real_int4_cache:
         parser.error("--real-int4-cache requires --real-int4")
+    if (args.real_int4_fake_cache_sha256 or args.real_int4_hessian_sha256) and not args.real_int4:
+        parser.error("real-INT4 provenance SHA flags require --real-int4")
+    if args.real_w4a16_modulators and not args.real_int4:
+        parser.error("--real-w4a16-modulators requires the FLUX --real-int4 path")
+    if args.real_w4a16_modulators and not args.real_w4a16_cache:
+        parser.error("--real-w4a16-modulators requires --real-w4a16-cache")
+    if args.real_w4a16_cache and not args.real_w4a16_modulators:
+        parser.error("--real-w4a16-cache requires --real-w4a16-modulators")
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
         parser.error("non-default --activation-format requires --nvfp4 weights")
@@ -899,27 +933,39 @@ if __name__ == "__main__":
     real_int4_info = None
     exact_packed_states = None
     if args.real_int4:
-        if not cache_path.is_file():
+        from utils.flux_real_quant import resolve_readonly_provenance_sha256
+
+        if args.real_int4_build and not cache_path.is_file():
             raise FileNotFoundError(
-                "real INT4 build/runtime requires the matched fake-quant cache "
+                "real INT4 build requires the matched fake-quant cache "
                 f"as immutable provenance: {cache_path}"
             )
         qlayer_count = len(find_qlayers(pipe.transformer, layers=[ActQuantWrapper]))
         hessian_path = cache_path.parent / gptq_hessian_cache_name(
             args.gptq_calib_files, qlayer_count, args.residual_rotation
         )
-        if not hessian_path.is_file():
+        if args.real_int4_build and not hessian_path.is_file():
             raise FileNotFoundError(
-                "real INT4 refuses to recollect Hessians; missing "
+                "real INT4 build refuses to recollect Hessians; missing "
                 f"{hessian_path}"
             )
+        fake_cache_sha256 = resolve_readonly_provenance_sha256(
+            cache_path,
+            args.real_int4_fake_cache_sha256,
+            label="matched dense fake-quant cache",
+        )
+        hessian_sha256 = resolve_readonly_provenance_sha256(
+            hessian_path,
+            args.real_int4_hessian_sha256,
+            label="matched GPTQ Hessian",
+        )
         real_int4_provenance = {
             "model": args.model,
             "model_id": str(model_id),
             "basis_sha256": sha256_file(Path(basis_path)),
             "rotation_sha256": sha256_file(Path(rotation_path)),
-            "fake_quant_cache_sha256": sha256_file(cache_path),
-            "hessian_sha256": sha256_file(hessian_path),
+            "fake_quant_cache_sha256": fake_cache_sha256,
+            "hessian_sha256": hessian_sha256,
             "gptq_calibration_files": args.gptq_calib_files,
             "gptq_block_size": args.gptq_block_size,
             "gptq_damp_pct": args.gptq_damp_pct,
@@ -932,11 +978,14 @@ if __name__ == "__main__":
         }
         if not args.real_int4_build:
             from utils.flux_real_quant import load_packed_cache
+            expected_real_int4_provenance = dict(real_int4_provenance)
+            expected_real_int4_provenance.pop("model_id")
             real_int4_info = load_packed_cache(
                 pipe.transformer,
                 real_int4_cache_path,
                 require_cuda=True,
-                expected_provenance=real_int4_provenance,
+                expected_provenance=expected_real_int4_provenance,
+                runtime_model_id=str(model_id),
             )
             print("Loaded exact packed INT4 sidecar:", json.dumps(real_int4_info, sort_keys=True))
     cache_required_formats = {
@@ -1240,6 +1289,55 @@ if __name__ == "__main__":
             }
             metadata_path = write_e0joint_metadata(cache_path, metadata)
             print(f"Saved E0-joint cache metadata: {metadata_path}")
+
+    if args.real_w4a16_modulators:
+        from utils.flux_w4a16_modulators import (
+            build_and_install_w4a16_modulators,
+            load_w4a16_cache,
+            save_w4a16_cache,
+            w4a16_provenance,
+        )
+
+        w4a16_path = Path(args.real_w4a16_cache)
+        expected_w4a16_provenance = w4a16_provenance(str(model_id))
+        if args.real_w4a16_build:
+            if w4a16_path.exists():
+                raise FileExistsError(
+                    f"refusing to overwrite W4A16 sidecar: {w4a16_path}"
+                )
+            w4a16_cache, w4a16_report = build_and_install_w4a16_modulators(
+                pipe.transformer, require_cuda=True
+            )
+            w4a16_info = save_w4a16_cache(
+                w4a16_cache,
+                w4a16_report,
+                w4a16_path,
+                provenance=expected_w4a16_provenance,
+            )
+            print(
+                "Built real W4A16 adaptive-norm sidecar: "
+                f"{json.dumps(w4a16_info, sort_keys=True)}"
+            )
+        else:
+            if not w4a16_path.is_file():
+                raise FileNotFoundError(
+                    f"missing requested W4A16 sidecar: {w4a16_path}"
+                )
+            # The same exact HF snapshot may live at a different absolute
+            # path after a cross-server handoff.  Validate invariant fields
+            # here and the exact 40-hex revision separately in the loader.
+            expected_w4a16_provenance.pop("model_id")
+            w4a16_info = load_w4a16_cache(
+                pipe.transformer,
+                w4a16_path,
+                expected_provenance=expected_w4a16_provenance,
+                runtime_model_id=str(model_id),
+                require_cuda=True,
+            )
+            print(
+                "Loaded real W4A16 adaptive-norm sidecar: "
+                f"{json.dumps(w4a16_info, sort_keys=True)}"
+            )
 
     real_tile_export = None
     if args.real_tile_export_config:

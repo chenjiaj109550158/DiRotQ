@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 import torch
@@ -20,6 +21,8 @@ from .quant_utils import ActQuantWrapper, find_qlayers
 
 SCHEMA = "dirotq.flux_split_real_int4"
 VERSION = 1
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def sha256_file(path: Path, chunk_size: int = 8 << 20) -> str:
@@ -28,6 +31,55 @@ def sha256_file(path: Path, chunk_size: int = 8 << 20) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_readonly_provenance_sha256(
+    path: Path,
+    supplied_sha256: str | None,
+    *,
+    label: str,
+) -> str:
+    """Resolve producer provenance without transferring an unused artifact.
+
+    A relocated inference-only packed sidecar does not consume its original
+    dense fake-quant cache or Hessian.  When those large producer artifacts
+    are intentionally absent, callers must supply their recorded SHA-256.
+    If the file is present, it is always hashed and must agree with any
+    supplied value.  This is provenance portability, not a cache fallback.
+    """
+    path = Path(path)
+    supplied = None if supplied_sha256 is None else supplied_sha256.lower()
+    if supplied is not None and _SHA256_RE.fullmatch(supplied) is None:
+        raise ValueError(f"{label} SHA-256 must be 64 lowercase hexadecimal characters")
+    if path.is_file():
+        observed = sha256_file(path)
+        if supplied is not None and supplied != observed:
+            raise RuntimeError(
+                f"{label} SHA-256 mismatch: supplied={supplied}, observed={observed}"
+            )
+        return observed
+    if supplied is None:
+        raise FileNotFoundError(
+            f"missing {label} provenance artifact {path}; provide its immutable SHA-256"
+        )
+    return supplied
+
+
+def validate_relocated_model_id(producer_model_id: str, runtime_model_id: str) -> None:
+    """Accept relocation only when both paths name the same exact HF commit."""
+    if str(producer_model_id) == str(runtime_model_id):
+        return
+    producer_revision = Path(str(producer_model_id)).name.lower()
+    runtime_revision = Path(str(runtime_model_id)).name.lower()
+    if (
+        _REVISION_RE.fullmatch(producer_revision) is not None
+        and producer_revision == runtime_revision
+    ):
+        return
+    raise ValueError(
+        "packed-cache model provenance mismatch: "
+        f"producer={producer_model_id!r}, runtime={runtime_model_id!r}"
+    )
 
 
 def _drop_dense_aliases(layer: ActQuantWrapper) -> None:
@@ -250,6 +302,9 @@ def real_int4_storage_report(transformer: torch.nn.Module) -> dict[str, int]:
         "low_group_scales_fp32": 0,
         "protected_high_bf16": 0,
         "active_bias": 0,
+        "w4a16_modulator_payload": 0,
+        "w4a16_modulator_scales_bf16": 0,
+        "w4a16_modulator_bias": 0,
         "other_model_parameters_and_buffers": 0,
         "online_pca_residual_frames": 0,
     }
@@ -268,6 +323,27 @@ def real_int4_storage_report(transformer: torch.nn.Module) -> dict[str, int]:
             ("low_group_scales_fp32", module.weight_scales),
             ("protected_high_bf16", module.high_weight),
             ("active_bias", module.bias),
+        ):
+            if tensor is None:
+                continue
+            packed_tensor_ids.add(id(tensor))
+            storage_key = _storage_key(tensor)
+            if storage_key not in seen_model:
+                categories[key] += tensor.untyped_storage().nbytes()
+                seen_model.add(storage_key)
+
+    # The three adaptive-norm operator families are outside ActQuantWrapper.
+    # Account for their optional real W4A16 buffers explicitly rather than
+    # folding them into the opaque "other" bucket.
+    from .flux_w4a16_modulators import PackedW4A16Linear
+
+    for module in transformer.modules():
+        if not isinstance(module, PackedW4A16Linear):
+            continue
+        for key, tensor in (
+            ("w4a16_modulator_payload", module.qweight),
+            ("w4a16_modulator_scales_bf16", module.weight_scales),
+            ("w4a16_modulator_bias", module.bias),
         ):
             if tensor is None:
                 continue
@@ -409,6 +485,7 @@ def load_packed_cache(
     *,
     require_cuda: bool = True,
     expected_provenance: dict[str, Any] | None = None,
+    runtime_model_id: str | None = None,
 ) -> dict[str, Any]:
     path = Path(path)
     payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
@@ -421,6 +498,8 @@ def load_packed_cache(
                 f"packed-cache provenance mismatch for {key}: "
                 f"{provenance.get(key)!r} != {value!r}"
             )
+    if runtime_model_id is not None:
+        validate_relocated_model_id(provenance.get("model_id", ""), runtime_model_id)
     qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
     states = payload["layers"]
     if set(states) != set(qlayers):

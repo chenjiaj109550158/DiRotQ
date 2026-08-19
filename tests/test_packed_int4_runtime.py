@@ -7,6 +7,8 @@ from torch import nn
 from utils.flux_real_quant import (
     exact_gptq_cache_from_states,
     real_int4_storage_report,
+    resolve_readonly_provenance_sha256,
+    validate_relocated_model_id,
     validate_states_against_fake_quant_cache,
 )
 from utils.gptq_utils import gptq_quantize_weights
@@ -103,6 +105,30 @@ def test_production_module_refuses_silent_cpu_fallback():
         assert "CPU fallback" in str(error)
     else:
         raise AssertionError("packed production path silently ran on CPU")
+
+
+def test_relocated_inference_provenance_is_fail_closed(tmp_path):
+    source = tmp_path / "producer.pt"
+    source.write_bytes(b"immutable producer")
+    observed = resolve_readonly_provenance_sha256(source, None, label="producer")
+    assert resolve_readonly_provenance_sha256(
+        tmp_path / "not-transferred.pt", observed, label="producer"
+    ) == observed
+    with pytest.raises(RuntimeError, match="mismatch"):
+        resolve_readonly_provenance_sha256(source, "0" * 64, label="producer")
+    with pytest.raises(FileNotFoundError, match="provide its immutable SHA-256"):
+        resolve_readonly_provenance_sha256(
+            tmp_path / "not-transferred.pt", None, label="producer"
+        )
+
+
+def test_relocated_model_id_requires_same_exact_snapshot_revision():
+    revision = "3de623fc3c33e44ffbe2bad470d0f45bccf2eb21"
+    validate_relocated_model_id(f"/producer/snapshots/{revision}", f"/receiver/{revision}")
+    with pytest.raises(ValueError, match="model provenance mismatch"):
+        validate_relocated_model_id(
+            f"/producer/snapshots/{revision}", "/receiver/" + "0" * 40
+        )
 
 
 class _TinyModel(nn.Module):
