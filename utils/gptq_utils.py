@@ -275,7 +275,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
 @torch.no_grad()
 def _gptq_quantize_layer(W, H, bits, groupsize, sym,
                           damp_pct, block_size, num_inv_tries, device,
-                          nvfp4=False):
+                          nvfp4=False, scale_dtype=torch.float32):
     """
     Apply GPTQ to a single weight matrix.
 
@@ -335,6 +335,13 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
             scales = (wmax - wmin).clamp(min=1e-5) / maxq
             zeros  = torch.round(-wmin / scales)
         groupsize = in_features
+
+    if scale_dtype not in {torch.float32, torch.bfloat16}:
+        raise ValueError(f"unsupported GPTQ scale dtype: {scale_dtype}")
+    # The serialized scale is part of the quantizer contract. Round it before
+    # code selection/error propagation; this avoids post-hoc BF16 repacking of
+    # an FP32-scale GPTQ solution.
+    scales = scales.to(scale_dtype).float()
 
     def _quant_col(w_col, orig_col_idx):
         """Quantize and dequantize one column vector [out_features]."""
@@ -434,7 +441,8 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                            rtn_names=None,
                            damp_pct=0.01, block_size=128, num_inv_tries=250,
                            device="cuda", nvfp4=False,
-                           packed_state_out=None):
+                           packed_state_out=None,
+                           packed_scale_dtype=torch.float32):
     """Apply GPTQ weight quantization to all ActQuantWrapper layers.
 
     For layers with hidden-dim rotation (bits<16): rotate H into the PCA
@@ -469,6 +477,10 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
             "packed GPTQ export currently requires symmetric INT4 "
             "(bits=4, sym=True, nvfp4=False)"
         )
+    if packed_scale_dtype not in {torch.float32, torch.bfloat16}:
+        raise ValueError(
+            "packed_scale_dtype must be torch.float32 or torch.bfloat16"
+        )
 
     def _record_packed(name, qlayer, W_target, W_q, W_tail, gs, method):
         """Save the exact codes/scales used before the dense BF16 cache cast.
@@ -488,11 +500,14 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
         target_pad = torch.nn.functional.pad(W_target.float(), (0, pad)) if pad else W_target.float()
         quant_pad = torch.nn.functional.pad(W_q.float(), (0, pad)) if pad else W_q.float()
         target_groups = target_pad.reshape(out_features, -1, gs)
-        scales = target_groups.abs().amax(dim=-1).clamp(min=1e-5) / 7.0
+        scales = (
+            target_groups.abs().amax(dim=-1).clamp(min=1e-5) / 7.0
+        ).to(packed_scale_dtype)
+        scales_fp32 = scales.float()
         q = torch.round(
-            quant_pad.reshape(out_features, -1, gs) / scales[..., None]
+            quant_pad.reshape(out_features, -1, gs) / scales_fp32[..., None]
         ).clamp(-8, 7).to(torch.int8)
-        decoded = q.float() * scales[..., None]
+        decoded = q.float() * scales_fp32[..., None]
         max_error = float(
             (decoded.reshape(out_features, -1)[:, :logical_k] - W_q.float())
             .abs().max().item()
@@ -532,6 +547,21 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
     def _rtn_low(W_low, gs):
         if nvfp4:
             return _quant_group_nvfp4(W_low, gs)
+        if packed_scale_dtype == torch.bfloat16:
+            logical_k = W_low.shape[1]
+            pad = (-logical_k) % gs
+            work = (
+                torch.nn.functional.pad(W_low.float(), (0, pad))
+                if pad else W_low.float()
+            )
+            groups = work.reshape(work.shape[0], -1, gs)
+            scales = (
+                groups.abs().amax(dim=-1).clamp(min=1e-5) / 7.0
+            ).to(torch.bfloat16).float()
+            codes = torch.round(groups / scales[..., None]).clamp(-8, 7)
+            return (codes * scales[..., None]).reshape(
+                work.shape[0], -1
+            )[:, :logical_k]
         return _quant_group_int(W_low, bits, gs, sym)
 
     for name, qlayer in _log_tqdm(qlayers.items(), desc="GPTQ weight quantization"):
@@ -583,7 +613,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 W_low_q = _gptq_quantize_layer(
                     W_low.to(device), H_low, bits, groupsize, sym,
                     damp_pct * damp_scale, block_size, num_inv_tries, device,
-                    nvfp4=nvfp4,
+                    nvfp4=nvfp4, scale_dtype=packed_scale_dtype,
                 )
                 del H_low
 
@@ -649,7 +679,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 W_low_q = _gptq_quantize_layer(
                     W_low.to(device), H_rot_low, bits, gs, sym,
                     damp_pct * damp_scale_ph, block_size, num_inv_tries, device,
-                    nvfp4=nvfp4,
+                    nvfp4=nvfp4, scale_dtype=packed_scale_dtype,
                 )
                 del H_rot_low
 
@@ -705,7 +735,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 W_low_q = _gptq_quantize_layer(
                     W_low.to(device), H_rot_low, bits, gs, sym,
                     damp_pct * damp_scale_had, block_size, num_inv_tries, device,
-                    nvfp4=nvfp4,
+                    nvfp4=nvfp4, scale_dtype=packed_scale_dtype,
                 )
                 del H_rot_low
 
@@ -748,7 +778,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 W_low_q = _gptq_quantize_layer(
                     W_low.to(device), H_low, bits, groupsize, sym,
                     damp_pct * damp_scale, block_size, num_inv_tries, device,
-                    nvfp4=nvfp4,
+                    nvfp4=nvfp4, scale_dtype=packed_scale_dtype,
                 )
                 del H_low
 
@@ -779,7 +809,7 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
                 W_q = _gptq_quantize_layer(
                     W_fp32, H_raw, bits, groupsize, sym,
                     damp_pct, block_size, num_inv_tries, device,
-                    nvfp4=nvfp4,
+                    nvfp4=nvfp4, scale_dtype=packed_scale_dtype,
                 )
             used_fallback = W_q is None
             if used_fallback:
@@ -806,4 +836,5 @@ def gptq_quantize_weights(model, hessians, bits=4, groupsize=64, sym=True,
         "configured_rtn_layers": n_rtn_configured,
         "rtn_fallback_layers": n_rtn_fail,
         "packed_layers": 0 if packed_state_out is None else len(packed_state_out),
+        "packed_scale_dtype": str(packed_scale_dtype),
     }

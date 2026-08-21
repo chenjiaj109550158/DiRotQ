@@ -160,6 +160,7 @@ def test_gptq_exports_actual_pre_bf16_codes_and_scales(tmp_path):
         "configured_rtn_layers": 0,
         "rtn_fallback_layers": 0,
         "packed_layers": 1,
+        "packed_scale_dtype": "torch.float32",
     }
     state = states["proj"]
     decoded = decode_weight_int4(
@@ -210,6 +211,57 @@ def test_storage_report_separates_payload_scales_high_and_shared_frames():
     assert report["low_group_scales_fp32"] == 16
     assert report["protected_high_bf16"] == 32
     assert report["online_pca_residual_frames"] == 8 * 8 * 2
+
+
+def test_bf16_scales_are_frozen_before_gptq_and_accounted_as_bf16():
+    torch.manual_seed(29)
+    model = _TinyModel()
+    original = model.proj.module.weight.detach().clone()
+    states = {}
+    summary = gptq_quantize_weights(
+        model,
+        {"proj": torch.eye(8)},
+        bits=4,
+        groupsize=4,
+        sym=True,
+        damp_pct=0.01,
+        block_size=4,
+        num_inv_tries=5,
+        device="cpu",
+        packed_state_out=states,
+        packed_scale_dtype=torch.bfloat16,
+    )
+    state = states["proj"]
+    expected_scale = (
+        original.reshape(4, 2, 4).abs().amax(-1) / 7
+    ).to(torch.bfloat16)
+    assert summary["packed_scale_dtype"] == "torch.bfloat16"
+    assert state["weight_scales"].dtype == torch.bfloat16
+    assert torch.equal(state["weight_scales"], expected_scale)
+    decoded = decode_weight_int4(
+        state["qweight"], state["weight_scales"], 8, 4, torch.bfloat16
+    )
+    assert torch.equal(decoded, model.proj.module.weight.to(torch.bfloat16))
+    _, report = exact_gptq_cache_from_states(
+        states, expected_layers=1, gptq_summary=summary
+    )
+    assert report["aggregate"]["scale_dtype"] == "torch.bfloat16"
+    assert report["aggregate"]["scale_bytes"] == 16
+
+    transformer = nn.Module()
+    transformer.proj = model.proj
+    transformer.proj.module = PackedSplitInt4Linear(
+        state["qweight"], state["weight_scales"],
+        logical_low_k=8, group_size=4, high_weight=None, bias=None,
+        require_cuda=False,
+    )
+    delattr(transformer.proj, "weight")
+    transformer.proj.register_parameter("weight", None)
+    delattr(transformer.proj, "bias")
+    transformer.proj.register_parameter("bias", None)
+    storage = real_int4_storage_report(transformer)
+    assert storage["low_group_scales_fp32"] == 0
+    assert storage["low_group_scales_bf16"] == 16
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

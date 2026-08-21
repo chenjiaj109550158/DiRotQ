@@ -111,6 +111,14 @@ def parse_measurements(log: Path) -> dict:
     }
 
 
+def completed_image(log: Path, image_dir: Path) -> Path | None:
+    """Return the sole nested FLUX image only for a completed prior run."""
+    if not log.is_file() or "All done." not in log.read_text():
+        return None
+    pngs = sorted(image_dir.rglob("*.png"))
+    return pngs[0] if len(pngs) == 1 else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--formal-root", type=Path, default=DEFAULT_FORMAL)
@@ -220,6 +228,26 @@ def main() -> None:
             provenance = json.loads(packed_manifest.read_text())["provenance"]
             image_dir = output / "images" / scheme
             log = output / "logs" / f"{scheme}-generate.log"
+            existing_image = completed_image(log, image_dir)
+            if existing_image is not None:
+                record = {
+                    "command": command_for(scheme) + [
+                        "--real-int4-fake-cache-sha256",
+                        provenance["fake_quant_cache_sha256"],
+                        "--real-int4-hessian-sha256", provenance["hessian_sha256"],
+                        "--output-dir", str(image_dir),
+                    ],
+                    "log": str(log),
+                    "wall_seconds": None,
+                    "process_peak_mib": None,
+                    "resumed_completed_run": True,
+                    **parse_measurements(log),
+                    "scheme": scheme,
+                    "image": str(existing_image),
+                }
+                records.append(record)
+                print(f"{scheme}: preserving completed prior run at {existing_image}")
+                continue
             record = run_logged(
                 command_for(scheme) + [
                     "--real-int4-fake-cache-sha256",
@@ -229,7 +257,7 @@ def main() -> None:
                 ],
                 log, env, args.physical_gpu,
             )
-            pngs = sorted(image_dir.glob("*.png"))
+            pngs = sorted(image_dir.rglob("*.png"))
             if len(pngs) != 1:
                 raise RuntimeError(f"{scheme}: expected one PNG, found {len(pngs)}")
             record.update(parse_measurements(log))

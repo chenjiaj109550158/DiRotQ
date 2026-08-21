@@ -8,6 +8,7 @@ from utils.flux_w4a16_modulators import (
     quantize_w4a16_weight,
 )
 from utils.packed_int4_runtime import decode_weight_int4, unpack_signed_int4
+from metrics.run_flux_shared_pca_w4a16_memory import completed_image
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -81,3 +82,18 @@ def test_w4a16_cuda_requirement_fails_closed():
     )
     with pytest.raises(RuntimeError, match="forbids silent CPU fallback"):
         module(torch.randn(1, 64, dtype=torch.bfloat16))
+
+
+def test_flux_nested_image_resume_requires_completed_single_png(tmp_path):
+    log = tmp_path / "run.log"
+    image_dir = tmp_path / "images"
+    nested = image_dir / "category" / "sample.png"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(b"png sentinel")
+    log.write_text("Inference-only peak CUDA memory: allocated=1 bytes, reserved=2 bytes\n")
+    assert completed_image(log, image_dir) is None
+    log.write_text(log.read_text() + "All done.\n")
+    assert completed_image(log, image_dir) == nested
+    extra = image_dir / "extra.png"
+    extra.write_bytes(b"extra")
+    assert completed_image(log, image_dir) is None

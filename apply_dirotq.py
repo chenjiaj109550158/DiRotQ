@@ -16,6 +16,8 @@ import os
 import sys
 import json
 import subprocess
+import gc
+import time
 import yaml
 import torch
 import torch.nn as nn
@@ -198,6 +200,154 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
         print("Done. Stats-only generation completed without image output.")
 
 
+def _flux_transformer_only_inputs(device: torch.device) -> dict:
+    device = torch.device(device)
+    dtype = torch.bfloat16
+    return {
+        "hidden_states": torch.randn(1, 4096, 64, dtype=dtype, device=device),
+        "encoder_hidden_states": torch.randn(
+            1, 512, 4096, dtype=dtype, device=device
+        ),
+        "pooled_projections": torch.randn(1, 768, dtype=dtype, device=device),
+        "timestep": torch.tensor([500], dtype=torch.long, device=device),
+        "guidance": torch.tensor([3.5], dtype=dtype, device=device),
+        "img_ids": torch.randint(0, 64, (4096, 3), dtype=dtype, device=device),
+        "txt_ids": torch.zeros(512, 3, dtype=dtype, device=device),
+        "return_dict": False,
+    }
+
+
+@torch.inference_mode()
+def benchmark_flux_transformer_only(transformer, *, warmup=2, repeats=4):
+    """Measure the same standalone FLUX forward used by the speedup scripts."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("FLUX transformer-only memory benchmark requires CUDA")
+    if warmup < 0 or repeats <= 0:
+        raise ValueError("warmup must be non-negative and repeats must be positive")
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    transformer.to(device).eval()
+    inputs = _flux_transformer_only_inputs(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    baseline_allocated = torch.cuda.memory_allocated()
+    baseline_reserved = torch.cuda.memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
+
+    times = []
+    process_memory_mib = []
+    output = None
+    for index in range(warmup + repeats):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        output = transformer(**inputs)[0]
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        memory_query = subprocess.run(
+            [
+                "nvidia-smi", "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True, capture_output=True,
+        )
+        if memory_query.returncode:
+            raise RuntimeError(
+                "nvidia-smi process-memory query failed: "
+                + memory_query.stderr.strip()
+            )
+        own_rows = []
+        for line in memory_query.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) == 2 and fields[0] == str(os.getpid()):
+                own_rows.append(int(fields[1]))
+        if len(own_rows) != 1:
+            raise RuntimeError(
+                f"expected one nvidia-smi row for PID {os.getpid()}, found {own_rows}"
+            )
+        process_memory_mib.append(own_rows[0])
+        if index >= warmup:
+            times.append(elapsed)
+    assert output is not None
+    if not torch.isfinite(output).all():
+        raise RuntimeError("FLUX transformer-only benchmark produced NaN/Inf")
+    result = {
+        "contract": {
+            "batch_size": 1,
+            "image_tokens": 4096,
+            "image_input_dim": 64,
+            "text_tokens": 512,
+            "text_input_dim": 4096,
+            "pooled_dim": 768,
+            "timestep": 500,
+            "guidance": 3.5,
+            "dtype": str(dtype),
+            "warmup": warmup,
+            "repeats": repeats,
+        },
+        "baseline_allocated_bytes": baseline_allocated,
+        "baseline_reserved_bytes": baseline_reserved,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+        "process_memory_mib_after_each_forward": process_memory_mib,
+        "process_peak_observed_mib": max(process_memory_mib),
+        "forward_seconds": times,
+        "forward_mean_seconds": sum(times) / len(times),
+        "output_shape": list(output.shape),
+        "output_dtype": str(output.dtype),
+        "output_finite": True,
+    }
+    del output, inputs
+    return result
+
+
+@torch.inference_mode()
+def verify_flux_fused_kernel_parity(transformer) -> dict:
+    """Compare both runtime paths on one identical full-transformer input."""
+    from utils.flux_real_quant import (
+        configure_real_int4_activation_reuse,
+        fused_reuse_stats,
+        patch_real_int4_forward,
+    )
+
+    transformer.to("cuda").eval()
+    # Rotation tensors are plain wrapper attributes rather than registered
+    # buffers, so ``Module.to`` does not move them.  Keep the standalone
+    # parity path independent of whether a memory benchmark ran first.
+    preconvert_rotations_to_device(transformer, device="cuda")
+    inputs = _flux_transformer_only_inputs(torch.device("cuda"))
+    patch_real_int4_forward("reference")
+    reference = transformer(**inputs)[0]
+    torch.cuda.synchronize()
+    patch_real_int4_forward("fused")
+    sharing = configure_real_int4_activation_reuse(transformer)
+    actual = transformer(**inputs)[0]
+    torch.cuda.synchronize()
+    if not torch.isfinite(reference).all() or not torch.isfinite(actual).all():
+        raise RuntimeError("kernel parity forward produced NaN/Inf")
+    delta = actual.float() - reference.float()
+    reference_f32 = reference.float()
+    actual_f32 = actual.float()
+    cosine = torch.nn.functional.cosine_similarity(
+        reference_f32.flatten(), actual_f32.flatten(), dim=0
+    )
+    report = {
+        "shape": list(reference.shape),
+        "dtype": str(reference.dtype),
+        "unequal_elements": int((actual != reference).sum()),
+        "elements": reference.numel(),
+        "max_abs_error": float(delta.abs().max()),
+        "mean_abs_error": float(delta.abs().mean()),
+        "relative_l2": float(delta.norm() / reference_f32.norm().clamp_min(1e-20)),
+        "cosine": float(cosine),
+        "reuse_configuration": sharing,
+        "reuse_runtime": fused_reuse_stats(),
+    }
+    del reference, actual, delta, reference_f32, actual_f32, inputs
+    return report
+
+
 if __name__ == "__main__":
     import argparse
     import importlib
@@ -345,6 +495,24 @@ if __name__ == "__main__":
               "handoff without transferring the read-only Hessian."),
     )
     parser.add_argument(
+        "--real-int4-weight-scale-dtype",
+        choices=("float32", "bfloat16"),
+        default="float32",
+        help=("Frozen low-weight GPTQ group-scale dtype. The default preserves "
+              "the existing FP32-scale path; bfloat16 rounds scales before "
+              "GPTQ code selection/error propagation and is also serialized "
+                             "by --real-int4-build."),
+    )
+    parser.add_argument(
+        "--real-int4-kernel-mode",
+        choices=("reference", "fused"),
+        default="reference",
+        help=("FLUX real-INT4 runtime kernel. reference preserves the existing "
+              "materialized activation path; fused packs activation metadata in "
+              "one Triton kernel, fuses low/high/bias output, and safely reuses "
+              "shared-frame QKV activation packing."),
+    )
+    parser.add_argument(
         "--real-w4a16-modulators", action="store_true",
         help=("FLUX real-INT4 only: replace norm1.linear, "
               "norm1_context.linear and single-block norm.linear with "
@@ -357,6 +525,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--real-w4a16-cache", default=None,
         help="Shared packed W4A16 modulator sidecar path.",
+    )
+    parser.add_argument(
+        "--nvfp4-w4a16-modulators", action="store_true",
+        help=("FLUX NVFP4 accuracy path: keep adaptive-normalization inputs "
+              "in BF16 and replace their 76 Linear weights with E2M1 payload, "
+              "a layer-global FP32 scale, and E4M3 K16 block scales."),
+    )
+    parser.add_argument(
+        "--nvfp4-w4a16-cache", default=None,
+        help="Immutable hardware-faithful NVFP4 W4A16 modulator sidecar.",
     )
     parser.add_argument("--slow-unrotation", action="store_true",
                         help="Use fp32 fused-unrotation path (debug/fallback). "
@@ -373,6 +551,19 @@ if __name__ == "__main__":
         "--stats-only", action="store_true",
         help="Run denoising for aggregate activation stats without decoding/saving images",
     )
+    parser.add_argument(
+        "--flux-transformer-only-memory-output", default=None,
+        help=("Write a matched B=1 synthetic FLUX transformer-only memory JSON; "
+              "requires --model flux-dev --real-int4 --real-w4a16-modulators "
+              "and --no-generate"),
+    )
+    parser.add_argument(
+        "--flux-fused-kernel-parity-output", default=None,
+        help=("Write a full-transformer reference-vs-fused numerical parity JSON; "
+              "requires FLUX --real-int4 and performs no image generation."),
+    )
+    parser.add_argument("--flux-transformer-only-warmup", type=int, default=2)
+    parser.add_argument("--flux-transformer-only-repeats", type=int, default=4)
     parser.add_argument(
         "--real-tile-export-config", default=None,
         help=("SANA-only read-only capture config for receiver-schema-v1 real "
@@ -444,10 +635,40 @@ if __name__ == "__main__":
         parser.error("real-INT4 provenance SHA flags require --real-int4")
     if args.real_w4a16_modulators and not args.real_int4:
         parser.error("--real-w4a16-modulators requires the FLUX --real-int4 path")
+    if args.real_int4_kernel_mode != "reference" and not args.real_int4:
+        parser.error("--real-int4-kernel-mode fused requires --real-int4")
+    if args.flux_fused_kernel_parity_output and (
+        args.model != "flux-dev" or not args.real_int4
+        or args.real_int4_kernel_mode != "fused"
+    ):
+        parser.error(
+            "--flux-fused-kernel-parity-output requires FLUX --real-int4 "
+            "--real-int4-kernel-mode fused"
+        )
     if args.real_w4a16_modulators and not args.real_w4a16_cache:
         parser.error("--real-w4a16-modulators requires --real-w4a16-cache")
     if args.real_w4a16_cache and not args.real_w4a16_modulators:
         parser.error("--real-w4a16-cache requires --real-w4a16-modulators")
+    if args.nvfp4_w4a16_modulators:
+        if args.model != "flux-dev" or not args.nvfp4 or not args.gptq:
+            parser.error(
+                "--nvfp4-w4a16-modulators requires FLUX --nvfp4 --gptq"
+            )
+        if args.real_int4 or args.activation_format != "nvfp4":
+            parser.error(
+                "NVFP4 W4A16 modulators require the legacy NVFP4 activation path"
+            )
+        if not args.nvfp4_w4a16_cache:
+            parser.error("--nvfp4-w4a16-modulators requires --nvfp4-w4a16-cache")
+    elif args.nvfp4_w4a16_cache:
+        parser.error("--nvfp4-w4a16-cache requires --nvfp4-w4a16-modulators")
+    if args.flux_transformer_only_memory_output:
+        if args.model != "flux-dev":
+            parser.error(
+                "--flux-transformer-only-memory-output requires flux-dev"
+            )
+        if args.generate:
+            parser.error("transformer-only memory benchmark requires --no-generate")
 
     if args.activation_format != "nvfp4" and not args.nvfp4:
         parser.error("non-default --activation-format requires --nvfp4 weights")
@@ -976,6 +1197,10 @@ if __name__ == "__main__":
             "shared_basis_scheme": shared_basis_scheme or "per-layer-pca",
             "gptq_rtn_layers": sorted(args.gptq_rtn_layers or []),
         }
+        if args.real_int4_weight_scale_dtype != "float32":
+            real_int4_provenance["weight_scale_dtype"] = (
+                args.real_int4_weight_scale_dtype
+            )
         if not args.real_int4_build:
             from utils.flux_real_quant import load_packed_cache
             expected_real_int4_provenance = dict(real_int4_provenance)
@@ -1232,6 +1457,11 @@ if __name__ == "__main__":
                 nvfp4=args.nvfp4,
                 rtn_names=args.gptq_rtn_layers,
                 packed_state_out=exact_packed_states,
+                packed_scale_dtype=(
+                    torch.bfloat16
+                    if args.real_int4_weight_scale_dtype == "bfloat16"
+                    else torch.float32
+                ),
             )
             del hessians
         elif args.nvfp4:
@@ -1339,6 +1569,26 @@ if __name__ == "__main__":
                 f"{json.dumps(w4a16_info, sort_keys=True)}"
             )
 
+    if args.nvfp4_w4a16_modulators:
+        from utils.flux_nvfp4_w4a16 import load_cache, provenance
+
+        nvfp4_w4a16_path = Path(args.nvfp4_w4a16_cache)
+        if not nvfp4_w4a16_path.is_file():
+            raise FileNotFoundError(
+                f"missing requested NVFP4 W4A16 sidecar: {nvfp4_w4a16_path}"
+            )
+        nvfp4_w4a16_info = load_cache(
+            pipe.transformer,
+            nvfp4_w4a16_path,
+            expected_provenance=provenance(str(model_id)),
+            runtime_model_id=str(model_id),
+            require_cuda=True,
+        )
+        print(
+            "Loaded hardware-faithful NVFP4 W4A16 adaptive-norm sidecar: "
+            f"{json.dumps(nvfp4_w4a16_info, sort_keys=True)}"
+        )
+
     real_tile_export = None
     if args.real_tile_export_config:
         if not cache_path.exists():
@@ -1381,10 +1631,47 @@ if __name__ == "__main__":
         print("Attached format-stat sidecar to true transformer timesteps.")
 
     if args.real_int4:
-        from utils.flux_real_quant import patch_real_int4_forward
-        patch_real_int4_forward()
+        from utils.flux_real_quant import (
+            configure_real_int4_activation_reuse,
+            patch_real_int4_forward,
+        )
+        patch_real_int4_forward(args.real_int4_kernel_mode)
+        if args.real_int4_kernel_mode == "fused":
+            reuse = configure_real_int4_activation_reuse(pipe.transformer)
+            print("Configured fused QKV activation reuse:", json.dumps(reuse, sort_keys=True))
     else:
         patch_forward()
+
+    if args.flux_transformer_only_memory_output:
+        preconvert_rotations_to_device(pipe.transformer, device="cuda")
+        from utils.flux_real_quant import real_int4_storage_report
+
+        storage_report = real_int4_storage_report(pipe.transformer)
+        result = benchmark_flux_transformer_only(
+            pipe.transformer,
+            warmup=args.flux_transformer_only_warmup,
+            repeats=args.flux_transformer_only_repeats,
+        )
+        result["persistent_storage"] = storage_report
+        result["physical_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES")
+        result["real_int4_kernel_mode"] = args.real_int4_kernel_mode
+        if args.real_int4_kernel_mode == "fused":
+            from utils.flux_real_quant import fused_reuse_stats
+            result["fused_reuse_stats"] = fused_reuse_stats()
+        output_path = Path(args.flux_transformer_only_memory_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        print("Real INT4 persistent storage:", json.dumps(storage_report, sort_keys=True))
+        print("Transformer-only memory benchmark:", json.dumps(result, sort_keys=True))
+        print(f"Transformer-only result saved to {output_path}")
+
+    if args.flux_fused_kernel_parity_output:
+        parity = verify_flux_fused_kernel_parity(pipe.transformer)
+        output_path = Path(args.flux_fused_kernel_parity_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(parity, indent=2, sort_keys=True) + "\n")
+        print("Full-transformer fused parity:", json.dumps(parity, sort_keys=True))
+        print(f"Fused parity result saved to {output_path}")
 
     if args.generate:
         print("Enabling model CPU offload (text encoders/VAE swap to CUDA on demand)...")

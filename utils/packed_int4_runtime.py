@@ -293,11 +293,60 @@ class PackedSplitInt4Linear(nn.Module):
             raise RuntimeError("activation and packed weight are on different devices")
         if self.require_cuda and x_low.device.type != "cuda":
             raise RuntimeError("real INT4 runtime forbids silent CPU fallback")
-        original_shape = x_low.shape[:-1]
         activation = quantize_activation_int4(x_low, self.group_size)
+        return self.forward_quantized(activation, x_high, kernel_mode="reference")
+
+    def forward_quantized(
+        self,
+        activation: ActivationInt4,
+        x_high: torch.Tensor | None = None,
+        *,
+        kernel_mode: str,
+    ) -> torch.Tensor:
+        """Execute from an already packed activation.
+
+        The explicit entry point lets Q/K/V wrappers reuse one projection and
+        activation quantization without retaining the dense rotated tensor.
+        """
+        if kernel_mode not in {"reference", "fused"}:
+            raise ValueError(f"unsupported real-INT4 kernel mode: {kernel_mode}")
+        if activation.payload.device != self.qweight.device:
+            raise RuntimeError("activation and packed weight are on different devices")
+        if activation.logical_k != self.logical_low_k:
+            raise ValueError(
+                f"packed activation low-K mismatch: {activation.logical_k} != "
+                f"{self.logical_low_k}"
+            )
+        original_shape = activation.original_shape[:-1]
+        if kernel_mode == "fused":
+            if self.require_cuda and activation.payload.device.type != "cuda":
+                raise RuntimeError("fused real INT4 runtime forbids silent CPU fallback")
+            from .packed_int4_fused_triton import packed_w4a4_high_gemm
+
+            high_output = None
+            if self.high_weight is not None:
+                if x_high is None or x_high.shape[-1] != self.high_weight.shape[1]:
+                    raise ValueError("protected high activation/weight mismatch")
+                # Keep cuBLAS BF16 high-branch arithmetic exactly aligned with
+                # the reference path; the Triton epilogue consumes this BF16
+                # result directly without a second FP32 materialization.
+                high_output = F.linear(x_high, self.high_weight, None)
+            elif x_high is not None and x_high.shape[-1]:
+                raise ValueError("unexpected protected high activation")
+            output = packed_w4a4_high_gemm(
+                activation.payload,
+                self.qweight,
+                activation.scales,
+                activation.zeros,
+                self.weight_scales,
+                high_output,
+                self.bias,
+            )
+            return output.reshape(*original_shape, self.out_features)
+
         padded_k = activation.padded_k
         groups = padded_k // self.group_size
-        if x_low.device.type == "cuda":
+        if activation.payload.device.type == "cuda":
             if self.group_size != 64:
                 raise RuntimeError("CUDA packed INT4 kernel requires K64 groups")
             from .packed_int4_triton import packed_w4a4_gemm
@@ -317,7 +366,8 @@ class PackedSplitInt4Linear(nn.Module):
             a_zero = activation.zeros.reshape(-1, groups, 1)
             a_scale = activation.scales.reshape(-1, groups)
             output = torch.zeros(
-                a_codes.shape[0], self.out_features, dtype=torch.float32, device=x_low.device
+                a_codes.shape[0], self.out_features, dtype=torch.float32,
+                device=activation.payload.device,
             )
             for group in range(groups):
                 centered = a_codes[:, group].to(torch.int16) - a_zero[:, group].to(torch.int16)
@@ -343,7 +393,7 @@ class PackedSplitInt4Linear(nn.Module):
             raise ValueError("unexpected protected high activation")
         if self.bias is not None:
             output.add_(self.bias.float())
-        return output.to(x_low.dtype).reshape(*original_shape, self.out_features)
+        return output.to(activation.scales.dtype).reshape(*original_shape, self.out_features)
 
 
 def packed_linear_state(module: PackedSplitInt4Linear) -> dict[str, Any]:
