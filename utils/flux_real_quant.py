@@ -1,4 +1,4 @@
-"""Install the five FLUX shared-PCA arms as persistent packed INT4 models."""
+"""Install FLUX shared-PCA arms as persistent packed INT4 models."""
 
 from __future__ import annotations
 

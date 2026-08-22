@@ -1,0 +1,9 @@
+141dfd2679ff280255170491788135cc4b25d5b7bbc0840782fa78e314b07140  U-flux-schnell-shared-width.pt
+fd6da8656a09776cee5f6989ca0301e08d1db2aa33986f4d9c5445ff372d5827  U-flux-schnell-shared-width.manifest.json
+d80b98e773389812b3bd3522af31033e6260252b2fffec695332fd0898c66466  R-flux-schnell-shared-width-r64.pt
+60bb571dc976a6b7b917a3ac447433dd7627c5264882c2e0849dd7103453d461  R-flux-schnell-shared-width-r64.manifest.json
+7964025c938294e2760e12578c1944b97281d0a7405c8da24acce039382eed69  int4_g64_gptq_model.fp32-scales.packed-int4.pt
+4f69e8007bc7a71498906958ae92d59e0cd0d117efe38a1471899ce66aaefbd1  int4_g64_gptq_model.fp32-scales.packed-int4.pt.manifest.json
+d4ddaf3332cbbae96768983da96c9c3b3555bffd5a03c0b346fa3e9aeae4e1b2  int4_g64_gptq_model.fp32-scales.packed-int4.pt.packing.json
+87484830cce4e92a042658957f63400ef5320c696bdbc5f9b0928c5c065d71aa  flux-schnell-adaptive-norm-int4-g64-bf16.pt
+1b544cb5c1efeb9a4895ededb488cea6e2a60ffa41a480b946b3098beaee609f  flux-schnell-adaptive-norm-int4-g64-bf16.pt.manifest.json

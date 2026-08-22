@@ -69,7 +69,31 @@ def _log_tqdm(iterable, desc, **kwargs):
 # Phase 1: Hessian collection
 # ---------------------------------------------------------------------------
 
-def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch_size=8):
+def select_hessian_qlayers(transformer, rtn_names=None):
+    """Return only layers whose Hessian will actually be consumed by GPTQ."""
+    all_qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
+    patterns = rtn_names or []
+    selected = {
+        name: layer
+        for name, layer in all_qlayers.items()
+        if not _match_skip(name, patterns)
+    }
+    if patterns:
+        print(
+            f"Hessian layer routing: {len(selected)}/{len(all_qlayers)} GPTQ; "
+            f"{len(all_qlayers) - len(selected)} configured-RTN."
+        )
+    return selected
+
+
+def collect_hessians(
+    transformer,
+    calib_dir,
+    device,
+    num_calib_files=5120,
+    batch_size=8,
+    rtn_names=None,
+):
     """
     Run qdiff calibration files through the transformer and accumulate
     per-layer Hessian matrices H = 2/n * X^T X.
@@ -105,7 +129,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
     # (e.g. FLUX) don't silently lose dynamic range via fp16 cast.
     model_dtype = next(transformer.parameters()).dtype
 
-    qlayers = find_qlayers(transformer, layers=[ActQuantWrapper])
+    qlayers = select_hessian_qlayers(transformer, rtn_names=rtn_names)
 
     # Hybrid placement: layers whose Hessian fits cheaply live on GPU and use
     # in-place addmm_ (no PCIe traffic, no per-call alloc). Big-D layers

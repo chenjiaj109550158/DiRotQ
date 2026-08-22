@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from apply_dirotq import _flux_transformer_only_inputs
 from utils.flux_real_quant import configure_real_int4_activation_reuse
 from utils.packed_int4_runtime import (
     PackedSplitInt4Linear,
@@ -9,6 +10,13 @@ from utils.packed_int4_runtime import (
     quantize_activation_int4,
 )
 from utils.quant_utils import ActQuantWrapper
+
+
+def test_schnell_synthetic_forward_omits_dev_only_guidance():
+    schnell = _flux_transformer_only_inputs("cpu", guidance_embeds=False)
+    dev = _flux_transformer_only_inputs("cpu", guidance_embeds=True)
+    assert "guidance" not in schnell
+    assert dev["guidance"].shape == (1,)
 
 
 def _packed_linear(k_low=128, high=64, n=32, *, device="cpu"):

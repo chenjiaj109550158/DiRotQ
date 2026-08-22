@@ -6,6 +6,7 @@ from utils.flux_w4a16_modulators import (
     GROUP_SIZE,
     PackedW4A16Linear,
     quantize_w4a16_weight,
+    w4a16_provenance,
 )
 from utils.packed_int4_runtime import decode_weight_int4, unpack_signed_int4
 from metrics.run_flux_shared_pca_w4a16_memory import completed_image
@@ -49,6 +50,16 @@ def test_w4a16_zero_groups_use_positive_safe_scale():
     assert torch.count_nonzero(payload) == 0
     assert torch.equal(scales, torch.ones_like(scales))
     assert report["zero_groups"] == 4
+
+
+def test_w4a16_provenance_distinguishes_flux_variants():
+    assert w4a16_provenance("black-forest-labs/FLUX.1-dev")["model"] == "flux-dev"
+    assert (
+        w4a16_provenance("/cache/models--black-forest-labs--FLUX.1-schnell/snapshots/rev")[
+            "model"
+        ]
+        == "flux-schnell"
+    )
 
 
 def test_w4a16_cuda_kernel_matches_decoded_bf16():

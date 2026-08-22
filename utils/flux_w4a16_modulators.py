@@ -22,8 +22,10 @@ TARGET_SUFFIXES = (".norm1.linear", ".norm1_context.linear", ".norm.linear")
 
 
 def w4a16_provenance(model_id: str) -> dict[str, Any]:
+    normalized = str(model_id).lower()
+    model = "flux-schnell" if "flux.1-schnell" in normalized else "flux-dev"
     return {
-        "model": "flux-dev",
+        "model": model,
         "model_id": str(model_id),
         "group_size": GROUP_SIZE,
         "weight_bits": 4,

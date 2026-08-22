@@ -200,21 +200,28 @@ def generate_images(pipeline, output_dir, dataset_json, generation_params, max_i
         print("Done. Stats-only generation completed without image output.")
 
 
-def _flux_transformer_only_inputs(device: torch.device) -> dict:
+def _flux_transformer_only_inputs(
+    device: torch.device, *, guidance_embeds: bool = True
+) -> dict:
     device = torch.device(device)
     dtype = torch.bfloat16
-    return {
+    inputs = {
         "hidden_states": torch.randn(1, 4096, 64, dtype=dtype, device=device),
         "encoder_hidden_states": torch.randn(
             1, 512, 4096, dtype=dtype, device=device
         ),
         "pooled_projections": torch.randn(1, 768, dtype=dtype, device=device),
         "timestep": torch.tensor([500], dtype=torch.long, device=device),
-        "guidance": torch.tensor([3.5], dtype=dtype, device=device),
         "img_ids": torch.randint(0, 64, (4096, 3), dtype=dtype, device=device),
         "txt_ids": torch.zeros(512, 3, dtype=dtype, device=device),
         "return_dict": False,
     }
+    # FLUX.1-dev has a guidance embedding; FLUX.1-schnell does not.  Passing
+    # the dev-only argument to Schnell changes the time/text embedding call
+    # signature before any quantized Linear executes.
+    if guidance_embeds:
+        inputs["guidance"] = torch.tensor([3.5], dtype=dtype, device=device)
+    return inputs
 
 
 @torch.inference_mode()
@@ -228,7 +235,10 @@ def benchmark_flux_transformer_only(transformer, *, warmup=2, repeats=4):
     device = torch.device("cuda")
     dtype = torch.bfloat16
     transformer.to(device).eval()
-    inputs = _flux_transformer_only_inputs(device)
+    guidance_embeds = bool(getattr(transformer.config, "guidance_embeds", False))
+    inputs = _flux_transformer_only_inputs(
+        device, guidance_embeds=guidance_embeds
+    )
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -281,7 +291,8 @@ def benchmark_flux_transformer_only(transformer, *, warmup=2, repeats=4):
             "text_input_dim": 4096,
             "pooled_dim": 768,
             "timestep": 500,
-            "guidance": 3.5,
+            "guidance": 3.5 if guidance_embeds else None,
+            "guidance_embeds": guidance_embeds,
             "dtype": str(dtype),
             "warmup": warmup,
             "repeats": repeats,
@@ -316,7 +327,10 @@ def verify_flux_fused_kernel_parity(transformer) -> dict:
     # buffers, so ``Module.to`` does not move them.  Keep the standalone
     # parity path independent of whether a memory benchmark ran first.
     preconvert_rotations_to_device(transformer, device="cuda")
-    inputs = _flux_transformer_only_inputs(torch.device("cuda"))
+    inputs = _flux_transformer_only_inputs(
+        torch.device("cuda"),
+        guidance_embeds=bool(getattr(transformer.config, "guidance_embeds", False)),
+    )
     patch_real_int4_forward("reference")
     reference = transformer(**inputs)[0]
     torch.cuda.synchronize()
@@ -514,7 +528,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--real-w4a16-modulators", action="store_true",
-        help=("FLUX real-INT4 only: replace norm1.linear, "
+        help=("FLUX INT4 path: replace norm1.linear, "
               "norm1_context.linear and single-block norm.linear with "
               "persistent signed-INT4 K64 weights and native A16 input."),
     )
@@ -554,7 +568,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--flux-transformer-only-memory-output", default=None,
         help=("Write a matched B=1 synthetic FLUX transformer-only memory JSON; "
-              "requires --model flux-dev --real-int4 --real-w4a16-modulators "
+              "requires a supported FLUX model, --real-int4, "
+              "--real-w4a16-modulators "
               "and --no-generate"),
     )
     parser.add_argument(
@@ -619,8 +634,8 @@ if __name__ == "__main__":
     if args.real_w4a16_build:
         args.real_w4a16_modulators = True
     if args.real_int4:
-        if args.model != "flux-dev":
-            parser.error("--real-int4 is restricted to the five FLUX.1-dev basis arms")
+        if args.model not in {"flux-dev", "flux-schnell"}:
+            parser.error("--real-int4 requires FLUX.1-dev or FLUX.1-schnell")
         if not args.gptq or args.nvfp4:
             parser.error("--real-int4 requires INT4 --gptq and forbids --nvfp4")
         if args.activation_format != "nvfp4":
@@ -633,12 +648,19 @@ if __name__ == "__main__":
         parser.error("--real-int4-cache requires --real-int4")
     if (args.real_int4_fake_cache_sha256 or args.real_int4_hessian_sha256) and not args.real_int4:
         parser.error("real-INT4 provenance SHA flags require --real-int4")
-    if args.real_w4a16_modulators and not args.real_int4:
-        parser.error("--real-w4a16-modulators requires the FLUX --real-int4 path")
+    if args.real_w4a16_modulators:
+        # Adaptive-norm W4A16 is an independent packed-weight exception.  It
+        # can accompany either the fully packed FLUX.1-dev runtime or the
+        # matched fake-quant INT4 accuracy path used by FLUX.1-schnell.  The
+        # latter still requires GPTQ for every non-exception DiRotQ Linear.
+        if args.model not in {"flux-dev", "flux-schnell"}:
+            parser.error("--real-w4a16-modulators requires a FLUX model")
+        if not args.gptq or args.nvfp4:
+            parser.error("--real-w4a16-modulators requires INT4 --gptq")
     if args.real_int4_kernel_mode != "reference" and not args.real_int4:
         parser.error("--real-int4-kernel-mode fused requires --real-int4")
     if args.flux_fused_kernel_parity_output and (
-        args.model != "flux-dev" or not args.real_int4
+        args.model not in {"flux-dev", "flux-schnell"} or not args.real_int4
         or args.real_int4_kernel_mode != "fused"
     ):
         parser.error(
@@ -663,9 +685,9 @@ if __name__ == "__main__":
     elif args.nvfp4_w4a16_cache:
         parser.error("--nvfp4-w4a16-cache requires --nvfp4-w4a16-modulators")
     if args.flux_transformer_only_memory_output:
-        if args.model != "flux-dev":
+        if args.model not in {"flux-dev", "flux-schnell"}:
             parser.error(
-                "--flux-transformer-only-memory-output requires flux-dev"
+                "--flux-transformer-only-memory-output requires a FLUX model"
             )
         if args.generate:
             parser.error("transformer-only memory benchmark requires --no-generate")
@@ -1438,6 +1460,7 @@ if __name__ == "__main__":
                     device="cuda",
                     num_calib_files=args.gptq_calib_files,
                     batch_size=args.gptq_batch_size,
+                    rtn_names=args.gptq_rtn_layers,
                 )
                 hessian_cache.parent.mkdir(parents=True, exist_ok=True)
                 print(f"Saving Hessians to {hessian_cache}...")
