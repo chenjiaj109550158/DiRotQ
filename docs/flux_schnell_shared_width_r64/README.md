@@ -27,19 +27,130 @@ the packed-INT4 runtime, and the W4A16 exception path are already part of this
 branch's history.  This checkpoint adds the Schnell-specific routing and
 portable evaluation commands.
 
-## Obtain the public model weights
+## End-to-end quick start
+
+### 1. Clone the source
+
+The implementation checkpoint is `f79a89314f99b3ff0eb87cce6e96ffee7e80ecdd`
+on `exp/flux-r64-shared-pca-fused-kernels`:
+
+```bash
+git clone --branch exp/flux-r64-shared-pca-fused-kernels --single-branch \
+  https://github.com/chenjiaj109550158/DiRotQ.git
+cd DiRotQ
+git merge-base --is-ancestor \
+  f79a89314f99b3ff0eb87cce6e96ffee7e80ecdd HEAD
+```
+
+An exit status of zero confirms that the checkout contains the frozen
+implementation.  Later documentation-only commits on this branch do not
+change the quantization artifacts.  To create the tested environment from
+scratch:
+
+```bash
+conda create -n dirotq python=3.12 -y
+conda activate dirotq
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
+
+### 2. Download the exact base model
 
 FLUX.1-schnell is gated on Hugging Face.  Accept its access terms first, then
-authenticate without putting a token in a command or log:
+authenticate without putting a token in a command or log.  The custom DiRotQ
+repository may be public, but authentication is still required for the gated
+base model.
 
 ```bash
 hf auth login
 
-MODEL_DIR=/path/to/models/FLUX.1-schnell-741f7c3
+MODEL_DIR=/path/with/enough/space/FLUX.1-schnell-741f7c3
 hf download black-forest-labs/FLUX.1-schnell \
   --revision 741f7c3ce8b383c54771c7003378a50191e9efe9 \
   --local-dir "$MODEL_DIR"
 ```
+
+Do not substitute `main`: the packed-weight provenance was validated against
+the exact revision above.
+
+### 3. Download the custom DiRotQ artifacts
+
+The uploaded model repository and immutable artifact revision are:
+
+```text
+chenjiaj109550158/dirotq-flux-schnell-shared-width-r64
+fbfe7133e6a2def4831ba9defd0553bbaadf2bc1
+```
+
+At the time this README was updated, the repository was private.  The owner
+must change its visibility to public before unrelated users can download it;
+while private, only the owner and explicitly authorized users have access.
+
+```bash
+ARTIFACT_ROOT=/path/with/enough/space/dirotq-flux-schnell-shared-width-r64
+ARTIFACT_REVISION=fbfe7133e6a2def4831ba9defd0553bbaadf2bc1
+
+hf download chenjiaj109550158/dirotq-flux-schnell-shared-width-r64 \
+  --revision "$ARTIFACT_REVISION" \
+  --local-dir "$ARTIFACT_ROOT"
+```
+
+Verify every downloaded byte before loading the PyTorch caches:
+
+```bash
+(cd "$ARTIFACT_ROOT" && sha256sum -c ARTIFACTS.sha256)
+```
+
+All nine entries must print `OK`.  This download contains four runtime
+artifacts plus their provenance manifests:
+
+1. `U-flux-schnell-shared-width.pt` (PCA basis)
+2. `R-flux-schnell-shared-width-r64.pt` (residual rotation)
+3. `int4_g64_gptq_model.fp32-scales.packed-int4.pt` (packed active weights)
+4. `flux-schnell-adaptive-norm-int4-g64-bf16.pt` (packed W4A16 weights)
+
+It deliberately excludes the 23.8 GB dense reconstructed cache, the 14.3 GB
+Hessian, and calibration activations.  The packed inference path validates
+their immutable producer hashes and does not need to download them.
+
+### 4. Verify the dataset and generate the matched 32 images
+
+```bash
+REPO=$PWD
+OUT=$REPO/models/flux-schnell/reproduction/real_int4_fused/images
+GPU=0
+
+echo \
+  "07ce5ef172dc0454c0267ad7a68a16e21ae2e695356651a51a9f303a166b120e  datasets/mjhq_5000_samples.json" \
+  | sha256sum -c -
+
+env NVIDIA_TF32_OVERRIDE=0 CUDA_VISIBLE_DEVICES="$GPU" \
+  HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+  conda run --no-capture-output -n dirotq python apply_dirotq.py \
+    --model flux-schnell \
+    --model-id "$MODEL_DIR" \
+    --dataset datasets/mjhq_5000_samples.json \
+    --basis-path "$ARTIFACT_ROOT/U-flux-schnell-shared-width.pt" \
+    --rotation-path "$ARTIFACT_ROOT/R-flux-schnell-shared-width-r64.pt" \
+    --gptq --gptq-calib-files 512 --gptq-batch-size 4 \
+    --gptq-rtn-layers .net.2 proj_out.linears.1 \
+    --quantized-cache "$ARTIFACT_ROOT/int4_g64_gptq_model.pt" \
+    --real-int4 \
+    --real-int4-cache "$ARTIFACT_ROOT/int4_g64_gptq_model.fp32-scales.packed-int4.pt" \
+    --real-int4-fake-cache-sha256 85875969ca86126e409771efc7315d6947e047c9fa944b7f2b942065cbff73fc \
+    --real-int4-hessian-sha256 9018d14f44a4595a0336e1972741a8215fa46909f21cfe1a83257a155513c729 \
+    --real-int4-kernel-mode fused \
+    --real-w4a16-modulators \
+    --real-w4a16-cache "$ARTIFACT_ROOT/flux-schnell-adaptive-norm-int4-g64-bf16.pt" \
+    --generate --batch-size 1 --max-images 32 --output-dir "$OUT"
+```
+
+This produces the first 32 MJHQ images using deterministic image-ID seeds, 4
+steps, guidance scale 0, batch size 1, and 1024 x 1024 output.  Successful
+startup must print that it loaded the exact packed INT4 sidecar; it must not
+collect Hessians or rebuild GPTQ.
+
+## Optional: official SVDQuant weights
 
 The official Nunchaku/SVDQuant checkpoints are independently available from
 the migrated `nunchaku-tech/nunchaku-flux.1-schnell` repository:
@@ -59,59 +170,7 @@ hf download nunchaku-tech/nunchaku-flux.1-schnell \
 The old `mit-han-lab/nunchaku-flux.1-schnell` repository contains the same
 named files but its model card says it migrated to `nunchaku-tech`.
 
-## Obtain the custom DiRotQ weights
-
-There is currently no public Hugging Face URL for the custom shared-width r64
-DiRotQ artifacts.  A Git push transfers source only.  Exact reproduction needs
-these four runtime files, whose hashes are frozen in `ARTIFACTS.sha256`:
-
-1. `U-flux-schnell-shared-width.pt` (PCA basis)
-2. `R-flux-schnell-shared-width-r64.pt` (residual rotation)
-3. `int4_g64_gptq_model.fp32-scales.packed-int4.pt` (packed active weights)
-4. `flux-schnell-adaptive-norm-int4-g64-bf16.pt` (packed W4A16 weights)
-
-The small adjacent JSON manifests should be transferred too.  The packed
-runtime does **not** need the 23.8 GB dense reconstructed cache, the 14.3 GB
-Hessian, or calibration activations: their immutable producer hashes are
-passed on the command line and verified against the packed sidecar.
-
-Suggested destination layout:
-
-```text
-$ARTIFACT_ROOT/
-  U-flux-schnell-shared-width.pt
-  U-flux-schnell-shared-width.manifest.json
-  R-flux-schnell-shared-width-r64.pt
-  R-flux-schnell-shared-width-r64.manifest.json
-  int4_g64_gptq_model.fp32-scales.packed-int4.pt
-  int4_g64_gptq_model.fp32-scales.packed-int4.pt.manifest.json
-  int4_g64_gptq_model.fp32-scales.packed-int4.pt.packing.json
-  flux-schnell-adaptive-norm-int4-g64-bf16.pt
-  flux-schnell-adaptive-norm-int4-g64-bf16.pt.manifest.json
-```
-
-Until these files are uploaded to a model repository, transfer them out of
-band.  For example, run this on the destination server after SSH connectivity
-has been arranged:
-
-```bash
-mkdir -p "$ARTIFACT_ROOT"
-rsync -avP SOURCE_USER@SOURCE_HOST:/path/to/export/ "$ARTIFACT_ROOT/"
-(cd "$ARTIFACT_ROOT" && sha256sum -c /path/to/DiRotQ/docs/flux_schnell_shared_width_r64/ARTIFACTS.sha256)
-```
-
-If the artifacts are later uploaded, users can replace the `rsync` step with:
-
-```bash
-hf download OWNER/dirotq-flux-schnell-shared-width-r64 \
-  --revision IMMUTABLE_ARTIFACT_REVISION \
-  --local-dir "$ARTIFACT_ROOT"
-```
-
-Do not advertise that placeholder as available until the repository and an
-immutable revision actually exist.
-
-## Reproduce packed-real DiRotQ INT4
+## Packed-real command details
 
 The path assigned to `--quantized-cache` below is a logical provenance path;
 it is allowed to be absent for inference because the two producer hashes are
@@ -120,8 +179,8 @@ BF16 cache.
 
 ```bash
 REPO=/path/to/DiRotQ
-MODEL_DIR=/path/to/models/FLUX.1-schnell-741f7c3
-ARTIFACT_ROOT=/path/to/dirotq-flux-schnell-r64
+MODEL_DIR=/path/with/enough/space/FLUX.1-schnell-741f7c3
+ARTIFACT_ROOT=/path/with/enough/space/dirotq-flux-schnell-shared-width-r64
 OUT=$REPO/models/flux-schnell/reproduction/real_int4_fused/images
 
 cd "$REPO"
