@@ -84,3 +84,32 @@ outliers, and rescaling channels before the eigendecomposition distorts the
 variance structure the basis exploits, while pushing outlier mass into the
 weights. Weight-QSNR actually improves slightly with smoothing (18.1 -> 18.3 dB
 median), confirming the loss is on the activation/basis side, not the GPTQ side.
+
+## Decoupled smoothing variants (PCA raw, smooth main branch only)
+
+`--smooth main-a05` keeps the PCA basis in the RAW domain and applies smoothing
+only to the 4-bit main branch (Y = (XU)(WU)^T + Q4(X/s) Q4(W_res*s)^T, exact),
+with s from the classic formula computed against the residual weight W_res.
+`--smooth main-search` grid-searches alpha per layer (no-smooth always a
+candidate) minimizing the main-branch output MSE on 4096 sampled calibration
+rows (`collect_act_samples.py`), with full GPTQ inside the search loop.
+
+| Variant                                  | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+| ---------------------------------------- | ------ | ------- | ------ |
+| SVDQuant NVFP4 (official)                | 19.22  | 0.2284  | 0.7466 |
+| **absorb-basis (no smooth)**             | **19.12** | **0.2302** | 0.7436 |
+| absorb-basis + smooth-then-PCA a=0.5     | 19.00  | 0.2302  | 0.7436 |
+| absorb-basis + main-only alpha search    | 18.95  | 0.2325  | 0.7441 |
+| absorb-basis + smooth-then-PCA (svdq s)  | 18.87  | 0.2331  | 0.7399 |
+| absorb-basis + main-only a=0.5           | 18.76  | 0.2395  | 0.7393 |
+
+Negative result, clearly established: smoothing does not help
+DiRotQ-absorb-basis in any of the four tested forms. Even the per-layer
+searched variant — where 160/228 layers picked a nonzero alpha because it
+reduced their calibration-sample main-branch MSE — lands below no-smooth
+end-to-end. The local per-layer MSE proxy does not track end-to-end quality
+here: smoothing converts broadband activation-quant noise into structured
+weight-side error (raw-domain weight QSNR of early mlp_fc1/qkv layers drops
+to 6-10 dB), which evidently propagates worse through the network than what
+it saves. The activation-derived PCA branch already absorbs the outliers
+smoothing is designed for; no-smooth remains the best configuration.

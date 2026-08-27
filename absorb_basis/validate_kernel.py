@@ -83,12 +83,16 @@ def main():
                 y = m(x)
 
             W_q = ref["W_q"].to("cuda", torch.float32)
-            U = ref["U"].to("cuda", torch.float32)
             lora_up = ref["lora_up"].to("cuda", torch.float32)
             s = ref.get("s")
             s = torch.ones(ic, device="cuda") if s is None else s.to("cuda", torch.float32)
-            xs = (x.float()[0] / s)  # smoothed input (kernel divides by smooth factor)
-            y_ref = simulate_act_fp4(xs.to(torch.bfloat16)).float() @ W_q.t() + xs @ U @ lora_up.t()
+            xf = x.float()[0]
+            xs = xf / s              # smoothed input (kernel divides by smooth factor)
+            if "U_eff" in ref:       # raw-domain effective lora_down; lora acts on raw x
+                lora_term = xf @ ref["U_eff"].to("cuda", torch.float32) @ lora_up.t()
+            else:                    # legacy valrefs: U stored in smoothed domain
+                lora_term = xs @ ref["U"].to("cuda", torch.float32) @ lora_up.t()
+            y_ref = simulate_act_fp4(xs.to(torch.bfloat16)).float() @ W_q.t() + lora_term
             if "bias" in sd:
                 # official bias tensors are stored in packed (permuted) order;
                 # skip bias in the reference and subtract the kernel's bias

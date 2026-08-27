@@ -192,32 +192,13 @@ def pack_top_scale_per_channel(packer: NunchakuWeightPacker, top: torch.Tensor):
 
 
 @torch.no_grad()
-def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
-                group_size: int, device: str, gptq: bool,
-                damp_pct: float, block_size: int,
-                valref: dict | None = None, valref_key: str = "",
-                s: torch.Tensor | None = None):
-    """Returns dict of replacement tensors for one nunchaku layer.
-
-    When smoothing is enabled, W and H must ALREADY be in the smoothed domain
-    (W = W_raw * s along the input dim, H = D^-1 H_raw D^-1) and U the top-r
-    eigenvectors of the smoothed covariance. `s` is the bf16-exact smooth
-    factor; the kernel divides the incoming activation by it, and applies the
-    low-rank branch on the RAW input, so the stored lora_down is U / s.
-    """
-    W = W.to(device=device, dtype=torch.float32)
-    U = U.to(device=device, dtype=torch.float32)  # [ic, r]
-    oc, ic = W.shape
-    if s is None:
-        s = torch.ones(ic, device=device, dtype=torch.float32)
-    else:
-        s = s.to(device=device, dtype=torch.float32)
-
-    lora_up = W @ U                      # [oc, r]
-    W_res = W - lora_up @ U.t()          # [oc, ic]
-
+def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
+                      group_size: int, device: str, gptq: bool,
+                      damp_pct: float, block_size: int):
+    """NVFP4-quantize a residual weight (in its final/smoothed domain) on the
+    exact two-level kernel grid. Returns (W_q dequantized, top, micro)."""
+    oc, ic = W_res.shape
     top, micro, eff = two_level_scales(W_res, group_size, per_channel=(kind == "qkv"))
-
     if gptq:
         W_q = _gptq_quantize_layer(
             W_res, H.to(device=device, dtype=torch.float32),
@@ -231,6 +212,43 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
         Wg = W_res.reshape(oc, ng, group_size) / eff.unsqueeze(-1)
         from utils.quant_utils import round_to_nf4_codebook
         W_q = (round_to_nf4_codebook(Wg) * eff.unsqueeze(-1)).reshape(oc, ic)
+    return W_q, top, micro
+
+
+@torch.no_grad()
+def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
+                group_size: int, device: str, gptq: bool,
+                damp_pct: float, block_size: int,
+                valref: dict | None = None, valref_key: str = "",
+                s: torch.Tensor | None = None, decouple: bool = False):
+    """Returns dict of replacement tensors for one nunchaku layer.
+
+    Smoothed-domain mode (decouple=False): W and H must ALREADY be in the
+    smoothed domain (W = W_raw * s, H = D^-1 H_raw D^-1) and U the top-r
+    eigenvectors of the smoothed covariance; stored lora_down = U / s.
+
+    Decoupled mode (decouple=True): W is the RAW weight, U the RAW-domain
+    basis, and smoothing applies to the main (4-bit) branch only:
+        Y = (X U)(W U)^T + Q4(X/s) Q4(W_res * s)^T,  W_res = W - (W U) U^T.
+    H must be the smoothed Hessian D^-1 H_raw D^-1 (input of the main branch
+    is X/s). Stored lora_down = U (kernel applies low-rank on the raw input).
+    """
+    W = W.to(device=device, dtype=torch.float32)
+    U = U.to(device=device, dtype=torch.float32)  # [ic, r]
+    oc, ic = W.shape
+    if s is None:
+        s = torch.ones(ic, device=device, dtype=torch.float32)
+    else:
+        s = s.to(device=device, dtype=torch.float32)
+
+    lora_up = W @ U                      # [oc, r]
+    W_res = W - lora_up @ U.t()          # [oc, ic]
+    if decouple:
+        W_res = W_res * s.unsqueeze(0)   # main branch moves to the smoothed domain
+
+    W_q, top, micro = quantize_residual(
+        W_res, H, kind, group_size, device, gptq, damp_pct, block_size
+    )
 
     # normalize by top so the packer sees codes * micro (micro is what wscales stores)
     if kind == "qkv":
@@ -239,7 +257,10 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
         W_n = (W_q / top).to(torch.bfloat16)
 
     packer = NunchakuWeightPacker(bits=4)
-    lora_down_prepack = (U.t() / s.unsqueeze(0)).to(torch.bfloat16)  # [r, ic], absorbs 1/s
+    if decouple:
+        lora_down_prepack = U.t().to(torch.bfloat16)                 # [r, ic], raw basis
+    else:
+        lora_down_prepack = (U.t() / s.unsqueeze(0)).to(torch.bfloat16)  # [r, ic], absorbs 1/s
     qweight, wscales, _bias, smooth_packed, (ld, lu) = convert_to_nunchaku_w4x4y16(
         weight=W_n,
         scale=micro.to(torch.bfloat16),          # [oc, ng] -> micro-scale e4m3 path
@@ -264,15 +285,21 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
         out["wtscale"] = top.reshape(1).to(torch.bfloat16).cpu()
 
     if valref is not None:
+        # U_eff: raw-domain effective lora_down (kernel applies lora on raw x)
+        U_eff = U if decouple else U / s.unsqueeze(1)
         valref[valref_key] = {
             "W_q": W_q.half().cpu(),          # dequantized residual on the kernel grid (smoothed domain)
-            "U": U.half().cpu(),              # [ic, r] basis in smoothed domain (unpacked)
+            "U_eff": U_eff.half().cpu(),      # [ic, r] raw-domain lora_down (unpacked)
             "lora_up": lora_up.half().cpu(),  # [oc, r] (unpacked)
             "s": s.float().cpu(),             # smooth factor (bf16-exact values)
         }
 
-    # quantization SNR of the full layer (lora + quantized residual) vs W
-    W_hat = W_q + lora_up @ U.t()
+    # quantization SNR of the full layer (lora + quantized residual) vs W,
+    # compared in the domain of the passed-in W (raw for decouple).
+    if decouple:
+        W_hat = W_q / s.unsqueeze(0) + lora_up @ U.t()
+    else:
+        W_hat = W_q + lora_up @ U.t()
     err = (W_hat - W).pow(2).sum()
     qsnr = 10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))
     return out, qsnr.item()
@@ -290,11 +317,19 @@ def main():
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--rtn", action="store_true", help="RTN instead of GPTQ for the residual")
-    ap.add_argument("--smooth", choices=["none", "a05", "svdq"], default="none",
-                    help="SmoothQuant before PCA: none | classic alpha=0.5 (a05) | "
-                         "reuse official SVDQuant per-layer smooth factors (svdq)")
-    ap.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha for --smooth a05")
+    ap.add_argument("--smooth", choices=["none", "a05", "svdq", "main-a05", "main-search"],
+                    default="none",
+                    help="none | smooth-then-PCA: a05 (classic alpha=0.5) / svdq (official "
+                         "factors) | decoupled (PCA raw, smooth main branch only): "
+                         "main-a05 (fixed alpha) / main-search (per-layer alpha search)")
+    ap.add_argument("--alpha", type=float, default=0.5,
+                    help="SmoothQuant alpha for --smooth a05 / main-a05")
     ap.add_argument("--act-amax", default="models/flux-schnell/basis/absorb_act_amax.pt")
+    ap.add_argument("--act-samples", default="models/flux-schnell/basis/absorb_act_samples.pt",
+                    help="raw activation samples for --smooth main-search")
+    ap.add_argument("--search-alphas", type=float, nargs="*",
+                    default=[0.25, 0.4, 0.5, 0.6, 0.75],
+                    help="alpha grid for --smooth main-search (no-smooth is always a candidate)")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
@@ -331,15 +366,20 @@ def main():
     valrefs = {}
 
     act_amax = None
-    if args.smooth == "a05":
+    if args.smooth in ("a05", "main-a05", "main-search"):
         act_amax = torch.load(args.act_amax, map_location="cpu", weights_only=False)
     if args.smooth == "svdq":
         _selftest_pack_perm()
+    act_samples = None
+    if args.smooth == "main-search":
+        act_samples = torch.load(args.act_samples, map_location="cpu", weights_only=False)
+        from absorb_basis.validate_kernel import simulate_act_fp4
 
     from absorb_basis.collect_cov import eigh_topr
 
     table = layer_table(args.num_double, args.num_single)
     qsnrs = {}
+    alphas = {}
     t0 = time.time()
     for nk_prefix, w_keys, cov_key, kind, slice_end in tqdm(table, dynamic_ncols=True):
         Ws = [sd[k].float() for k in w_keys]
@@ -347,11 +387,12 @@ def main():
         if slice_end is not None:
             W = W[:, :slice_end]
         H = cov[f"{cov_key}.H"]
+        decouple = args.smooth in ("main-a05", "main-search")
 
         if args.smooth == "none":
             s = None
             U = cov[cov_key][:, -args.rank:]       # precomputed top-r eigenvectors
-        else:
+        elif args.smooth in ("a05", "svdq"):       # smooth-then-PCA (smoothed domain)
             if args.smooth == "a05":
                 s = smoothquant_factors(act_amax[cov_key], W, args.alpha)
             else:  # svdq: official per-layer smooth factors (stored packed)
@@ -360,13 +401,48 @@ def main():
             W = W * s.unsqueeze(0)                 # smoothed weight
             H = H / (s.unsqueeze(1) * s.unsqueeze(0))  # cov of X/s
             U, _ = eigh_topr(H, args.rank)         # PCA in the smoothed domain
+        else:                                      # decoupled: PCA raw, smooth main branch
+            U = cov[cov_key][:, -args.rank:]
+            Wg = W.to("cuda", torch.float32)
+            Ug = U.to("cuda", torch.float32)
+            W_res_raw = Wg - (Wg @ Ug) @ Ug.t()
+            ax = act_amax[cov_key].to("cuda")
+            if args.smooth == "main-a05":
+                s = smoothquant_factors(ax, W_res_raw, args.alpha).to(torch.bfloat16).float()
+                alphas[nk_prefix] = args.alpha
+            else:  # main-search: per-layer alpha grid, no-smooth always a candidate
+                X = act_samples[cov_key].to("cuda", torch.float32)
+                ref = X @ W_res_raw.t()
+                Hc = H.to("cuda", torch.float32)
+                best = (None, None, float("inf"))
+                for cand in [None] + list(args.search_alphas):
+                    if cand is None:
+                        s_c = torch.ones(W.shape[1], device="cuda")
+                    else:
+                        s_c = smoothquant_factors(ax, W_res_raw, cand).to(torch.bfloat16).float()
+                    H_c = Hc / (s_c.unsqueeze(1) * s_c.unsqueeze(0))
+                    W_q_c, _, _ = quantize_residual(
+                        W_res_raw * s_c.unsqueeze(0), H_c, kind, args.group_size,
+                        "cuda", not args.rtn, args.damp, args.block_size,
+                    )
+                    est = simulate_act_fp4((X / s_c).to(torch.bfloat16)).float() @ W_q_c.t()
+                    err = (est - ref).pow(2).sum().item()
+                    if err < best[2]:
+                        best = (cand, s_c, err)
+                    del W_q_c, est, H_c
+                alphas[nk_prefix] = best[0]
+                s = best[1]
+                del X, ref, Hc
+            H = H.to("cuda", torch.float32) / (s.unsqueeze(1) * s.unsqueeze(0))
+            del Wg, Ug, W_res_raw
+            torch.cuda.empty_cache()
 
         repl, qsnr = build_layer(
             W, H, U, kind, args.group_size, "cuda",
             gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
             valref=valrefs if nk_prefix in VALREF_LAYERS else None,
             valref_key=nk_prefix,
-            s=s,
+            s=s, decouple=decouple,
         )
         qsnrs[nk_prefix] = qsnr
         for name, t in repl.items():
@@ -392,7 +468,10 @@ def main():
     save_file(tensors, args.out, metadata=metadata)
     print("saved:", args.out)
     with open(args.out + ".qsnr.json", "w") as f:
-        json.dump(qsnrs, f, indent=2)
+        json.dump({"qsnr": qsnrs, "alphas": alphas} if alphas else qsnrs, f, indent=2)
+    if alphas:
+        from collections import Counter
+        print("alpha histogram:", dict(Counter(str(a) for a in alphas.values())))
     torch.save(valrefs, args.out + ".valref.pt")
     print("saved validation refs:", args.out + ".valref.pt")
 
