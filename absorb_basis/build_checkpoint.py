@@ -62,7 +62,8 @@ E4M3_MAX = 448.0
 # For "slice" sources, take W[:, :3072] of the named weight.
 # --------------------------------------------------------------------------
 
-def layer_table(num_double: int, num_single: int):
+def layer_table(num_double: int, num_single: int, down_proj: bool = False):
+    """Fifth field: None (full weight) or (col_start, col_end) input-column slice."""
     table = []
     for i in range(num_double):
         p = f"transformer_blocks.{i}"
@@ -99,8 +100,23 @@ def layer_table(num_double: int, num_single: int):
              f"single.{i}.attn", "plain", None),  # shares input (and basis) with qkv
             (f"{p}.out_proj",
              [f"{d}.proj_out.weight"],
-             f"single.{i}.attn_out.value", "plain", 3072),  # attn half of fused proj_out
+             f"single.{i}.attn_out.value", "plain", (0, 3072)),  # attn half of fused proj_out
         ]
+    if down_proj:
+        for i in range(num_double):
+            p = d = f"transformer_blocks.{i}"
+            table += [
+                (f"{p}.mlp_fc2", [f"{d}.ff.net.2.weight"],
+                 f"layer.{i}.img_ffn.down", "plain", None),
+                (f"{p}.mlp_context_fc2", [f"{d}.ff_context.net.2.weight"],
+                 f"layer.{i}.txt_ffn.down", "plain", None),
+            ]
+        for i in range(num_single):
+            p = d = f"single_transformer_blocks.{i}"
+            table += [
+                (f"{p}.mlp_fc2", [f"{d}.proj_out.weight"],
+                 f"single.{i}.mlp.down", "plain", (3072, 15360)),  # MLP half of fused proj_out
+            ]
     return table
 
 
@@ -352,14 +368,16 @@ def hsvd_basis(W: torch.Tensor, H: torch.Tensor, rank: int, device: str,
     Hd = Hd + damping * Hd.diagonal().mean() * torch.eye(
         Hd.shape[0], dtype=Hd.dtype, device=device
     )
-    evals, Q = torch.linalg.eigh(Hd)
-    evals = evals.clamp(min=evals.max() * 1e-12)
-    C = Q * evals.sqrt().unsqueeze(0)              # [ic, ic]
-    Cinv = (Q / evals.sqrt().unsqueeze(0)).t()     # [ic, ic] = Lambda^-1/2 Q^T
+    # Cholesky square root H = C C^T (much faster than eigh at ic = 12288)
+    C = torch.linalg.cholesky(Hd)                               # lower [ic, ic]
     M = (W.to(device=device, dtype=torch.float64) @ C).float()  # fp32 SVD (top-r only)
     Us, Ss, Vh = torch.linalg.svd(M, full_matrices=False)
     lora_up = Us[:, :rank] * Ss[:rank].unsqueeze(0)             # [oc, r]
-    D = (Vh[:rank].double() @ Cinv).float()                     # [r, ic]
+    # D = V_r^T C^-1  <=>  D^T = C^-T V_r  (triangular solve, no explicit inverse)
+    Dt = torch.linalg.solve_triangular(
+        C.t(), Vh[:rank].double().t(), upper=True, left=True
+    )                                                           # [ic, r]
+    D = Dt.t().float()
     return D, lora_up
 
 
@@ -495,6 +513,12 @@ def main():
     ap.add_argument("--bias-correct", action="store_true",
                     help="calibration-mean bias correction (requires --smooth none "
                          "and --act-samples)")
+    ap.add_argument("--down-absorb", action="store_true",
+                    help="also rebuild the K=12288 down-projections (mlp_fc2 / "
+                         "mlp_context_fc2 / single-block MLP half) with absorb-basis "
+                         "instead of copying SVDQuant. Requires --basis hsvd and "
+                         "--cov-down-dir covariances")
+    ap.add_argument("--cov-down-dir", default="models/flux-schnell/basis/absorb_cov_down")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
@@ -528,10 +552,18 @@ def main():
         "single_transformer_blocks.20.out_proj",
         "single_transformer_blocks.37.mlp_fc1",
     }
+    if args.down_absorb:
+        VALREF_LAYERS |= {"transformer_blocks.7.mlp_fc2",
+                          "single_transformer_blocks.20.mlp_fc2"}
     valrefs = {}
 
+    if args.down_absorb:
+        assert args.basis == "hsvd" and args.smooth == "none", \
+            "--down-absorb requires --basis hsvd and --smooth none"
+        assert os.path.isdir(args.cov_down_dir), \
+            f"missing down-proj covariances: {args.cov_down_dir} (run collect_cov_down.py)"
     v2_features = args.basis == "hsvd" or args.clip_search or args.refit_lora \
-        or args.bias_correct or args.alt_iters > 1
+        or args.bias_correct or args.alt_iters > 1 or args.down_absorb
     if v2_features:
         assert args.smooth == "none", \
             "--basis hsvd / --clip-search / --refit-lora / --bias-correct / --alt-iters " \
@@ -554,16 +586,23 @@ def main():
 
     from absorb_basis.collect_cov import eigh_topr
 
-    table = layer_table(args.num_double, args.num_single)
+    def get_H(cov_key):
+        k = f"{cov_key}.H"
+        if k in cov:
+            return cov[k]
+        return torch.load(os.path.join(args.cov_down_dir, f"{cov_key}.pt"),
+                          map_location="cpu", weights_only=False)
+
+    table = layer_table(args.num_double, args.num_single, down_proj=args.down_absorb)
     qsnrs = {}
     alphas = {}
     t0 = time.time()
-    for nk_prefix, w_keys, cov_key, kind, slice_end in tqdm(table, dynamic_ncols=True):
+    for nk_prefix, w_keys, cov_key, kind, col_slice in tqdm(table, dynamic_ncols=True):
         Ws = [sd[k].float() for k in w_keys]
         W = torch.cat(Ws, dim=0)
-        if slice_end is not None:
-            W = W[:, :slice_end]
-        H = cov[f"{cov_key}.H"]
+        if col_slice is not None:
+            W = W[:, col_slice[0]:col_slice[1]]
+        H = get_H(cov_key)
         decouple = args.smooth in ("main-a05", "main-search")
 
         if args.smooth == "none":
@@ -574,7 +613,7 @@ def main():
                 Ug = cov[cov_key][:, -args.rank:].to("cuda", torch.float32)
                 D, lu0 = Ug.t(), Wg @ Ug
             mu = None
-            if args.bias_correct:
+            if args.bias_correct and cov_key in act_samples:
                 mu = act_samples[cov_key].float().mean(dim=0)
             repl, qsnr, bias_delta = build_layer_v2(
                 Wg, H, D, lu0, kind, args.group_size, "cuda",
@@ -674,7 +713,8 @@ def main():
       + ("-clip" if args.clip_search else "") \
       + ("-refit" if args.refit_lora else "") \
       + (f"-alt{args.alt_iters}" if args.alt_iters > 1 else "") \
-      + ("-bc" if args.bias_correct else "")
+      + ("-bc" if args.bias_correct else "") \
+      + ("-down" if args.down_absorb else "")
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     save_file(tensors, args.out, metadata=metadata)
     print("saved:", args.out)
