@@ -85,8 +85,10 @@ def main():
             W_q = ref["W_q"].to("cuda", torch.float32)
             U = ref["U"].to("cuda", torch.float32)
             lora_up = ref["lora_up"].to("cuda", torch.float32)
-            xf = x.float()
-            y_ref = simulate_act_fp4(x[0]).float() @ W_q.t() + xf[0] @ U @ lora_up.t()
+            s = ref.get("s")
+            s = torch.ones(ic, device="cuda") if s is None else s.to("cuda", torch.float32)
+            xs = (x.float()[0] / s)  # smoothed input (kernel divides by smooth factor)
+            y_ref = simulate_act_fp4(xs.to(torch.bfloat16)).float() @ W_q.t() + xs @ U @ lora_up.t()
             if "bias" in sd:
                 # official bias tensors are stored in packed (permuted) order;
                 # skip bias in the reference and subtract the kernel's bias

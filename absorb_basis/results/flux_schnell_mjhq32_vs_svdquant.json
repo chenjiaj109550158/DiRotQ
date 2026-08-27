@@ -55,5 +55,51 @@
       "guidance_scale": 0.0,
       "batch_size": 1
     }
+  },
+  "dirotq_absorb_basis_smoothquant_a0.5": {
+    "quality_vs_bf16": {
+      "psnr": 18.996471405029297,
+      "lpips": 0.23015041649341583,
+      "ssim": 0.7435702085494995
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 158.96546936035156,
+      "lat_ms_mean": 159.77654492855072,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8560932341879379,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_basis_svdquant_smooth": {
+    "quality_vs_bf16": {
+      "psnr": 18.86547088623047,
+      "lpips": 0.23309050500392914,
+      "ssim": 0.7398791909217834
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.4120635986328,
+      "lat_ms_mean": 160.0253256559372,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8548303264062724,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
   }
 }

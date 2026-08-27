@@ -118,6 +118,47 @@ def load_transformer_state_dict(model_id: str) -> dict:
     return sd
 
 
+def pack_perm_vector(n: int, warp_n: int = 128) -> torch.Tensor:
+    """Index permutation applied by NunchakuWeightPacker.pack_scale(group_size=-1)
+    to a [n] vector: packed[i] = orig[perm[i]]."""
+    s_pack_size = min(max(warp_n // 32, 2), 8)
+    num_s_lanes = min(32, warp_n // s_pack_size)
+    num_s_packs = warp_n // (s_pack_size * num_s_lanes)
+    warp_s = num_s_packs * num_s_lanes * s_pack_size
+    assert warp_s == warp_n and n % warp_s == 0
+    idx = torch.arange(n).reshape(
+        n // warp_s, num_s_packs, num_s_lanes // 4, s_pack_size // 2, 4, 2, -1
+    )
+    return idx.permute(0, 6, 1, 2, 4, 3, 5).contiguous().view(-1)
+
+
+def unpack_scale_vector(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of pack_scale(group_size=-1) for a flat [n] vector."""
+    perm = pack_perm_vector(packed.shape[0])
+    out = torch.empty_like(packed)
+    out[perm] = packed
+    return out
+
+
+def _selftest_pack_perm():
+    packer = NunchakuWeightPacker(bits=4)
+    v = torch.randn(3072).to(torch.bfloat16)
+    ref = packer.pack_scale(
+        packer.pad_scale(v.view(-1, 1, 1, 1), group_size=-1), group_size=-1
+    ).view(-1)
+    mine = v[pack_perm_vector(3072)]
+    assert torch.equal(ref, mine), "pack_perm_vector mismatch with NunchakuWeightPacker"
+    assert torch.equal(unpack_scale_vector(ref), v), "unpack_scale_vector roundtrip failed"
+
+
+def smoothquant_factors(act_amax: torch.Tensor, W: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Classic SmoothQuant: s_j = amax|X_j|^a / amax|W_:,j|^(1-a). Returns float32 [ic]."""
+    ax = act_amax.float().clamp(min=1e-5)
+    aw = W.abs().amax(dim=0).float().clamp(min=1e-5)
+    s = ax.pow(alpha) / aw.pow(1.0 - alpha)
+    return s.clamp(min=1e-5, max=1e4)
+
+
 def two_level_scales(W_res: torch.Tensor, group_size: int, per_channel: bool):
     """Compute (top, micro_e4m3, effective) scales for NVFP4.
 
@@ -154,11 +195,23 @@ def pack_top_scale_per_channel(packer: NunchakuWeightPacker, top: torch.Tensor):
 def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
                 group_size: int, device: str, gptq: bool,
                 damp_pct: float, block_size: int,
-                valref: dict | None = None, valref_key: str = ""):
-    """Returns dict of replacement tensors for one nunchaku layer."""
+                valref: dict | None = None, valref_key: str = "",
+                s: torch.Tensor | None = None):
+    """Returns dict of replacement tensors for one nunchaku layer.
+
+    When smoothing is enabled, W and H must ALREADY be in the smoothed domain
+    (W = W_raw * s along the input dim, H = D^-1 H_raw D^-1) and U the top-r
+    eigenvectors of the smoothed covariance. `s` is the bf16-exact smooth
+    factor; the kernel divides the incoming activation by it, and applies the
+    low-rank branch on the RAW input, so the stored lora_down is U / s.
+    """
     W = W.to(device=device, dtype=torch.float32)
     U = U.to(device=device, dtype=torch.float32)  # [ic, r]
     oc, ic = W.shape
+    if s is None:
+        s = torch.ones(ic, device=device, dtype=torch.float32)
+    else:
+        s = s.to(device=device, dtype=torch.float32)
 
     lora_up = W @ U                      # [oc, r]
     W_res = W - lora_up @ U.t()          # [oc, ic]
@@ -186,12 +239,13 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
         W_n = (W_q / top).to(torch.bfloat16)
 
     packer = NunchakuWeightPacker(bits=4)
+    lora_down_prepack = (U.t() / s.unsqueeze(0)).to(torch.bfloat16)  # [r, ic], absorbs 1/s
     qweight, wscales, _bias, smooth_packed, (ld, lu) = convert_to_nunchaku_w4x4y16(
         weight=W_n,
         scale=micro.to(torch.bfloat16),          # [oc, ng] -> micro-scale e4m3 path
         bias=None,
-        smooth=torch.ones(ic, dtype=torch.bfloat16, device=device),
-        lora=(U.t().to(torch.bfloat16),          # lora_down pre-pack [r, ic]
+        smooth=s.to(torch.bfloat16),
+        lora=(lora_down_prepack,                 # lora_down pre-pack [r, ic]
               lora_up.to(torch.bfloat16)),       # lora_up  pre-pack [oc, r]
         float_point=True,
     )
@@ -201,8 +255,8 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
         "wscales": wscales.cpu(),
         "lora_down": ld.cpu(),
         "lora_up": lu.cpu(),
-        "smooth": torch.ones(ic, dtype=torch.bfloat16),
-        "smooth_orig": torch.ones(ic, dtype=torch.bfloat16),
+        "smooth": smooth_packed.view(-1).to(torch.bfloat16).cpu(),
+        "smooth_orig": smooth_packed.view(-1).to(torch.bfloat16).cpu(),
     }
     if kind == "qkv":
         out["wcscales"] = pack_top_scale_per_channel(packer, top).cpu()
@@ -211,9 +265,10 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
 
     if valref is not None:
         valref[valref_key] = {
-            "W_q": W_q.half().cpu(),          # dequantized residual on the kernel grid
-            "U": U.half().cpu(),              # [ic, r] lora_down (unpacked)
+            "W_q": W_q.half().cpu(),          # dequantized residual on the kernel grid (smoothed domain)
+            "U": U.half().cpu(),              # [ic, r] basis in smoothed domain (unpacked)
             "lora_up": lora_up.half().cpu(),  # [oc, r] (unpacked)
+            "s": s.float().cpu(),             # smooth factor (bf16-exact values)
         }
 
     # quantization SNR of the full layer (lora + quantized residual) vs W
@@ -235,6 +290,11 @@ def main():
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--rtn", action="store_true", help="RTN instead of GPTQ for the residual")
+    ap.add_argument("--smooth", choices=["none", "a05", "svdq"], default="none",
+                    help="SmoothQuant before PCA: none | classic alpha=0.5 (a05) | "
+                         "reuse official SVDQuant per-layer smooth factors (svdq)")
+    ap.add_argument("--alpha", type=float, default=0.5, help="SmoothQuant alpha for --smooth a05")
+    ap.add_argument("--act-amax", default="models/flux-schnell/basis/absorb_act_amax.pt")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
@@ -270,6 +330,14 @@ def main():
     }
     valrefs = {}
 
+    act_amax = None
+    if args.smooth == "a05":
+        act_amax = torch.load(args.act_amax, map_location="cpu", weights_only=False)
+    if args.smooth == "svdq":
+        _selftest_pack_perm()
+
+    from absorb_basis.collect_cov import eigh_topr
+
     table = layer_table(args.num_double, args.num_single)
     qsnrs = {}
     t0 = time.time()
@@ -278,13 +346,27 @@ def main():
         W = torch.cat(Ws, dim=0)
         if slice_end is not None:
             W = W[:, :slice_end]
-        U = cov[cov_key][:, -args.rank:]           # top-r eigenvectors
         H = cov[f"{cov_key}.H"]
+
+        if args.smooth == "none":
+            s = None
+            U = cov[cov_key][:, -args.rank:]       # precomputed top-r eigenvectors
+        else:
+            if args.smooth == "a05":
+                s = smoothquant_factors(act_amax[cov_key], W, args.alpha)
+            else:  # svdq: official per-layer smooth factors (stored packed)
+                s = unpack_scale_vector(tensors[f"{nk_prefix}.smooth"]).float()
+            s = s.to(torch.bfloat16).float()       # bf16-exact, matches runtime storage
+            W = W * s.unsqueeze(0)                 # smoothed weight
+            H = H / (s.unsqueeze(1) * s.unsqueeze(0))  # cov of X/s
+            U, _ = eigh_topr(H, args.rank)         # PCA in the smoothed domain
+
         repl, qsnr = build_layer(
             W, H, U, kind, args.group_size, "cuda",
             gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
             valref=valrefs if nk_prefix in VALREF_LAYERS else None,
             valref_key=nk_prefix,
+            s=s,
         )
         qsnrs[nk_prefix] = qsnr
         for name, t in repl.items():
@@ -303,7 +385,9 @@ def main():
         print(f"  {v:6.2f} dB  {k}")
     print(f"median weight-QSNR: {w_qsnr[len(w_qsnr)//2][1]:.2f} dB")
 
-    metadata["method"] = "dirotq-absorb-basis"
+    metadata["method"] = "dirotq-absorb-basis" + (
+        "" if args.smooth == "none" else f"-smooth-{args.smooth}"
+    )
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     save_file(tensors, args.out, metadata=metadata)
     print("saved:", args.out)

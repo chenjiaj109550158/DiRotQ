@@ -60,3 +60,27 @@ python absorb_basis/validate_kernel.py --ckpt models/flux-schnell/absorb_basis/d
 #    plus transformer-only memory / forward latency — svdquant env,
 #    same protocol as the SVDQuant baseline run.
 ```
+
+## Smoothing variants (MJHQ-32 vs bf16 reference, FLUX.1-schnell, nunchaku fp4, RTX 5090)
+
+`--smooth a05` applies classic SmoothQuant (alpha=0.5, per-channel act-amax from
+`collect_act_amax.py`) before the PCA; `--smooth svdq` reuses the official
+SVDQuant per-layer calibrated smooth factors (unpacked from the checkpoint).
+In both cases the PCA basis is computed in the smoothed domain
+(cov(X/s) = D^-1 H D^-1), the weight becomes W*s, GPTQ uses the smoothed
+Hessian, and the kernel's built-in smooth mechanism is used (stored
+lora_down = U/s since the kernel applies the low-rank branch on the raw input).
+
+| Variant                        | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+| ------------------------------ | ------ | ------- | ------ |
+| SVDQuant NVFP4 (official)      | 19.22  | 0.2284  | 0.7466 |
+| absorb-basis (no smooth)       | 19.12  | 0.2302  | 0.7436 |
+| absorb-basis + SmoothQuant a=.5| 19.00  | 0.2302  | 0.7436 |
+| absorb-basis + SVDQuant smooth | 18.87  | 0.2331  | 0.7399 |
+
+Smoothing before the PCA does not help this method (PSNR drops 0.1-0.25 dB):
+the activation-derived PCA branch already absorbs the dominant activation
+outliers, and rescaling channels before the eigendecomposition distorts the
+variance structure the basis exploits, while pushing outlier mass into the
+weights. Weight-QSNR actually improves slightly with smoothing (18.1 -> 18.3 dB
+median), confirming the loss is on the activation/basis side, not the GPTQ side.
