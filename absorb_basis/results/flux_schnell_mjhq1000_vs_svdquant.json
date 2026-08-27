@@ -1,0 +1,36 @@
+{
+  "protocol": {
+    "model": "FLUX.1-schnell",
+    "dataset": "MJHQ-1000 (deepcompressor sampling, per-filename hash seeds)",
+    "steps": 4,
+    "guidance_scale": 0.0,
+    "resolution": 1024,
+    "batch_size": 1,
+    "gpu": "RTX 5090 (sm_120)",
+    "kernel": "nunchaku 1.2.1 fp4",
+    "bf16_reference": "deepcompressor eval.generate, fmeuler4-g0, 1000 imgs",
+    "fid": "clean-fid, 1000 vs 1000"
+  },
+  "svdquant_nvfp4": {
+    "similarity_vs_bf16": {
+      "psnr": 18.824399948120117,
+      "lpips": 0.2318841964006424,
+      "ssim": 0.7429648041725159
+    },
+    "fid": {
+      "fid_vs_bf16ref": 28.274739705805814,
+      "fid_vs_gt": 60.39682573937074
+    }
+  },
+  "dirotq_absorb_hsvd_down": {
+    "similarity_vs_bf16": {
+      "psnr": 18.91253662109375,
+      "lpips": 0.22782406210899353,
+      "ssim": 0.7455645203590393
+    },
+    "fid": {
+      "fid_vs_bf16ref": 27.812656882103397,
+      "fid_vs_gt": 59.732578778782624
+    }
+  }
+}

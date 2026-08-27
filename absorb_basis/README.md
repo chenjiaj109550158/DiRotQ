@@ -170,3 +170,21 @@ rel_err (~7.6%) and end-to-end quality confirm the allocation is right:
 another instance of unweighted local metrics being misleading.
 
     python absorb_basis/build_checkpoint.py --basis hsvd --down-absorb
+
+## MJHQ-1000 confirmation (SVDQuant vs absorb + H-SVD + down-absorb)
+
+1000-sample rerun of the final configuration against SVDQuant, same protocol
+(bf16 reference regenerated for 1000 prompts with the deepcompressor pipeline;
+FID via clean-fid at N=1000 on both sides):
+
+| Metric                | SVDQuant NVFP4 | absorb H-SVD + down |
+| --------------------- | -------------- | ------------------- |
+| PSNR ↑ (vs bf16)      | 18.82          | **18.91**           |
+| LPIPS ↓ (vs bf16)     | 0.2319         | **0.2278**          |
+| SSIM ↑ (vs bf16)      | 0.7430         | **0.7456**          |
+| FID ↓ (vs bf16 ref)   | 28.27          | **27.81**           |
+| FID ↓ (vs MJHQ GT)    | 60.40          | **59.73**           |
+
+DiRotQ-absorb-basis with the H-SVD basis and down-projection absorb wins on
+all five metrics at N=1000, with identical memory and latency (same nunchaku
+kernels, same tensor layout).
