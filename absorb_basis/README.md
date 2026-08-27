@@ -113,3 +113,37 @@ weight-side error (raw-domain weight QSNR of early mlp_fc1/qkv layers drops
 to 6-10 dB), which evidently propagates worse through the network than what
 it saves. The activation-derived PCA branch already absorbs the outliers
 smoothing is designed for; no-smooth remains the best configuration.
+
+## Refinements beyond smoothing (clip search / lora refit / bias correction / H-SVD basis)
+
+Four candidate quality refinements, each ablated individually on MJHQ-32
+(all with --smooth none; memory/latency unchanged by construction):
+
+| Variant                                   | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+| ----------------------------------------- | ------ | ------- | ------ |
+| SVDQuant NVFP4 (official)                 | 19.22  | 0.2284  | 0.7466 |
+| absorb-basis, PCA basis (baseline)        | 19.12  | 0.2302  | 0.7436 |
+| **absorb-basis, H-SVD basis (`--basis hsvd`)** | **19.29** | **0.2234** | **0.7558** |
+| + clip search only (`--clip-search`)      | 18.83  | 0.2463  | 0.7376 |
+| + lora refit only (`--refit-lora --alt-iters 2`) | 18.77 | 0.2446 | 0.7389 |
+| + bias correction only (`--bias-correct`) | 18.80  | 0.2373  | 0.7412 |
+| hsvd + clip + refit + bias (combo)        | 18.86  | 0.2358  | 0.7432 |
+| pca + clip + refit + bias (combo)         | 18.96  | 0.2386  | 0.7409 |
+
+**The activation-weighted SVD basis wins on every metric — including against
+SVDQuant** — while clip search, H-metric lora refit, and calibration-mean bias
+correction each hurt end-to-end quality despite improving their local
+objectives (weight QSNR up to 18.66 dB median with hsvd+extras). The pattern
+is consistent across this whole project: local per-layer proxies (weight QSNR,
+per-layer output MSE) repeatedly fail to predict end-to-end diffusion quality,
+so every refinement must be validated end-to-end.
+
+`--basis hsvd` replaces the top-r input-PCA basis with the H-metric optimal
+rank-r branch: minimize ||X (W - L)^T||_F over rank-32 L, solved by
+L = SVD_32(W C) C^{-1} with H = C C^T (damped eigen square root). It couples
+the branch to BOTH the activation statistics and the weight, generalizing both
+plain PCA (activation-only) and SVDQuant's weight SVD (weight-only). The
+winning configuration is exactly:
+
+    python absorb_basis/build_checkpoint.py --basis hsvd \
+        --out models/flux-schnell/absorb_basis/dirotq-absorb-ablate-hsvd-fp4_r32-flux.1-schnell.safetensors

@@ -147,5 +147,143 @@
       "guidance_scale": 0.0,
       "batch_size": 1
     }
+  },
+  "dirotq_absorb_refined_pca_clip_refit_bias": {
+    "quality_vs_bf16": {
+      "psnr": 18.964981079101562,
+      "lpips": 0.23863686621189117,
+      "ssim": 0.7409077882766724
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.18695068359375,
+      "lat_ms_mean": 160.24650239944458,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8577230563125795,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_refined_hsvd_clip_refit_bias": {
+    "quality_vs_bf16": {
+      "psnr": 18.85965347290039,
+      "lpips": 0.23575125634670258,
+      "ssim": 0.7432011961936951
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.73196411132812,
+      "lat_ms_mean": 160.3000729084015,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.857930124249151,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_ablate_clip_only": {
+    "quality_vs_bf16": {
+      "psnr": 18.832584381103516,
+      "lpips": 0.24625691771507263,
+      "ssim": 0.7375502586364746
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.6357421875,
+      "lat_ms_mean": 160.65828943252563,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8620175547814597,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_ablate_refit_only": {
+    "quality_vs_bf16": {
+      "psnr": 18.765871047973633,
+      "lpips": 0.24456755816936493,
+      "ssim": 0.7388707995414734
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.90576171875,
+      "lat_ms_mean": 160.4361311197281,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.857335112749297,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_ablate_bias_only": {
+    "quality_vs_bf16": {
+      "psnr": 18.802764892578125,
+      "lpips": 0.2373296320438385,
+      "ssim": 0.7411945462226868
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.8253173828125,
+      "lat_ms_mean": 160.44399666786194,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8564210049696612,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_hsvd_basis": {
+    "quality_vs_bf16": {
+      "psnr": 19.2924861907959,
+      "lpips": 0.2234085500240326,
+      "ssim": 0.7558426260948181
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.90707397460938,
+      "lat_ms_mean": 160.47711765766144,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8611463722500048,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
   }
 }

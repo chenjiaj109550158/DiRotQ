@@ -159,28 +159,60 @@ def smoothquant_factors(act_amax: torch.Tensor, W: torch.Tensor, alpha: float) -
     return s.clamp(min=1e-5, max=1e4)
 
 
-def two_level_scales(W_res: torch.Tensor, group_size: int, per_channel: bool):
+def two_level_scales(W_res: torch.Tensor, group_size: int, per_channel: bool,
+                     hdiag: torch.Tensor | None = None,
+                     clip_ratios: torch.Tensor | None = None):
     """Compute (top, micro_e4m3, effective) scales for NVFP4.
 
     top:   [oc] (per_channel) or scalar tensor  — bf16-storable float32
     micro: [oc, ng] float32 holding exact e4m3 values
     eff:   [oc, ng] float32 = micro * top      — the actual dequant grid
+
+    With clip_ratios (and hdiag = diagonal of the input Hessian), each group's
+    micro-scale is chosen from {r * amax/6 : r in clip_ratios} minimizing the
+    Hessian-diagonal-weighted RTN error of that group (mirrors deepcompressor's
+    calib_range search, at per-group granularity).
     """
+    from utils.quant_utils import round_to_nf4_codebook
+
     oc, ic = W_res.shape
     ng = ic // group_size
-    Wg = W_res.abs().reshape(oc, ng, group_size)
-    gmax = Wg.amax(dim=-1)  # [oc, ng]
+    Wg = W_res.reshape(oc, ng, group_size)
+    gmax = Wg.abs().amax(dim=-1)  # [oc, ng]
     if per_channel:
         top = (gmax.amax(dim=1) / (E2M1_MAX * E4M3_MAX)).clamp(min=1e-8)  # [oc]
         top = top.to(torch.bfloat16).float()  # round to storable bf16 first
-        micro = gmax / (E2M1_MAX * top.unsqueeze(1))
+        top_b = top.unsqueeze(1)
     else:
         top = (gmax.amax() / (E2M1_MAX * E4M3_MAX)).clamp(min=1e-8).reshape(())
         top = top.to(torch.bfloat16).float()
-        micro = gmax / (E2M1_MAX * top)
-    micro = micro.clamp(max=E4M3_MAX)
-    micro = micro.to(torch.float8_e4m3fn).float().clamp(min=2.0 ** -9)  # e4m3 grid, no zeros
-    eff = micro * (top.unsqueeze(1) if per_channel else top)
+        top_b = top
+
+    def to_e4m3(m):
+        m = m.clamp(max=E4M3_MAX)
+        return m.to(torch.float8_e4m3fn).float().clamp(min=2.0 ** -9)
+
+    if clip_ratios is None:
+        micro = to_e4m3(gmax / (E2M1_MAX * top_b))
+    else:
+        assert hdiag is not None
+        hg = hdiag.to(W_res.device, torch.float32).clamp(min=0).reshape(1, ng, group_size)
+        best_err = torch.full((oc, ng), float("inf"), device=W_res.device)
+        micro = torch.empty((oc, ng), device=W_res.device)
+        CHUNK = 2048
+        for r in clip_ratios:
+            micro_r = to_e4m3(float(r) * gmax / (E2M1_MAX * top_b))  # [oc, ng]
+            eff_r = micro_r * top_b
+            for c0 in range(0, oc, CHUNK):
+                c1 = min(c0 + CHUNK, oc)
+                q = round_to_nf4_codebook(Wg[c0:c1] / eff_r[c0:c1].unsqueeze(-1))
+                q = q * eff_r[c0:c1].unsqueeze(-1)
+                err = ((q - Wg[c0:c1]).pow(2) * hg).sum(dim=-1)  # [chunk, ng]
+                take = err < best_err[c0:c1]
+                best_err[c0:c1][take] = err[take]
+                micro[c0:c1][take] = micro_r[c0:c1][take]
+
+    eff = micro * top_b
     return top, micro, eff
 
 
@@ -194,11 +226,14 @@ def pack_top_scale_per_channel(packer: NunchakuWeightPacker, top: torch.Tensor):
 @torch.no_grad()
 def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
                       group_size: int, device: str, gptq: bool,
-                      damp_pct: float, block_size: int):
+                      damp_pct: float, block_size: int,
+                      hdiag: torch.Tensor | None = None,
+                      clip_ratios: torch.Tensor | None = None):
     """NVFP4-quantize a residual weight (in its final/smoothed domain) on the
     exact two-level kernel grid. Returns (W_q dequantized, top, micro)."""
     oc, ic = W_res.shape
-    top, micro, eff = two_level_scales(W_res, group_size, per_channel=(kind == "qkv"))
+    top, micro, eff = two_level_scales(W_res, group_size, per_channel=(kind == "qkv"),
+                                       hdiag=hdiag, clip_ratios=clip_ratios)
     if gptq:
         W_q = _gptq_quantize_layer(
             W_res, H.to(device=device, dtype=torch.float32),
@@ -213,6 +248,119 @@ def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
         from utils.quant_utils import round_to_nf4_codebook
         W_q = (round_to_nf4_codebook(Wg) * eff.unsqueeze(-1)).reshape(oc, ic)
     return W_q, top, micro
+
+
+@torch.no_grad()
+def pack_layer(W_q, top, micro, lora_down_prepack, lora_up, s, kind, device):
+    """Pack quantized residual + lora + smooth into nunchaku replacement tensors."""
+    ic = lora_down_prepack.shape[1]
+    if kind == "qkv":
+        W_n = (W_q / top.unsqueeze(1)).to(torch.bfloat16)
+    else:
+        W_n = (W_q / top).to(torch.bfloat16)
+    packer = NunchakuWeightPacker(bits=4)
+    qweight, wscales, _bias, smooth_packed, (ld, lu) = convert_to_nunchaku_w4x4y16(
+        weight=W_n,
+        scale=micro.to(torch.bfloat16),
+        bias=None,
+        smooth=s.to(torch.bfloat16),
+        lora=(lora_down_prepack.to(torch.bfloat16), lora_up.to(torch.bfloat16)),
+        float_point=True,
+    )
+    out = {
+        "qweight": qweight.cpu(),
+        "wscales": wscales.cpu(),
+        "lora_down": ld.cpu(),
+        "lora_up": lu.cpu(),
+        "smooth": smooth_packed.view(-1).to(torch.bfloat16).cpu(),
+        "smooth_orig": smooth_packed.view(-1).to(torch.bfloat16).cpu(),
+    }
+    if kind == "qkv":
+        out["wcscales"] = pack_top_scale_per_channel(packer, top).cpu()
+    else:
+        out["wtscale"] = top.reshape(1).to(torch.bfloat16).cpu()
+    return out
+
+
+@torch.no_grad()
+def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
+                   lora_up: torch.Tensor, kind: str, group_size: int, device: str,
+                   gptq: bool, damp_pct: float, block_size: int,
+                   alt_iters: int = 1, refit: bool = False,
+                   clip_ratios: torch.Tensor | None = None,
+                   mu: torch.Tensor | None = None,
+                   valref: dict | None = None, valref_key: str = ""):
+    """Raw-domain (no-smooth) layer build with optional clip search, alternating
+    lora refit, and bias correction.
+
+    D:        [r, ic] lora_down (pre-pack); low-rank branch = x @ D^T @ lora_up^T
+    lora_up:  [oc, r] initial value; refit updates it in the H metric.
+    mu:       [ic] calibration input mean for bias correction (None to skip).
+
+    Returns (out_tensors, qsnr, bias_delta_or_None).
+    """
+    W = W.to(device=device, dtype=torch.float32)
+    D = D.to(device=device, dtype=torch.float32)
+    lora_up = lora_up.to(device=device, dtype=torch.float32)
+    oc, ic = W.shape
+    Hg = H.to(device=device, dtype=torch.float32)
+    hdiag = Hg.diagonal() if clip_ratios is not None else None
+
+    W_q = top = micro = None
+    for _ in range(max(1, alt_iters)):
+        W_res = W - lora_up @ D
+        W_q, top, micro = quantize_residual(
+            W_res, Hg, kind, group_size, device, gptq, damp_pct, block_size,
+            hdiag=hdiag, clip_ratios=clip_ratios,
+        )
+        if refit:
+            E = W - W_q
+            G = D @ Hg @ D.t()
+            G = G + 1e-6 * G.diagonal().mean() * torch.eye(G.shape[0], device=device)
+            lora_up = (E @ Hg @ D.t()) @ torch.linalg.inv(G)
+
+    s = torch.ones(ic, device=device, dtype=torch.float32)
+    out = pack_layer(W_q, top, micro, D, lora_up, s, kind, device)
+
+    W_hat = W_q + lora_up @ D
+    bias_delta = None
+    if mu is not None:
+        bias_delta = (mu.to(device=device, dtype=torch.float32) @ (W - W_hat).t()).cpu()
+
+    if valref is not None:
+        valref[valref_key] = {
+            "W_q": W_q.half().cpu(),
+            "U_eff": D.t().half().cpu(),
+            "lora_up": lora_up.half().cpu(),
+            "s": s.cpu(),
+        }
+
+    err = (W_hat - W).pow(2).sum()
+    qsnr = 10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))
+    return out, qsnr.item(), bias_delta
+
+
+@torch.no_grad()
+def hsvd_basis(W: torch.Tensor, H: torch.Tensor, rank: int, device: str,
+               damping: float = 0.01):
+    """Activation-weighted (H-metric) rank-r branch: minimize ||X (W - L)^T||_F.
+
+    H = C C^T (eigen square root, damped). Best rank-r L = SVD_r(W C) C^{-1}.
+    Returns (D [r, ic], lora_up [oc, r]) with L = lora_up @ D.
+    """
+    Hd = H.to(device=device, dtype=torch.float64)
+    Hd = Hd + damping * Hd.diagonal().mean() * torch.eye(
+        Hd.shape[0], dtype=Hd.dtype, device=device
+    )
+    evals, Q = torch.linalg.eigh(Hd)
+    evals = evals.clamp(min=evals.max() * 1e-12)
+    C = Q * evals.sqrt().unsqueeze(0)              # [ic, ic]
+    Cinv = (Q / evals.sqrt().unsqueeze(0)).t()     # [ic, ic] = Lambda^-1/2 Q^T
+    M = (W.to(device=device, dtype=torch.float64) @ C).float()  # fp32 SVD (top-r only)
+    Us, Ss, Vh = torch.linalg.svd(M, full_matrices=False)
+    lora_up = Us[:, :rank] * Ss[:rank].unsqueeze(0)             # [oc, r]
+    D = (Vh[:rank].double() @ Cinv).float()                     # [r, ic]
+    return D, lora_up
 
 
 @torch.no_grad()
@@ -330,6 +478,23 @@ def main():
     ap.add_argument("--search-alphas", type=float, nargs="*",
                     default=[0.25, 0.4, 0.5, 0.6, 0.75],
                     help="alpha grid for --smooth main-search (no-smooth is always a candidate)")
+    ap.add_argument("--basis", choices=["pca", "hsvd"], default="pca",
+                    help="low-rank branch: pca (top-r input PCA) or hsvd "
+                         "(activation-weighted SVD of W in the H metric). "
+                         "hsvd requires --smooth none")
+    ap.add_argument("--clip-search", action="store_true",
+                    help="per-group weight-scale clip search (Hessian-diagonal-weighted), "
+                         "requires --smooth none")
+    ap.add_argument("--clip-grid", type=float, nargs=3, default=[0.8, 1.0, 21],
+                    metavar=("LO", "HI", "N"), help="clip ratio grid")
+    ap.add_argument("--refit-lora", action="store_true",
+                    help="closed-form H-metric refit of lora_up after each GPTQ pass "
+                         "(requires --smooth none)")
+    ap.add_argument("--alt-iters", type=int, default=1,
+                    help="number of (quantize -> refit) passes (>=2 alternates)")
+    ap.add_argument("--bias-correct", action="store_true",
+                    help="calibration-mean bias correction (requires --smooth none "
+                         "and --act-samples)")
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
@@ -365,14 +530,26 @@ def main():
     }
     valrefs = {}
 
+    v2_features = args.basis == "hsvd" or args.clip_search or args.refit_lora \
+        or args.bias_correct or args.alt_iters > 1
+    if v2_features:
+        assert args.smooth == "none", \
+            "--basis hsvd / --clip-search / --refit-lora / --bias-correct / --alt-iters " \
+            "are only supported with --smooth none"
+    clip_ratios = None
+    if args.clip_search:
+        lo, hi, n = args.clip_grid
+        clip_ratios = torch.linspace(lo, hi, int(n))
+
     act_amax = None
     if args.smooth in ("a05", "main-a05", "main-search"):
         act_amax = torch.load(args.act_amax, map_location="cpu", weights_only=False)
     if args.smooth == "svdq":
         _selftest_pack_perm()
     act_samples = None
-    if args.smooth == "main-search":
+    if args.smooth == "main-search" or args.bias_correct:
         act_samples = torch.load(args.act_samples, map_location="cpu", weights_only=False)
+    if args.smooth == "main-search":
         from absorb_basis.validate_kernel import simulate_act_fp4
 
     from absorb_basis.collect_cov import eigh_topr
@@ -390,9 +567,39 @@ def main():
         decouple = args.smooth in ("main-a05", "main-search")
 
         if args.smooth == "none":
-            s = None
-            U = cov[cov_key][:, -args.rank:]       # precomputed top-r eigenvectors
-        elif args.smooth in ("a05", "svdq"):       # smooth-then-PCA (smoothed domain)
+            Wg = W.to("cuda", torch.float32)
+            if args.basis == "hsvd":
+                D, lu0 = hsvd_basis(Wg, H, args.rank, "cuda")
+            else:
+                Ug = cov[cov_key][:, -args.rank:].to("cuda", torch.float32)
+                D, lu0 = Ug.t(), Wg @ Ug
+            mu = None
+            if args.bias_correct:
+                mu = act_samples[cov_key].float().mean(dim=0)
+            repl, qsnr, bias_delta = build_layer_v2(
+                Wg, H, D, lu0, kind, args.group_size, "cuda",
+                gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
+                alt_iters=args.alt_iters, refit=args.refit_lora,
+                clip_ratios=clip_ratios, mu=mu,
+                valref=valrefs if nk_prefix in VALREF_LAYERS else None,
+                valref_key=nk_prefix,
+            )
+            if bias_delta is not None:
+                bkey = f"{nk_prefix}.bias"
+                perm = pack_perm_vector(bias_delta.shape[0])
+                tensors[bkey] = (
+                    tensors[bkey].float() + bias_delta[perm].float()
+                ).to(tensors[bkey].dtype)
+            qsnrs[nk_prefix] = qsnr
+            for name, t in repl.items():
+                full = f"{nk_prefix}.{name}"
+                assert full in tensors, f"unexpected key {full}"
+                assert tensors[full].shape == t.shape and tensors[full].dtype == t.dtype, full
+                tensors[full] = t
+            del Wg
+            continue
+
+        if args.smooth in ("a05", "svdq"):         # smooth-then-PCA (smoothed domain)
             if args.smooth == "a05":
                 s = smoothquant_factors(act_amax[cov_key], W, args.alpha)
             else:  # svdq: official per-layer smooth factors (stored packed)
@@ -463,7 +670,11 @@ def main():
 
     metadata["method"] = "dirotq-absorb-basis" + (
         "" if args.smooth == "none" else f"-smooth-{args.smooth}"
-    )
+    ) + (f"-{args.basis}" if args.basis != "pca" else "") \
+      + ("-clip" if args.clip_search else "") \
+      + ("-refit" if args.refit_lora else "") \
+      + (f"-alt{args.alt_iters}" if args.alt_iters > 1 else "") \
+      + ("-bc" if args.bias_correct else "")
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     save_file(tensors, args.out, metadata=metadata)
     print("saved:", args.out)
