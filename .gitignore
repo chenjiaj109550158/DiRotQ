@@ -13,3 +13,6 @@ __pycache__/
 # Logs
 logs/*
 *.log
+models/*/calibration_dataset/
+models/*/basis/
+models/*/absorb_basis/

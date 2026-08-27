@@ -153,7 +153,8 @@ def pack_top_scale_per_channel(packer: NunchakuWeightPacker, top: torch.Tensor):
 @torch.no_grad()
 def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
                 group_size: int, device: str, gptq: bool,
-                damp_pct: float, block_size: int):
+                damp_pct: float, block_size: int,
+                valref: dict | None = None, valref_key: str = ""):
     """Returns dict of replacement tensors for one nunchaku layer."""
     W = W.to(device=device, dtype=torch.float32)
     U = U.to(device=device, dtype=torch.float32)  # [ic, r]
@@ -208,6 +209,13 @@ def build_layer(W: torch.Tensor, H: torch.Tensor, U: torch.Tensor, kind: str,
     else:
         out["wtscale"] = top.reshape(1).to(torch.bfloat16).cpu()
 
+    if valref is not None:
+        valref[valref_key] = {
+            "W_q": W_q.half().cpu(),          # dequantized residual on the kernel grid
+            "U": U.half().cpu(),              # [ic, r] lora_down (unpacked)
+            "lora_up": lora_up.half().cpu(),  # [oc, r] (unpacked)
+        }
+
     # quantization SNR of the full layer (lora + quantized residual) vs W
     W_hat = W_q + lora_up @ U.t()
     err = (W_hat - W).pow(2).sum()
@@ -252,6 +260,16 @@ def main():
     print("loading covariances/basis:", args.cov)
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
 
+    VALREF_LAYERS = {
+        "transformer_blocks.0.qkv_proj",
+        "transformer_blocks.7.mlp_fc1",
+        "transformer_blocks.18.out_proj",
+        "single_transformer_blocks.0.qkv_proj",
+        "single_transformer_blocks.20.out_proj",
+        "single_transformer_blocks.37.mlp_fc1",
+    }
+    valrefs = {}
+
     table = layer_table(args.num_double, args.num_single)
     qsnrs = {}
     t0 = time.time()
@@ -265,6 +283,8 @@ def main():
         repl, qsnr = build_layer(
             W, H, U, kind, args.group_size, "cuda",
             gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
+            valref=valrefs if nk_prefix in VALREF_LAYERS else None,
+            valref_key=nk_prefix,
         )
         qsnrs[nk_prefix] = qsnr
         for name, t in repl.items():
@@ -289,6 +309,8 @@ def main():
     print("saved:", args.out)
     with open(args.out + ".qsnr.json", "w") as f:
         json.dump(qsnrs, f, indent=2)
+    torch.save(valrefs, args.out + ".valref.pt")
+    print("saved validation refs:", args.out + ".valref.pt")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,59 @@
+{
+  "protocol": {
+    "model": "FLUX.1-schnell",
+    "dataset": "MJHQ-32 (deepcompressor sampling, per-filename hash seeds)",
+    "steps": 4,
+    "guidance_scale": 0.0,
+    "resolution": 1024,
+    "batch_size": 1,
+    "gpu": "RTX 5090 (sm_120)",
+    "kernel": "nunchaku 1.2.1 fp4 (Blackwell)",
+    "bf16_reference": "deepcompressor eval.generate (SVDQuant repo code), fmeuler4-g0"
+  },
+  "svdquant_nvfp4": {
+    "quality_vs_bf16": {
+      "psnr": 19.21879005432129,
+      "lpips": 0.22843775153160095,
+      "ssim": 0.7466168403625488
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 159.07034301757812,
+      "lat_ms_mean": 159.96990835666656,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8556728358128112,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  },
+  "dirotq_absorb_basis_nvfp4": {
+    "quality_vs_bf16": {
+      "psnr": 19.122188568115234,
+      "lpips": 0.23018130660057068,
+      "ssim": 0.7435687184333801
+    },
+    "transformer": {
+      "transformer_load_mem": {
+        "device_used_delta_gib": 6.5546875,
+        "torch_alloc_delta_gib": 0.1008763313293457
+      },
+      "num_forwards": 128,
+      "lat_ms_median": 158.961669921875,
+      "lat_ms_mean": 159.90737748146057,
+      "entry_alloc_gib_max": 9.385075569152832,
+      "peak_alloc_gib_max": 9.460564136505127,
+      "forward_act_overhead_gib_max": 0.07548856735229492,
+      "image_wall_s_mean": 0.8554387145002238,
+      "num_steps": 4,
+      "guidance_scale": 0.0,
+      "batch_size": 1
+    }
+  }
+}
