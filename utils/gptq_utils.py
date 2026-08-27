@@ -274,7 +274,7 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
 @torch.no_grad()
 def _gptq_quantize_layer(W, H, bits, groupsize, sym,
                           damp_pct, block_size, num_inv_tries, device,
-                          nvfp4=False):
+                          nvfp4=False, scales_override=None):
     """
     Apply GPTQ to a single weight matrix.
 
@@ -287,6 +287,11 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
         num_inv_tries: max Cholesky retry attempts.
         device: compute device.
         nvfp4: if True, use NF4 codebook rounding instead of INT4.
+        scales_override: optional [out_features, n_groups] float tensor of
+             per-group scales to use verbatim (zeros forced to 0 / symmetric).
+             Used by DiRotQ-absorb-basis to pass two-level NVFP4 scales
+             (e4m3-rounded micro-scale x per-tensor/per-channel top scale) so
+             the GPTQ grid exactly matches what the nunchaku kernel dequants.
 
     Returns:
         W_q: [out_features, in_features] float32 dequantized weight,
@@ -304,7 +309,14 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
     # Pre-compute per-group scales from the original (unpermuted) W.
     # These scales are kept fixed throughout the GPTQ loop.
     # Handles partial last group by zero-padding to next multiple of groupsize.
-    if groupsize > 0 and groupsize < in_features:
+    if scales_override is not None:
+        assert groupsize > 0
+        n_groups = (in_features + groupsize - 1) // groupsize
+        assert scales_override.shape == (out_features, n_groups), \
+            f"scales_override {tuple(scales_override.shape)} != {(out_features, n_groups)}"
+        scales = scales_override.to(device=device, dtype=torch.float32).clamp(min=1e-8)
+        zeros = torch.zeros_like(scales)
+    elif groupsize > 0 and groupsize < in_features:
         pad = (-in_features) % groupsize
         W_for_scale = torch.nn.functional.pad(W, (0, pad)) if pad > 0 else W
         n_groups = W_for_scale.shape[1] // groupsize

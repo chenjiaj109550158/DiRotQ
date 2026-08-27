@@ -255,6 +255,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size",          type=int,   default=1)
     parser.add_argument("--image-size",          type=int,   default=1024)
     parser.add_argument("--max-sequence-length", type=int,   default=256)
+    parser.add_argument("--cpu-offload", action="store_true",
+                        help="Use enable_model_cpu_offload() instead of .to('cuda') "
+                             "(needed when the full bf16 pipeline exceeds VRAM, e.g. 32 GB).")
     args = parser.parse_args()
 
     prompts, filenames = load_prompts(args.prompts, args.num_samples)
@@ -269,7 +272,11 @@ if __name__ == "__main__":
     print(f"Loading {args.model_id} in bf16...")
     pipe = FluxPipeline.from_pretrained(
         args.model_id, torch_dtype=torch.bfloat16
-    ).to("cuda")
+    )
+    if args.cpu_offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to("cuda")
     pipe.transformer.eval()
     pipe.transformer.requires_grad_(False)
 
