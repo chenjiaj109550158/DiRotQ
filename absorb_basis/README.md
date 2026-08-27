@@ -147,3 +147,26 @@ winning configuration is exactly:
 
     python absorb_basis/build_checkpoint.py --basis hsvd \
         --out models/flux-schnell/absorb_basis/dirotq-absorb-ablate-hsvd-fp4_r32-flux.1-schnell.safetensors
+
+## Down-projection absorb (--down-absorb)
+
+The K=12288 down-projections (mlp_fc2 / mlp_context_fc2 / single-block MLP
+half of the fused proj_out), previously copied verbatim from SVDQuant, are
+also rebuilt with absorb-basis + H-SVD (`collect_cov_down.py` gathers the 76
+12288-dim input covariances in chunked GPU passes; hsvd_basis uses a Cholesky
+square root, tractable at this size).
+
+| Variant                                   | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+| ----------------------------------------- | ------ | ------- | ------ |
+| SVDQuant NVFP4 (official)                 | 19.22  | 0.2284  | 0.7466 |
+| absorb-basis H-SVD (down = SVDQuant copy) | 19.29  | 0.2234  | 0.7558 |
+| **absorb-basis H-SVD + down-absorb**      | **19.37** | **0.2185** | 0.7543 |
+
+Best configuration overall (PSNR +0.15, LPIPS -0.010 vs SVDQuant; identical
+memory and latency). Note the down layers' *unweighted* weight-QSNR looks
+alarming (mlp_context_fc2 down to 5.5 dB) — the H-metric deliberately
+sacrifices channels with near-zero GELU activations — yet kernel-level
+rel_err (~7.6%) and end-to-end quality confirm the allocation is right:
+another instance of unweighted local metrics being misleading.
+
+    python absorb_basis/build_checkpoint.py --basis hsvd --down-absorb
