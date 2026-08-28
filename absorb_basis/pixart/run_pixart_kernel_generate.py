@@ -83,9 +83,15 @@ def inject_kernel(transformer, packed_dict):
             lin.proj_up.copy_(t["lora_up"].to("cuda", torch.float16))
             if old.bias is not None:
                 # the kernel epilogue reads the bias in nunchaku's packed
-                # (pack_scale) channel order — store it permuted
-                b = old.bias.detach().to("cuda", torch.float16)
-                lin.bias.copy_(b[pack_perm_vector(oc).to(b.device)])
+                # (pack_scale) channel order. A checkpoint may carry an
+                # already-packed bias (e.g. converted SVDQuant, where the
+                # shift-folded bias lives in the dict); otherwise permute
+                # the fp16 model's bias.
+                if "bias" in t and t["bias"] is not None:
+                    lin.bias.copy_(t["bias"].view(-1).to("cuda", torch.float16))
+                else:
+                    b = old.bias.detach().to("cuda", torch.float16)
+                    lin.bias.copy_(b[pack_perm_vector(oc).to(b.device)])
         lin.wtscale = float(t["wtscale"])
         if parts[-1].isdigit():
             parent[int(parts[-1])] = lin
