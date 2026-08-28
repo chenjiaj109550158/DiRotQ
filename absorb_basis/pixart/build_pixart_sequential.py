@@ -7,19 +7,24 @@ the activation stream that has already passed through the QUANTIZED blocks
 0..i-1, so H-SVD and GPTQ compensate upstream quantization error.
 
 Implementation:
-  1. One full-model fp16 pass over all calibration caches, capturing the
-     inputs of transformer_blocks[0] (hidden + shared kwargs). PixArt passes
-     identical kwargs to every block, so the captured kwargs serve all blocks.
-  2. For each block: (a) forward the stored stream through the fp16 block with
-     covariance hooks; (b) hsvd+GPTQ its 8 quantized linears (cross-attn KV
-     stays fp16, aligned with SVDQuant's attn_add skip) and swap them for
+  1. One pass over all calibration caches, running the model front-end and
+     capturing the inputs of transformer_blocks[0] (hidden + shared kwargs).
+     PixArt passes identical kwargs to every block, so the captured kwargs
+     serve all blocks. The hidden stream ([N, 4096, 1152] fp16, ~48 GB for
+     the full 5120-cache set) does not fit in RAM, so it lives in two
+     alternating disk memmaps under --scratch-dir; the small kwargs stay in
+     RAM.
+  2. For each block: (a) forward the stored stream through the fp16 block
+     with covariance hooks; (b) hsvd+GPTQ its 8 quantized linears (cross-attn
+     KV stays fp16, aligned with SVDQuant's attn_add skip) and swap them for
      SimW4A4Linear (weight AND activation quantization simulated, nunchaku
-     semantics); (c) forward the stream through the quantized block to produce
-     the next block's input.
+     semantics); (c) forward the stream through the quantized block into the
+     other memmap to produce the next block's input.
   3. Save the same sim-weights dict format as build_pixart_sim.py.
 
 Run in the svdquant env:
-  python build_pixart_sequential.py --calib-dir <caches> --out <sim.pt>
+  python build_pixart_sequential.py --calib-dir <caches> --out <sim.pt> \
+      --scratch-dir <dir with ~100 GB free>
 """
 
 import argparse
@@ -30,6 +35,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -39,7 +45,7 @@ sys.path.insert(0, str(_ROOT))
 from absorb_basis.build_checkpoint import hsvd_basis, quantize_residual
 from absorb_basis.pixart.run_pixart_sim_generate import SimW4A4Linear
 
-BLOCK_LAYERS = [  # (module path within block, cov key, hook module path)
+BLOCK_LAYERS = [  # (module path within block, cov key)
     ("attn1.to_q", "attn1_qkv"),
     ("attn1.to_k", "attn1_qkv"),
     ("attn1.to_v", "attn1_qkv"),
@@ -57,6 +63,10 @@ HOOK_POINTS = [  # (cov key, module path of the linear whose input we tap, dim)
     ("ffn_up", "ff.net.0.proj", 1152),
     ("ffn_down", "ff.net.2", 4608),
 ]
+
+
+class _StopForward(Exception):
+    pass
 
 
 def get_submodule(root, path):
@@ -81,6 +91,8 @@ def main():
     ap.add_argument("--model-id", default="PixArt-alpha/PixArt-Sigma-XL-2-1024-MS")
     ap.add_argument("--calib-dir", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--scratch-dir", required=True,
+                    help="holds two [N,tokens,1152] fp16 memmaps (~2x9.4MB per cache)")
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--damp", type=float, default=0.01)
@@ -103,29 +115,43 @@ def main():
     if args.max_files > 0:
         files = files[: args.max_files]
     assert files
-    print(f"{len(files)} calibration caches")
+    n = len(files)
+    print(f"{n} calibration caches")
 
-    # ---- stage 1: capture block-0 inputs (hidden + shared kwargs) ----------
-    hiddens, kw_enc, kw_mask, kw_temb = [], [], [], []
-    other_kwargs = {}
+    # ---- stage 1: capture block-0 inputs (hidden -> memmap, kwargs -> RAM) --
+    os.makedirs(args.scratch_dir, exist_ok=True)
+    stream_paths = [os.path.join(args.scratch_dir, f"seq_stream_{i}.f16") for i in (0, 1)]
+    state = {"stream": None, "enc": None, "mask": None, "temb": None, "i": 0}
 
     def cap_hook(module, hargs, hkwargs):
-        hiddens.append(hargs[0].half().cpu())
-        kw_enc.append(hkwargs["encoder_hidden_states"].half().cpu())
-        m = hkwargs.get("encoder_attention_mask")
-        kw_mask.append(m.half().cpu() if m is not None else None)
-        t = hkwargs.get("timestep")
-        kw_temb.append(t.half().cpu() if t is not None else None)
-        for k, v in hkwargs.items():
-            if k not in ("encoder_hidden_states", "encoder_attention_mask", "timestep"):
-                other_kwargs[k] = v if not isinstance(v, torch.Tensor) else None
+        assert not hargs[1:] and "encoder_hidden_states" in hkwargs, (
+            f"unexpected block call convention: args={len(hargs)}, kwargs={list(hkwargs)}"
+        )
+        i = state["i"]
+        h = hargs[0]
+        if state["stream"] is None:  # first file: allocate from observed shapes
+            state["tok"], state["dim"] = h.shape[1], h.shape[2]
+            state["stream"] = np.memmap(stream_paths[0], dtype=np.float16, mode="w+",
+                                        shape=(n, h.shape[1], h.shape[2]))
+            for k in ("encoder_hidden_states", "encoder_attention_mask", "timestep"):
+                v = hkwargs.get(k)
+                if v is not None:
+                    state[{"encoder_hidden_states": "enc", "encoder_attention_mask": "mask",
+                           "timestep": "temb"}[k]] = torch.empty(n, *v.shape[1:], dtype=torch.float16)
+            extras = {k: v for k, v in hkwargs.items()
+                      if k not in ("encoder_hidden_states", "encoder_attention_mask", "timestep")
+                      and v is not None and not (isinstance(v, dict) and not v)}
+            assert not extras, f"unhandled non-None block kwargs: {list(extras)}"
+        assert h.shape[0] == 1 and h.shape[1] == state["tok"]
+        state["stream"][i] = h[0].half().cpu().numpy()
+        for k, s in (("encoder_hidden_states", "enc"), ("encoder_attention_mask", "mask"),
+                     ("timestep", "temb")):
+            v = hkwargs.get(k)
+            if v is not None:
+                state[s][i] = v[0].half().cpu()
         raise _StopForward
 
-
-    class _StopForward(Exception):
-        pass
-
-    h = transformer.transformer_blocks[0].register_forward_pre_hook(cap_hook, with_kwargs=True)
+    hcap = transformer.transformer_blocks[0].register_forward_pre_hook(cap_hook, with_kwargs=True)
 
     def to_dev(x):
         if isinstance(x, torch.Tensor):
@@ -135,13 +161,19 @@ def main():
     for f in tqdm(files, desc="capture", dynamic_ncols=True):
         data = torch.load(f, map_location="cpu", weights_only=False)
         try:
-            transformer(*tree_map(to_dev, data["input_args"]), **tree_map(to_dev, data["input_kwargs"]))
+            transformer(*tree_map(to_dev, data["input_args"]),
+                        **tree_map(to_dev, data["input_kwargs"]))
         except _StopForward:
             pass
-    h.remove()
-    n = len(hiddens)
-    assert n == len(files)
-    print(f"captured {n} block-0 inputs; other block kwargs: {other_kwargs}")
+        state["i"] += 1
+    hcap.remove()
+    assert state["i"] == n and state["stream"] is not None
+    state["stream"].flush()
+    cur = state["stream"]
+    print(f"captured {n} block-0 inputs: tokens={state['tok']}, "
+          f"enc={None if state['enc'] is None else tuple(state['enc'].shape)}, "
+          f"mask={None if state['mask'] is None else tuple(state['mask'].shape)}, "
+          f"temb={None if state['temb'] is None else tuple(state['temb'].shape)}")
 
     # ---- stage 2: sequential per-block calibrate -> quantize -> propagate --
     sim_out, qsnrs = {}, {}
@@ -166,24 +198,21 @@ def main():
         for key, mpath, _ in HOOK_POINTS:
             hooks.append(get_submodule(blk, mpath).register_forward_pre_hook(mk(key)))
 
-        def block_forward_all(store_output: bool):
-            outs = [] if store_output else None
+        def block_forward_all(dst):
             for c0 in range(0, n, args.chunk):
                 c1 = min(c0 + args.chunk, n)
-                hs = torch.cat(hiddens[c0:c1], dim=0).to("cuda", torch.float16)
-                kw = {"encoder_hidden_states": torch.cat(kw_enc[c0:c1], dim=0).to("cuda", torch.float16)}
-                if kw_mask[0] is not None:
-                    kw["encoder_attention_mask"] = torch.cat(kw_mask[c0:c1], dim=0).to("cuda", torch.float16)
-                if kw_temb[0] is not None:
-                    kw["timestep"] = torch.cat(kw_temb[c0:c1], dim=0).to("cuda", torch.float16)
+                hs = torch.from_numpy(np.ascontiguousarray(cur[c0:c1])).to("cuda")
+                kw = {"encoder_hidden_states": state["enc"][c0:c1].to("cuda")}
+                if state["mask"] is not None:
+                    kw["encoder_attention_mask"] = state["mask"][c0:c1].to("cuda")
+                if state["temb"] is not None:
+                    kw["timestep"] = state["temb"][c0:c1].to("cuda")
                 y = blk(hs, **kw)
                 y = y[0] if isinstance(y, tuple) else y
-                if store_output:
-                    for j in range(c1 - c0):
-                        outs.append(y[j:j + 1].half().cpu())
-            return outs
+                if dst is not None:
+                    dst[c0:c1] = y.half().cpu().numpy()
 
-        block_forward_all(store_output=False)
+        block_forward_all(dst=None)
         for hk in hooks:
             hk.remove()
 
@@ -221,7 +250,10 @@ def main():
 
         # (c) propagate the stream through the quantized block
         if bi < num_blocks - 1:
-            hiddens = block_forward_all(store_output=True)
+            nxt = np.memmap(stream_paths[(bi + 1) % 2], dtype=np.float16, mode="w+",
+                            shape=(n, state["tok"], state["dim"]))
+            block_forward_all(dst=nxt)
+            cur = nxt
         torch.cuda.empty_cache()
 
     print(f"sequential quantization done in {time.time()-t0:.0f}s")
@@ -235,6 +267,9 @@ def main():
     with open(args.out + ".qsnr.json", "w") as f:
         json.dump(qsnrs, f, indent=2)
     print("saved:", args.out)
+    for p in stream_paths:
+        if os.path.exists(p):
+            os.remove(p)
 
 
 if __name__ == "__main__":
