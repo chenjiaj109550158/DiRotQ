@@ -535,6 +535,8 @@ def main():
                          "--cov-down-dir covariances")
     ap.add_argument("--cov-down-dir", default="models/flux-schnell/basis/absorb_cov_down")
     ap.add_argument("--damp", type=float, default=0.01)
+    ap.add_argument("--hsvd-damping", type=float, default=0.01,
+                    help="damping for the H-SVD basis (PLAN item B)")
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
     ap.add_argument("--num-single", type=int, default=38)
@@ -623,7 +625,8 @@ def main():
         if args.smooth == "none":
             Wg = W.to("cuda", torch.float32)
             if args.basis == "hsvd":
-                D, lu0 = hsvd_basis(Wg, H, args.rank, "cuda")
+                D, lu0 = hsvd_basis(Wg, H, args.rank, "cuda",
+                                    damping=args.hsvd_damping)
             else:
                 Ug = cov[cov_key][:, -args.rank:].to("cuda", torch.float32)
                 D, lu0 = Ug.t(), Wg @ Ug
