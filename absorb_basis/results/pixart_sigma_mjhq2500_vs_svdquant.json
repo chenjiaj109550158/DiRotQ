@@ -1,0 +1,37 @@
+{
+  "protocol": {
+    "model": "PixArt-Sigma-XL-2-1024-MS",
+    "dataset": "MJHQ-2500 (deepcompressor sampling)",
+    "steps": 20,
+    "guidance_scale": 4.5,
+    "scheduler": "dpm",
+    "dtype": "fp16",
+    "mode": "fake-quant simulation, both methods (PixArt has no nunchaku support; same protocol as SVDQuant paper's PixArt numbers)",
+    "format": "NVFP4 (E2M1 g16 + fp8 e4m3 micro-scales), W4A4, rank-32 low-rank branch",
+    "svdquant": "deepcompressor native pipeline, official pixart-sigma.yaml + svdquant/nvfp4.yaml (smooth grid-search + 100-iter lowrank + calib_range; sample_batch_size 32 for 32GB VRAM)",
+    "absorb": "H-SVD basis + GPTQ + down-absorb; skips aligned incl. cross-attn KV fp16 (attn_add)",
+    "reference": "fp16 via deepcompressor ptq (their code)"
+  },
+  "svdquant_nvfp4": {
+    "similarity_vs_ref": {
+      "psnr": 17.951852798461914,
+      "lpips": 0.29194527864456177,
+      "ssim": 0.6756901741027832
+    },
+    "fid": {
+      "fid_vs_ref": 19.92677352630875,
+      "fid_vs_gt": 28.453822957733678
+    }
+  },
+  "dirotq_absorb_hsvd_down": {
+    "similarity_vs_ref": {
+      "psnr": 18.032901763916016,
+      "lpips": 0.29299086332321167,
+      "ssim": 0.6745320558547974
+    },
+    "fid": {
+      "fid_vs_ref": 20.62506420010169,
+      "fid_vs_gt": 28.539048025568945
+    }
+  }
+}
