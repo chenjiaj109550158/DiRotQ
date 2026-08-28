@@ -114,6 +114,22 @@ variant 與現行最佳直接對比；不要同時改多個東西。
   再次印證局部指標不可信。成本高（~1.6h/次）收益零，暫時關閉；若之後
   與 λ=0.1 組合想重試，改動單一變因即可（`build_pixart_sequential.py
   --hsvd-damping 0.1`）。
-- 待辦：λ=0.1 上 PixArt MJHQ-2500 對 SVDQuant 正式確認；FLUX 端
-  λ∈{0.1, 0.003} 真量化（nunchaku kernel）MJHQ-500 排名進行中
-  （`run_flux_damping.sh`）。
+- 待辦：λ=0.1 上 PixArt MJHQ-2500 對 SVDQuant 正式確認。
+
+## 結果（2026-08-28，FLUX-schnell MJHQ-500，真量化 nunchaku kernel，vs bf16 ref）
+
+`run_flux_damping.sh`；數據在 `results/flux_damping_mjhq500.json`。
+
+| 配置 | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+|---|---|---|---|
+| SVDQuant NVFP4 | 18.74 | 0.2311 | 0.7444 |
+| baseline（λ=0.01） | 18.80 | 0.2284 | 0.7454 |
+| λ=0.1 | 18.86 | 0.2278 | 0.7458 |
+| **λ=0.003（勝者）** | **18.90** | **0.2270** | **0.7473** |
+
+- **B 在 FLUX 上同樣有效**：兩個掃描點都三項贏 baseline，領先 SVDQuant 的
+  幅度進一步拉大。
+- **最佳 λ 跨模型不同**（PixArt→0.1、FLUX→0.003），damping 必須 per-model
+  掃描，不可遷移 —— 論文敘事中 λ 應列為 per-model 超參數（SVDQuant 的
+  smooth-α 網格搜尋同理，這樣對比是公平的）。
+- 待辦：FLUX λ=0.003 上 MJHQ-1000 五指標（含 FID）正式確認。
