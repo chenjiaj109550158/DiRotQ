@@ -1,9 +1,10 @@
 """Build DiRotQ-absorb-basis (H-SVD, rank 32, GPTQ, NVFP4 two-level grid,
 down-absorb) simulated-quantization weights for PixArt-Sigma.
 
-Quantized layers = the 280 block linears (attn1 q/k/v/out, attn2 q/k/v/out,
-ff up/down), matching SVDQuant's pixart-sigma skips (adaln_single,
-caption_projection, proj_out and all embeds stay fp16).
+Quantized layers = the 224 block linears (attn1 q/k/v/out, attn2 q/out,
+ff up/down), matching SVDQuant's pixart-sigma skips exactly (adaln_single,
+caption_projection, proj_out, all embeds AND cross-attn to_k/to_v stay fp16;
+the last is their "attn_add" skip, verified from their quantization log).
 
 Output: dict {diffusers_module_path: {"W_q": fp16 [oc,ic] (dequantized residual
 on the NVFP4 grid), "lora_down": fp16 [ic,32], "lora_up": fp16 [oc,32]}}.
@@ -38,9 +39,11 @@ def layer_table(num_blocks: int):
             (f"{p}.attn1.to_k", f"{c}.attn1_qkv"),
             (f"{p}.attn1.to_v", f"{c}.attn1_qkv"),
             (f"{p}.attn1.to_out.0", f"{c}.attn1_out"),
+            # NOTE: attn2.to_k / attn2.to_v (cross-attn KV over the projected
+            # caption) are NOT quantized by SVDQuant on PixArt (their
+            # "attn_add" skip) — verified from their quantization log
+            # (224 = 28 x 8 layers). Keep them fp16 here for alignment.
             (f"{p}.attn2.to_q", f"{c}.attn2_q"),
-            (f"{p}.attn2.to_k", f"{c}.attn2_kv"),
-            (f"{p}.attn2.to_v", f"{c}.attn2_kv"),
             (f"{p}.attn2.to_out.0", f"{c}.attn2_out"),
             (f"{p}.ff.net.0.proj", f"{c}.ffn_up"),
             (f"{p}.ff.net.2", f"{c}.ffn_down"),

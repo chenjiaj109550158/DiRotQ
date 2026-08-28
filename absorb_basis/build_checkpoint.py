@@ -257,8 +257,12 @@ def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
             damp_pct=damp_pct, block_size=block_size, num_inv_tries=8,
             device=device, nvfp4=True, scales_override=eff,
         )
-        assert W_q is not None, "GPTQ failed after retries"
-    else:  # RTN on the same grid
+        if W_q is None:
+            # ill-conditioned Hessian (e.g. near-zero-variance cross-attn
+            # outputs): fall back to RTN on the same grid
+            print("[warn] GPTQ failed after retries; falling back to RTN for this layer")
+            gptq = False
+    if not gptq:  # RTN on the same grid
         ng = ic // group_size
         Wg = W_res.reshape(oc, ng, group_size) / eff.unsqueeze(-1)
         from utils.quant_utils import round_to_nf4_codebook
@@ -365,11 +369,22 @@ def hsvd_basis(W: torch.Tensor, H: torch.Tensor, rank: int, device: str,
     Returns (D [r, ic], lora_up [oc, r]) with L = lora_up @ D.
     """
     Hd = H.to(device=device, dtype=torch.float64)
-    Hd = Hd + damping * Hd.diagonal().mean() * torch.eye(
-        Hd.shape[0], dtype=Hd.dtype, device=device
-    )
-    # Cholesky square root H = C C^T (much faster than eigh at ic = 12288)
-    C = torch.linalg.cholesky(Hd)                               # lower [ic, ic]
+    Hd = 0.5 * (Hd + Hd.t())  # symmetrize (fp32 accumulation noise)
+    # Cholesky square root H = C C^T (much faster than eigh at ic = 12288).
+    # Retry with escalating damping if H is numerically rank-deficient
+    # (e.g. dead/near-zero-variance channels).
+    C = None
+    d = damping
+    for _ in range(6):
+        try:
+            C = torch.linalg.cholesky(
+                Hd + d * Hd.diagonal().mean()
+                * torch.eye(Hd.shape[0], dtype=Hd.dtype, device=device)
+            )
+            break
+        except torch._C._LinAlgError:
+            d *= 3.0
+    assert C is not None, "Cholesky failed even with escalated damping"
     M = (W.to(device=device, dtype=torch.float64) @ C).float()  # fp32 SVD (top-r only)
     Us, Ss, Vh = torch.linalg.svd(M, full_matrices=False)
     lora_up = Us[:, :rank] * Ss[:rank].unsqueeze(0)             # [oc, r]

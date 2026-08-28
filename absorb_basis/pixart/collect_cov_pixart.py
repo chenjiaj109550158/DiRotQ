@@ -82,22 +82,26 @@ def main():
     for key, mod in specs:
         hooks.append(mod.register_forward_pre_hook(make_hook(key)))
 
+    import glob
+
     from deepcompressor.utils.common import tree_map
 
-    # batch_size=1 with a squeeze keeps each cache's original shapes (incl. the
-    # CFG batch dim) and lets DiffusionDataset resolve latent/text-emb file refs
-    # and encoder_hidden_states padding exactly as deepcompressor does.
-    dataset = DiffusionDataset(args.calib_dir, num_samples=args.num_samples)
-    loader = dataset.build_loader(batch_size=1, shuffle=False, num_workers=4)
-    print(f"{len(dataset)} calibration caches")
+    # deepcompressor's collect saves .pt caches with fully materialized tensors
+    # (no text-emb file refs for PixArt; encoder_hidden_states already padded
+    # to the attention-mask length) — load and forward them directly.
+    files = sorted(glob.glob(os.path.join(args.calib_dir, "*.pt")))
+    if args.num_samples > 0:
+        files = files[: args.num_samples]
+    assert files, f"no .pt caches in {args.calib_dir}"
+    print(f"{len(files)} calibration caches")
 
     def to_dev(x):
         if isinstance(x, torch.Tensor):
-            x = x.squeeze(0)  # undo collate's batch-of-1 dim
             return x.to("cuda", torch.float16) if x.is_floating_point() else x.to("cuda")
         return x
 
-    for data in tqdm(loader, desc="cov", dynamic_ncols=True):
+    for f in tqdm(files, desc="cov", dynamic_ncols=True):
+        data = torch.load(f, map_location="cpu", weights_only=False)
         input_args = tree_map(to_dev, data["input_args"])
         input_kwargs = tree_map(to_dev, data["input_kwargs"])
         transformer(*input_args, **input_kwargs)
