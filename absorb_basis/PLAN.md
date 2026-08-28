@@ -1,4 +1,8 @@
-# 待辦計畫：absorb + H-SVD + down-absorb 之後的品質優化
+# 計畫：absorb + H-SVD + down-absorb 之後的品質優化
+
+> **狀態更新（2026-08-28）：A、B 已在 PixArt-Σ 上執行完畢，結果見文末。**
+> B（damping 掃描）勝出：λ=0.1 三項全贏 baseline 與 SVDQuant；
+> A（sequential 校準）與 baseline 打平。FLUX 端的 λ 掃描移植進行中。
 
 基準（目前最佳，commit `0894ed7`）：`--basis hsvd --down-absorb`，MJHQ-1000 上
 PSNR 18.91 / LPIPS 0.2278 / SSIM 0.7456 / FID-vs-ref 27.81 / FID-vs-GT 59.73，
@@ -83,3 +87,33 @@ variant 與現行最佳直接對比；不要同時改多個東西。
 2. A：sequential 校準，basis 用 B 的最佳 λ。
 3. 兩者的贏家跑 MJHQ-1000 五指標確認（bf16 reference 與 GT 已備份於
    /vault/dirotq-absorb-backup，重跑只需生成量化側 + metrics）。
+
+---
+
+## 結果（2026-08-28，PixArt-Σ MJHQ-500，fake-quant 模擬，vs fp16 ref）
+
+執行順序與原計畫相反：因當時正在做 PixArt 移植，A、B 先套在 PixArt 上
+（`build_pixart_sim.py --hsvd-damping`、`build_pixart_sequential.py`、
+`run_plan_ab.sh`；數據在 `results/pixart_plan_ab_mjhq500.json`）。
+
+| 配置 | PSNR ↑ | LPIPS ↓ | SSIM ↑ |
+|---|---|---|---|
+| SVDQuant NVFP4 | 17.78 | 0.2929 | 0.6750 |
+| baseline（λ=0.01） | 17.76 | 0.2950 | 0.6732 |
+| λ=0.003 | 17.86 | 0.2923 | 0.6742 |
+| λ=0.03 | 17.71 | 0.2961 | 0.6710 |
+| **λ=0.1（勝者）** | **17.95** | **0.2908** | **0.6803** |
+| A：sequential（λ=0.01） | 17.82 | 0.2949 | 0.6730 |
+
+- **B 有效且翻盤**：λ=0.1 三項全面贏 baseline 與 SVDQuant —— PixArt 在
+  2500 張正式比較原本微幅落後（4/5 項），λ=0.1 在同基準 500 子集轉為全勝。
+  但 λ 的 landscape 非單調（0.03 反而最差），是個噪的旋鈕，跨模型不可假設
+  可遷移，須各自掃描。
+- **A 打平**：sequential 校準（memmap 串流版，5120 caches 全量，97 分鐘）
+  PSNR 略贏、SSIM 略輸 baseline，weight-QSNR 18.86 dB 最高但端到端無感 ——
+  再次印證局部指標不可信。成本高（~1.6h/次）收益零，暫時關閉；若之後
+  與 λ=0.1 組合想重試，改動單一變因即可（`build_pixart_sequential.py
+  --hsvd-damping 0.1`）。
+- 待辦：λ=0.1 上 PixArt MJHQ-2500 對 SVDQuant 正式確認；FLUX 端
+  λ∈{0.1, 0.003} 真量化（nunchaku kernel）MJHQ-500 排名進行中
+  （`run_flux_damping.sh`）。
