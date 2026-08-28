@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--group-size", type=int, default=16)
     ap.add_argument("--damp", type=float, default=0.01)
+    ap.add_argument("--hsvd-damping", type=float, default=0.01,
+                    help="damping for the H-SVD basis (PLAN item B)")
     ap.add_argument("--block-size", type=int, default=128)
     args = ap.parse_args()
 
@@ -79,7 +81,7 @@ def main():
     for wpath, ckey in tqdm(layer_table(num_blocks), dynamic_ncols=True):
         W = sd[f"{wpath}.weight"].to("cuda", torch.float32)
         H = cov[ckey]
-        D, lora_up = hsvd_basis(W, H, args.rank, "cuda")
+        D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
         Hs = H.to("cuda", torch.float32)
         W_q, _, _ = quantize_residual(
