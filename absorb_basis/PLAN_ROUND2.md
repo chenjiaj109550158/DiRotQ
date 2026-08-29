@@ -1,6 +1,6 @@
-# 待辦計畫（第二輪品質優化）：PSNR 與 FID 提升
+# 第二輪品質優化：PSNR 與 FID 提升
 
-狀態：**已規劃、未實作**（2026-08-29 存檔）。
+狀態：**已執行完畢**（2026-08-29/30），結果見文末「執行結果」。
 基準：嚴格協定最終配置（見 PLAN.md）——FLUX λ=0.01 五項全勝 SVDQuant；
 PixArt λ=0.1 近打平（PSNR/SSIM 贏、LPIPS/FID 小輸），PSNR 領先幅度小
 （PixArt +0.11、FLUX +0.09）。
@@ -122,3 +122,37 @@ FLUX 側:任何在 PixArt 勝出的組合,同法移植(clip 的 FLUX 重審一�
 - PTQ4DiT: arXiv 2405.16005；EDA-DM: 2401.04585；QuEST: 2402.03666
 - Timestep-Aware SVDQuant-GPTQ (Wan2.2): arXiv 2605.27003
 - DMQ: ICCV 2025；CBQ: 2312.07950
+
+---
+
+## 執行結果（2026-08-29/30）
+
+**選擇協定**：每項在 qdiff-128（SVDQuant 同款校準 prompts）上以四判準
+（PSNR/LPIPS/SSIM/FID-proxy）對 baseline 排名，勝出才上官方測試集。
+
+### 計畫 S（選擇性 smoothing）— 兩個模型大勝，一個不適用
+
+| 模型 | qdiff-128 選擇 | 官方測試 |
+|---|---|---|
+| PixArt | S 四項全勝 | **五項全勝 SVDQuant**：18.57/0.2718/0.6919/19.57/28.09（原 2:3 → 5:0，PSNR 差距 +0.11→+0.69，兩個 FID 全翻正） |
+| FLUX | S 四項全勝 | 自我改善 4/5：19.10/0.2231/0.7498/27.55/59.93；**對 SVDQuant 五項全勝擴大**（PSNR +0.09→+0.28） |
+| SANA | S/G/SG 皆四項輸 baseline | 不採用（smoothing 增益 +0.48 dB 不敵 weight 側代價） |
+
+層選擇量測：PixArt median +1.03 dB（164/224 層 >+0.3）、FLUX +0.27
+（108/228）、SANA +0.48（101/160）。**最終配置**：PixArt = λ0.1+S、
+FLUX = λ0.01+S、SANA = λ0.003（不變）。
+
+### 計畫 G（act-aware GPTQ）— 關閉
+PixArt 微增益但被 S 蓋過、SG 反而互相干擾；SANA 四項退步。不採用。
+
+### 計畫 C（摺疊增益校正）— 關閉（誠實負結果）
+實作插曲：packed lora_up 的 row 是 tile 混排，通道縮放必須 pack 前摺入
+（--gain-k）;wcscales 語意已驗證（只乘主支路、packed 排列）。
+修正後仍四項退步（PixArt SC vs S、SANA C vs base 皆然）。結論：量化通道
+的乘性收縮是 Wiener 最優增益，靜態拉回會放大噪聲，PSNR 與 FID proxy
+同時受損。PTQD 型校正在本方法（lora 已屏蔽主方向 + S 已治 deadzone）
+的殘餘誤差上沒有可修空間。
+
+### 計畫 R（block 重建）— 未執行
+按計畫準則「若 1/2 已拉開差距可略過」:PixArt/FLUX 已大幅領先。唯一
+候選是 SANA（仍 2:3 近打平）——待決定是否投入（實作 1-2 天）。
