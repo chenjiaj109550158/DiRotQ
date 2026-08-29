@@ -197,3 +197,35 @@ n=128 的端到端 proxy 選粗旋鈕（λ）可靠、選細部權衡解析度�
 kernel 原生支援 smooth 除法、零部署成本；先前否決時判準無 FID）；
 方向 3 = FLUX clip 用新協定重審（8/27 舊結論是在 PCA 基底 + 無 FID 判準
 + MJHQ-32 下做的，參考價值有限）。
+
+## SANA-1.6B 結果（2026-08-29，嚴格協定，真 kernel）
+
+模型 `Lawrence-cj/Sana_1600M_1024px_BF16_diffusers_ch5632`（bf16，
+flowdpm20-g4.5）。SVDQuant 無現成 NVFP4 權重（HF 只有 INT4，且 int4
+kernel 不支援 sm_120）→ 用他們的 code 全程校準 NVFP4（smoothing
+GridSearch 4.5h + lowrank/calib_range 1.8h）並經 save-model dump 轉至
+同一 kernel。SANA 維度（2240）非 128 倍數 → pad-first 打包（先補零對齊
+再量化，kernel-vs-sim 24 dB 驗證）；GLUMBConv 的 1x1 conv 以 channel 維
+linear 處理（4D wrapper）；160 = 20 blocks x 8 層，cross-attn KV 依
+attn_add skip 保持 bf16。SANA 的 `proj.fuse_when_possible = False`（與
+PixArt 不同），轉換時全層保留真實 smooth。
+
+λ 選擇（qdiff-128、四判準含 FID proxy）：**λ*=0.003 四項全勝**
+（19.18/0.1664/0.7461/43.1；0.1 居中、0.01 最差）。三個模型 λ 各異：
+FLUX→0.01、PixArt→0.1、SANA→0.003。
+
+MJHQ-2500 正式賽（`results/sana_final_test2500.json`）—— 近打平（2:3）：
+
+| 指標 | absorb λ=0.003 | SVDQuant |
+|---|---|---|
+| PSNR ↑ | **19.79** | 19.76 |
+| LPIPS ↓ | 0.1630 | **0.1624** |
+| SSIM ↑ | 0.7425 | **0.7426** |
+| FID vs ref ↓ | 10.71 | **10.41** |
+| FID vs GT ↓ | **27.15** | 27.22 |
+
+Kernel parity 實測：兩者 transformer 1.268 GiB（bf16 2.997 GiB，2.36x）、
+median forward 37.86 vs 38.04 ms（batch-2 CFG、1024px、RTX 5090）。
+transformer 輸出 QSNR vs bf16：ours 27.9 dB / svdq 轉換 27.3 dB。
+FID-ref 落後模式與 PixArt 相同（軟化機制），PLAN_ROUND2 的 S/G/C/R
+同樣適用於 SANA。
