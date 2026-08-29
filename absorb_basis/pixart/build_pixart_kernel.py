@@ -49,6 +49,12 @@ def main():
     ap.add_argument("--hsvd-damping", type=float, default=0.1,
                     help="PixArt PLAN-B winner default")
     ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--clip-search", action="store_true",
+                    help="per-group Hessian-diag-weighted clip-ratio search "
+                         "for the micro-scales (finer grid preserves small "
+                         "high-frequency weight components)")
+    ap.add_argument("--clip-grid", type=float, nargs=3, default=[0.8, 1.0, 21],
+                    metavar=("LO", "HI", "N"))
     args = ap.parse_args()
 
     from diffusers import PixArtTransformer2DModel
@@ -69,9 +75,16 @@ def main():
         H = cov[ckey]
         D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
+        Hg = H.to("cuda", torch.float32)
+        clip_kw = {}
+        if args.clip_search:
+            lo, hi, n = args.clip_grid
+            clip_kw = {"hdiag": Hg.diagonal().clone(),
+                       "clip_ratios": torch.linspace(lo, hi, int(n))}
         W_q, top, micro = quantize_residual(
-            W_res, H.to("cuda", torch.float32), "plain", args.group_size, "cuda",
+            W_res, Hg, "plain", args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
+            **clip_kw,
         )
         packed = pack_layer(
             W_q.half(), top, micro, D.half(), lora_up.half(),
