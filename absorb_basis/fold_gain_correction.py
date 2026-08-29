@@ -120,23 +120,22 @@ def main():
     for h in hooks:
         h.remove()
 
-    ks = []
-    for lp, t in ckpt.items():
+    # NOTE: the packed lora_up rows are tile-interleaved (verified: neither
+    # model-order nor perm-order row scaling reproduces per-channel output
+    # scaling), so the lora half of the correction must be folded PRE-PACK.
+    # This tool therefore only exports k (model channel order); the builders
+    # consume it via --gain-k and fold 1/k into lora_up before packing +
+    # wcscales after packing.
+    ks, kout = [], {}
+    for lp in ckpt:
         qy, yy = acc[lp]
         eps = float(yy.mean()) * EPS_FRAC
-        k = ((qy + eps) / (yy + eps)).clamp(*CLAMP).float()   # [oc]
+        k = ((qy + eps) / (yy + eps)).clamp(*CLAMP).float()   # [oc], model order
         ks.append(float(k.mean()))
-        oc = k.shape[0]
-        oc_p = t["lora_up"].shape[0] if "oc_p" not in t else t["oc_p"]
-        inv = (1.0 / k)
-        inv_p = F.pad(inv, (0, oc_p - oc), value=1.0)
-        perm = pack_perm_vector(oc_p).cuda()
-        wdt = t["lora_up"].dtype
-        t["wcscales"] = inv_p[perm].to(wdt).cpu()
-        t["lora_up"] = (t["lora_up"].float().cuda() * inv_p.unsqueeze(1)).to(wdt).cpu()
-    torch.save(ckpt, CKPT_OUT)
+        kout[lp] = k.cpu()
+    torch.save(kout, CKPT_OUT)
     import statistics
-    print(json.dumps({"ckpt": CKPT_OUT, "layers": len(ckpt),
+    print(json.dumps({"k_file": CKPT_OUT, "layers": len(kout),
                       "mean_k_median": round(statistics.median(ks), 5),
                       "mean_k_min": round(min(ks), 5)}))
 

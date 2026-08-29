@@ -65,6 +65,10 @@ def main():
                     help="PLAN_ROUND2 G: alternate covariance file (collected "
                          "in the act-quantized input domain) used for GPTQ; "
                          "the H-SVD basis always uses the raw --cov")
+    ap.add_argument("--gain-k", default=None,
+                    help="PLAN_ROUND2 C: per-layer per-channel gain file from "
+                         "fold_gain_correction.py; folds 1/k into lora_up "
+                         "(pre-pack) and wcscales (post-pack)")
     args = ap.parse_args()
 
     from diffusers import PixArtTransformer2DModel
@@ -79,6 +83,8 @@ def main():
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
     cov_g = (torch.load(args.gptq_cov, map_location="cpu", weights_only=False)
              if args.gptq_cov else None)
+    gain_k = (torch.load(args.gain_k, map_location="cpu", weights_only=False)
+              if args.gain_k else None)
 
     table = layer_table(num_blocks)
     smoothed_hooks = {}
@@ -125,10 +131,18 @@ def main():
         )
         s_pack = (s if s is not None
                   else torch.ones(W.shape[1], device="cuda", dtype=torch.float32))
+        inv_k = None
+        if gain_k is not None and wpath in gain_k:
+            inv_k = (1.0 / gain_k[wpath].to("cuda", torch.float32))
+        lu_pack = lora_up * inv_k.unsqueeze(1) if inv_k is not None else lora_up
         packed = pack_layer(
-            W_q.half(), top, micro, D.half(), lora_up.half(),
+            W_q.half(), top, micro, D.half(), lu_pack.half(),
             s_pack.half(), "plain", "cuda",
         )
+        if inv_k is not None:
+            from absorb_basis.build_checkpoint import pack_perm_vector
+            perm = pack_perm_vector(inv_k.shape[0]).cuda()
+            packed["wcscales"] = inv_k[perm].half().cpu()
         # pack_layer emits bf16 side tensors (FLUX convention); PixArt runs fp16
         out[wpath] = {
             "qweight": packed["qweight"],
@@ -139,6 +153,8 @@ def main():
             "lora_up": packed["lora_up"].half(),
             "wtscale": float(packed["wtscale"].float()),
         }
+        if "wcscales" in packed:
+            out[wpath]["wcscales"] = packed["wcscales"]
         W_hat = (W_q / s.unsqueeze(0) if s is not None else W_q) + lora_up @ D
         err = (W_hat - W).pow(2).sum()
         qsnrs[wpath] = (10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))).item()

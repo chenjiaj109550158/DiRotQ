@@ -72,6 +72,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--gptq-cov", default=None,
                     help="PLAN_ROUND2 G: act-quant-domain covariances for GPTQ")
+    ap.add_argument("--gain-k", default=None,
+                    help="PLAN_ROUND2 C: per-layer per-channel gain file; "
+                         "folds 1/k into lora_up (pre-pack) + wcscales")
     args = ap.parse_args()
 
     from diffusers import SanaTransformer2DModel
@@ -87,6 +90,8 @@ def main():
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
     cov_g = (torch.load(args.gptq_cov, map_location="cpu", weights_only=False)
              if args.gptq_cov else None)
+    gain_k = (torch.load(args.gain_k, map_location="cpu", weights_only=False)
+              if args.gain_k else None)
 
     table = layer_table(num_blocks)
     smoothed_hooks = {}
@@ -138,11 +143,19 @@ def main():
         lu_p = F.pad(lora_up, (0, 0, 0, oc_p - oc))
         s_pack = (F.pad(s, (0, ic_p - ic), value=1.0) if s is not None
                   else torch.ones(ic_p, device="cuda", dtype=torch.float32))
+        inv_k = None
+        if gain_k is not None and wpath in gain_k:
+            inv_k = F.pad(1.0 / gain_k[wpath].to("cuda", torch.float32),
+                          (0, oc_p - oc), value=1.0)
+            lu_p = lu_p * inv_k.unsqueeze(1)
         packed = pack_layer(
             W_qp.to(torch.bfloat16), top, micro,
             D_p.to(torch.bfloat16), lu_p.to(torch.bfloat16),
             s_pack.to(torch.bfloat16), "plain", "cuda",
         )
+        if inv_k is not None:
+            from absorb_basis.build_checkpoint import pack_perm_vector
+            packed["wcscales"] = inv_k[pack_perm_vector(oc_p).cuda()].to(torch.bfloat16).cpu()
         out[wpath] = {
             "qweight": packed["qweight"],
             "wscales": packed["wscales"],
@@ -153,6 +166,8 @@ def main():
             "wtscale": float(packed["wtscale"].float()),
             "oc": oc, "ic": ic, "oc_p": oc_p, "ic_p": ic_p,
         }
+        if "wcscales" in packed:
+            out[wpath]["wcscales"] = packed["wcscales"]
         Wq_raw = W_qp[:oc, :ic] / s.unsqueeze(0) if s is not None else W_qp[:oc, :ic]
         W_hat = Wq_raw + lora_up @ D
         err = (W_hat - W).pow(2).sum()
