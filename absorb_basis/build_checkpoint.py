@@ -309,9 +309,12 @@ def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
                    alt_iters: int = 1, refit: bool = False,
                    clip_ratios: torch.Tensor | None = None,
                    mu: torch.Tensor | None = None,
-                   valref: dict | None = None, valref_key: str = ""):
-    """Raw-domain (no-smooth) layer build with optional clip search, alternating
-    lora refit, and bias correction.
+                   valref: dict | None = None, valref_key: str = "",
+                   smooth: torch.Tensor | None = None):
+    """Raw-domain layer build with optional clip search, alternating lora
+    refit, bias correction, and selective smoothing (PLAN_ROUND2 S: the
+    residual is quantized in the smoothed domain W_res*diag(s) with
+    H/ss^T while the lora branch stays on raw x).
 
     D:        [r, ic] lora_down (pre-pack); low-rank branch = x @ D^T @ lora_up^T
     lora_up:  [oc, r] initial value; refit updates it in the H metric.
@@ -324,25 +327,30 @@ def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
     lora_up = lora_up.to(device=device, dtype=torch.float32)
     oc, ic = W.shape
     Hg = H.to(device=device, dtype=torch.float32)
+    if smooth is not None:
+        s = smooth.to(device=device, dtype=torch.float32)
+        Hg = Hg / (s.unsqueeze(1) * s.unsqueeze(0))
+    else:
+        s = torch.ones(ic, device=device, dtype=torch.float32)
     hdiag = Hg.diagonal() if clip_ratios is not None else None
 
     W_q = top = micro = None
     for _ in range(max(1, alt_iters)):
-        W_res = W - lora_up @ D
+        W_res = (W - lora_up @ D) * s.unsqueeze(0)
         W_q, top, micro = quantize_residual(
             W_res, Hg, kind, group_size, device, gptq, damp_pct, block_size,
             hdiag=hdiag, clip_ratios=clip_ratios,
         )
         if refit:
+            assert smooth is None, "refit not supported with smoothing"
             E = W - W_q
             G = D @ Hg @ D.t()
             G = G + 1e-6 * G.diagonal().mean() * torch.eye(G.shape[0], device=device)
             lora_up = (E @ Hg @ D.t()) @ torch.linalg.inv(G)
 
-    s = torch.ones(ic, device=device, dtype=torch.float32)
     out = pack_layer(W_q, top, micro, D, lora_up, s, kind, device)
 
-    W_hat = W_q + lora_up @ D
+    W_hat = W_q / s.unsqueeze(0) + lora_up @ D
     bias_delta = None
     if mu is not None:
         bias_delta = (mu.to(device=device, dtype=torch.float32) @ (W - W_hat).t()).cpu()
@@ -540,6 +548,12 @@ def main():
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--num-double", type=int, default=19)
     ap.add_argument("--num-single", type=int, default=38)
+    ap.add_argument("--select-smooth-gains", default=None,
+                    help="PLAN_ROUND2 S: json {nk_prefix: gain_db}; layers "
+                         "above --select-threshold are quantized in the "
+                         "official-smooth domain (lora stays on raw x). "
+                         "Only valid with --smooth none + --basis hsvd.")
+    ap.add_argument("--select-threshold", type=float, default=0.3)
     args = ap.parse_args()
 
     if args.official is None:
@@ -590,6 +604,13 @@ def main():
         lo, hi, n = args.clip_grid
         clip_ratios = torch.linspace(lo, hi, int(n))
 
+    select_gains = None
+    if args.select_smooth_gains:
+        assert args.smooth == "none" and args.basis == "hsvd"
+        select_gains = json.load(open(args.select_smooth_gains))
+        n_sel = sum(1 for v in select_gains.values() if v > args.select_threshold)
+        print(f"selective smoothing: {n_sel}/{len(select_gains)} measured layers")
+
     act_amax = None
     if args.smooth in ("a05", "main-a05", "main-search"):
         act_amax = torch.load(args.act_amax, map_location="cpu", weights_only=False)
@@ -633,13 +654,18 @@ def main():
             mu = None
             if args.bias_correct and cov_key in act_samples:
                 mu = act_samples[cov_key].float().mean(dim=0)
+            s_layer = None
+            if select_gains is not None and \
+                    select_gains.get(nk_prefix, -1e9) > args.select_threshold:
+                s_layer = unpack_scale_vector(
+                    tensors[f"{nk_prefix}.smooth"]).float()
             repl, qsnr, bias_delta = build_layer_v2(
                 Wg, H, D, lu0, kind, args.group_size, "cuda",
                 gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
                 alt_iters=args.alt_iters, refit=args.refit_lora,
                 clip_ratios=clip_ratios, mu=mu,
                 valref=valrefs if nk_prefix in VALREF_LAYERS else None,
-                valref_key=nk_prefix,
+                valref_key=nk_prefix, smooth=s_layer,
             )
             if bias_delta is not None:
                 bkey = f"{nk_prefix}.bias"
