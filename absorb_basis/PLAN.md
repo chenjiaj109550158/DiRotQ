@@ -176,3 +176,24 @@ PixArt-Σ MJHQ-2500（`results/pixart_final_test2500_*.json`）—— 近打平�
 
 （SVDQuant 的 PixArt recipe 額外含 grid-search smoothing + 100-iter lowrank
 最佳化；我們無 smoothing、單次 H-SVD+GPTQ，校準成本低得多。）
+
+## PixArt FID 落後的歸因與方向 1 結果（2026-08-29）
+
+**歸因**（`結論由三個實證分析支持`）：FID 差距全在 covariance 項（mean 項相
+同），非多樣性坍縮；癥結是我們的圖比 ref 系統性偏軟（Laplacian 變異數
+−6.5%、高頻佔比 −0.8pp），SVDQuant 反而比 ref 偏銳（+4%）。機制：全程
+ℓ2/H-加權誤差最小化 → 向均值回歸；無 smoothing 時 outlier 撐大 per-group
+scale，小幅值高頻分量落入 deadzone。λ 非兇手（λ=0.1 在 500-proxy 上 FID
+反而最佳）。
+
+**方向 1（weight 側 per-group clip-ratio 搜尋，`--clip-search`）**：
+qdiff-128 選擇時四項全勝，但 MJHQ-2500 測試只部分遷移 ——
+damp0.1+clip：17.89/0.2993/0.6746/FID-ref **20.53**/FID-GT **28.50**
+（vs 無 clip 20.62/28.63：FID-GT 差距 0.21→0.08 幾乎追平；但 PSNR −0.10、
+LPIPS +0.0034）。結論：clip 是 FID↔similarity 的權衡旋鈕而非免費增益；
+n=128 的端到端 proxy 選粗旋鈕（λ）可靠、選細部權衡解析度不足。
+
+**未試方向**：方向 2 = 輕量 smoothing 重審（act 側 deadzone 是軟化主因，
+kernel 原生支援 smooth 除法、零部署成本；先前否決時判準無 FID）；
+方向 3 = FLUX clip 用新協定重審（8/27 舊結論是在 PCA 基底 + 無 FID 判準
++ MJHQ-32 下做的，參考價值有限）。
