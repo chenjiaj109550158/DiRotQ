@@ -81,6 +81,9 @@ def inject_kernel(transformer, packed_dict):
             lin.smooth_factor_orig.copy_(t["smooth_orig"].to("cuda", torch.float16))
             lin.proj_down.copy_(t["lora_down"].to("cuda", torch.float16))
             lin.proj_up.copy_(t["lora_up"].to("cuda", torch.float16))
+            if "wcscales" in t and t["wcscales"] is not None:
+                # folded gain correction (PLAN_ROUND2 C)
+                lin.wcscales.copy_(t["wcscales"].view(-1).to("cuda", lin.wcscales.dtype))
             if old.bias is not None:
                 # the kernel epilogue reads the bias in nunchaku's packed
                 # (pack_scale) channel order. A checkpoint may carry an
