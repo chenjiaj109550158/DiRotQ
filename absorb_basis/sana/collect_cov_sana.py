@@ -70,7 +70,8 @@ def main():
     from diffusers import SanaTransformer2DModel
 
     transformer = SanaTransformer2DModel.from_pretrained(
-        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
+        variant="bf16",
     ).to("cuda")
     transformer.eval()
     transformer.requires_grad_(False)

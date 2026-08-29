@@ -71,7 +71,8 @@ def main():
     from diffusers import SanaTransformer2DModel
 
     model = SanaTransformer2DModel.from_pretrained(
-        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16
+        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
+        variant="bf16",
     )
     sd = model.state_dict()
     num_blocks = len(model.transformer_blocks)
