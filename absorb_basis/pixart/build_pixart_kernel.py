@@ -55,6 +55,16 @@ def main():
                          "high-frequency weight components)")
     ap.add_argument("--clip-grid", type=float, nargs=3, default=[0.8, 1.0, 21],
                     metavar=("LO", "HI", "N"))
+    ap.add_argument("--smooth-pt", default=None,
+                    help="PLAN_ROUND2 S: SVDQuant smooth.pt; hooks whose mean "
+                         "layer gain (--gains json) exceeds --threshold are "
+                         "quantized in the smoothed domain")
+    ap.add_argument("--gains", default=None)
+    ap.add_argument("--threshold", type=float, default=0.3)
+    ap.add_argument("--gptq-cov", default=None,
+                    help="PLAN_ROUND2 G: alternate covariance file (collected "
+                         "in the act-quantized input domain) used for GPTQ; "
+                         "the H-SVD basis always uses the raw --cov")
     args = ap.parse_args()
 
     from diffusers import PixArtTransformer2DModel
@@ -67,15 +77,42 @@ def main():
     del model
 
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
+    cov_g = (torch.load(args.gptq_cov, map_location="cpu", weights_only=False)
+             if args.gptq_cov else None)
+
+    table = layer_table(num_blocks)
+    smoothed_hooks = {}
+    if args.smooth_pt:
+        sm = torch.load(args.smooth_pt, map_location="cpu", weights_only=False)
+        gains = json.load(open(args.gains))
+        by_hook = {}
+        for lp, ck in table:
+            skey = lp.replace(".to_k", ".to_q").replace(".to_v", ".to_q") \
+                if ".attn1" in lp else lp
+            if lp in gains:
+                by_hook.setdefault(ck, []).append((gains[lp], skey))
+        for ck, gl in by_hook.items():
+            if sum(g for g, _ in gl) / len(gl) > args.threshold:
+                smoothed_hooks[ck] = sm[gl[0][1]].float()
+        print(f"smoothed hooks: {len(smoothed_hooks)}/{len(by_hook)}")
 
     out, qsnrs = {}, {}
     t0 = time.time()
-    for wpath, ckey in tqdm(layer_table(num_blocks), dynamic_ncols=True):
+    for wpath, ckey in tqdm(table, dynamic_ncols=True):
         W = sd[f"{wpath}.weight"].to("cuda", torch.float32)
         H = cov[ckey]
         D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
-        Hg = H.to("cuda", torch.float32)
+        s = smoothed_hooks.get(ckey)
+        if s is not None:
+            s = s.to("cuda", torch.float32)
+            W_res = W_res * s.unsqueeze(0)
+            if cov_g is not None:  # already collected in the Q(x/s) domain
+                Hg = cov_g[ckey].to("cuda", torch.float32)
+            else:
+                Hg = H.to("cuda", torch.float32) / (s.unsqueeze(1) * s.unsqueeze(0))
+        else:
+            Hg = (cov_g[ckey] if cov_g is not None else H).to("cuda", torch.float32)
         clip_kw = {}
         if args.clip_search:
             lo, hi, n = args.clip_grid
@@ -86,10 +123,11 @@ def main():
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
             **clip_kw,
         )
+        s_pack = (s if s is not None
+                  else torch.ones(W.shape[1], device="cuda", dtype=torch.float32))
         packed = pack_layer(
             W_q.half(), top, micro, D.half(), lora_up.half(),
-            torch.ones(W.shape[1], device="cuda", dtype=torch.float16),
-            "plain", "cuda",
+            s_pack.half(), "plain", "cuda",
         )
         # pack_layer emits bf16 side tensors (FLUX convention); PixArt runs fp16
         out[wpath] = {
@@ -101,7 +139,7 @@ def main():
             "lora_up": packed["lora_up"].half(),
             "wtscale": float(packed["wtscale"].float()),
         }
-        W_hat = W_q + lora_up @ D
+        W_hat = (W_q / s.unsqueeze(0) if s is not None else W_q) + lora_up @ D
         err = (W_hat - W).pow(2).sum()
         qsnrs[wpath] = (10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))).item()
 

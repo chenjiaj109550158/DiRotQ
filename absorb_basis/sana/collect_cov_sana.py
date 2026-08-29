@@ -64,6 +64,11 @@ def main():
     ap.add_argument("--calib-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--num-samples", type=int, default=-1)
+    ap.add_argument("--act-quant", action="store_true",
+                    help="accumulate H over NVFP4-quantized inputs Q(x/s)")
+    ap.add_argument("--smooth-pt", default=None)
+    ap.add_argument("--gains", default=None)
+    ap.add_argument("--threshold", type=float, default=0.3)
     args = ap.parse_args()
 
     from deepcompressor.utils.common import tree_map
@@ -83,11 +88,40 @@ def main():
         H[key] = torch.zeros(d, d, dtype=torch.float32, device="cuda")
         cnt[key] = 0
 
+    hook_smooth = {}
+    if args.smooth_pt:
+        import json as _json
+
+        from absorb_basis.sana.build_sana_kernel import layer_table as _lt
+        sm = torch.load(args.smooth_pt, map_location="cpu", weights_only=False)
+        gains = _json.load(open(args.gains))
+        by_hook = {}
+        for lp, ck in _lt(len(transformer.transformer_blocks)):
+            skey = lp.replace(".to_k", ".to_q").replace(".to_v", ".to_q") \
+                if ".attn1" in lp else lp
+            if lp in gains:
+                by_hook.setdefault(ck, []).append((gains[lp], skey))
+        for ck, gl in by_hook.items():
+            mean_gain = sum(g for g, _ in gl) / len(gl)
+            if mean_gain > args.threshold:
+                hook_smooth[ck] = sm[gl[0][1]].float().cuda()
+        print(f"smoothed hooks: {len(hook_smooth)}/{len(by_hook)}")
+
+    if args.act_quant:
+        from absorb_basis.pixart.run_pixart_sim_generate import act_fp4_sim
+
     hooks = []
 
     def make_hook(key):
+        s = hook_smooth.get(key)
+
         def hook(module, hargs):
-            x = rows(hargs[0]).float()
+            x = rows(hargs[0])
+            if s is not None:
+                x = x.float() / s
+            if args.act_quant:
+                x = act_fp4_sim(x)
+            x = x.float()
             H[key].addmm_(x.t(), x)
             cnt[key] += x.shape[0]
         return hook

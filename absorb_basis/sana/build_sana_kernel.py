@@ -66,6 +66,12 @@ def main():
     ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--hsvd-damping", type=float, default=0.01)
     ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--smooth-pt", default=None,
+                    help="PLAN_ROUND2 S: selective smoothing (see pixart builder)")
+    ap.add_argument("--gains", default=None)
+    ap.add_argument("--threshold", type=float, default=0.3)
+    ap.add_argument("--gptq-cov", default=None,
+                    help="PLAN_ROUND2 G: act-quant-domain covariances for GPTQ")
     args = ap.parse_args()
 
     from diffusers import SanaTransformer2DModel
@@ -79,10 +85,28 @@ def main():
     del model
 
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
+    cov_g = (torch.load(args.gptq_cov, map_location="cpu", weights_only=False)
+             if args.gptq_cov else None)
+
+    table = layer_table(num_blocks)
+    smoothed_hooks = {}
+    if args.smooth_pt:
+        sm = torch.load(args.smooth_pt, map_location="cpu", weights_only=False)
+        gains = json.load(open(args.gains))
+        by_hook = {}
+        for lp, ck in table:
+            skey = lp.replace(".to_k", ".to_q").replace(".to_v", ".to_q") \
+                if ".attn1" in lp else lp
+            if lp in gains:
+                by_hook.setdefault(ck, []).append((gains[lp], skey))
+        for ck, gl in by_hook.items():
+            if sum(g for g, _ in gl) / len(gl) > args.threshold:
+                smoothed_hooks[ck] = sm[gl[0][1]].float()
+        print(f"smoothed hooks: {len(smoothed_hooks)}/{len(by_hook)}")
 
     out, qsnrs = {}, {}
     t0 = time.time()
-    for wpath, ckey in tqdm(layer_table(num_blocks), dynamic_ncols=True):
+    for wpath, ckey in tqdm(table, dynamic_ncols=True):
         W = sd[f"{wpath}.weight"].to("cuda", torch.float32)
         if W.dim() == 4:  # 1x1 conv
             assert W.shape[2] == W.shape[3] == 1, wpath
@@ -91,22 +115,33 @@ def main():
         H = cov[ckey]
         D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
+        s = smoothed_hooks.get(ckey)
+        if s is not None:
+            s = s.to("cuda", torch.float32)
+            W_res = W_res * s.unsqueeze(0)
+            if cov_g is not None:
+                Hq = cov_g[ckey].to("cuda", torch.float32)
+            else:
+                Hq = H.to("cuda", torch.float32) / (s.unsqueeze(1) * s.unsqueeze(0))
+        else:
+            Hq = (cov_g[ckey] if cov_g is not None else H).to("cuda", torch.float32)
         oc_p, ic_p = pad128(oc), pad128(ic)
         W_res_p = F.pad(W_res, (0, ic_p - ic, 0, oc_p - oc))
         H_p = torch.zeros(ic_p, ic_p, dtype=torch.float32, device="cuda")
-        H_p[:ic, :ic] = H.to("cuda", torch.float32)
-        H_p[range(ic, ic_p), range(ic, ic_p)] = float(H.diagonal().mean())
+        H_p[:ic, :ic] = Hq
+        H_p[range(ic, ic_p), range(ic, ic_p)] = float(Hq.diagonal().mean())
         W_qp, top, micro = quantize_residual(
             W_res_p, H_p, "plain", args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
         )
         D_p = F.pad(D, (0, ic_p - ic))
         lu_p = F.pad(lora_up, (0, 0, 0, oc_p - oc))
+        s_pack = (F.pad(s, (0, ic_p - ic), value=1.0) if s is not None
+                  else torch.ones(ic_p, device="cuda", dtype=torch.float32))
         packed = pack_layer(
             W_qp.to(torch.bfloat16), top, micro,
             D_p.to(torch.bfloat16), lu_p.to(torch.bfloat16),
-            torch.ones(ic_p, device="cuda", dtype=torch.bfloat16),
-            "plain", "cuda",
+            s_pack.to(torch.bfloat16), "plain", "cuda",
         )
         out[wpath] = {
             "qweight": packed["qweight"],
@@ -118,7 +153,8 @@ def main():
             "wtscale": float(packed["wtscale"].float()),
             "oc": oc, "ic": ic, "oc_p": oc_p, "ic_p": ic_p,
         }
-        W_hat = W_qp[:oc, :ic] + lora_up @ D
+        Wq_raw = W_qp[:oc, :ic] / s.unsqueeze(0) if s is not None else W_qp[:oc, :ic]
+        W_hat = Wq_raw + lora_up @ D
         err = (W_hat - W).pow(2).sum()
         qsnrs[wpath] = (10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))).item()
 
