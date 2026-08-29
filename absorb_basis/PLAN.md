@@ -132,4 +132,47 @@ variant 與現行最佳直接對比；不要同時改多個東西。
 - **最佳 λ 跨模型不同**（PixArt→0.1、FLUX→0.003），damping 必須 per-model
   掃描，不可遷移 —— 論文敘事中 λ 應列為 per-model 超參數（SVDQuant 的
   smooth-α 網格搜尋同理，這樣對比是公平的）。
-- 待辦：FLUX λ=0.003 上 MJHQ-1000 五指標（含 FID）正式確認。
+
+> 注意：以上兩節的 λ 排名是在 MJHQ 測試子集上做的（開發期探索）。正式協定
+> 的 λ 選擇與最終數據見下一節 —— 引用數據以下一節為準。
+
+---
+
+## 最終結果（2026-08-29，嚴格協定：λ 只用校準資料選定）
+
+**協定**：λ ∈ {0.003, 0.01, 0.1} 以端到端生成品質在 SVDQuant 自己的校準集
+（`prompts/qdiff.yaml` 前 128 條，與其 smooth-α/calib_range 搜尋同資料同量）
+上排名（`run_lambda_calib.sh`），選定即冻結，測試 benchmark（MJHQ、sDCI）
+完全未參與選擇。兩邊皆為真量化 nunchaku kernel（PixArt 側 SVDQuant 由其
+save-model dump 經官方 converter 轉至同一 kernel；速度/記憶體實測相同：
+0.503 GiB / ~65.8 ms vs fp16 1.155 GiB / 91.7 ms）。
+
+**λ 選擇結果**（`results/{pixart,flux}_lambda_qdiff128.json`）：
+- PixArt：λ*=0.1 —— 與 MJHQ 測試域探索的贏家一致 → λ 選擇跨資料集 robust。
+- FLUX：λ*=0.01 —— 開發期 MJHQ-500 上 0.003 的小幅增益不被校準域支持，
+  誠實回退到預設值（最終配置即原 baseline，不受影響）。
+
+**正式測試**：
+
+FLUX-schnell MJHQ-1000（`results/flux_final_test1000_*.json`）—— **五項全勝**：
+
+| 指標 | absorb λ=0.01 | SVDQuant |
+|---|---|---|
+| PSNR ↑ | **18.91** | 18.82 |
+| LPIPS ↓ | **0.2278** | 0.2319 |
+| SSIM ↑ | **0.7456** | 0.7430 |
+| FID vs ref ↓ | **27.81** | 28.27 |
+| FID vs GT ↓ | **59.73** | 60.40 |
+
+PixArt-Σ MJHQ-2500（`results/pixart_final_test2500_*.json`）—— 近打平（2:3）：
+
+| 指標 | absorb λ=0.1 | SVDQuant |
+|---|---|---|
+| PSNR ↑ | **17.99** | 17.88 |
+| LPIPS ↓ | 0.2959 | **0.2951** |
+| SSIM ↑ | **0.6753** | 0.6727 |
+| FID vs ref ↓ | 20.62 | **20.22** |
+| FID vs GT ↓ | 28.63 | **28.42** |
+
+（SVDQuant 的 PixArt recipe 額外含 grid-search smoothing + 100-iter lowrank
+最佳化；我們無 smoothing、單次 H-SVD+GPTQ，校準成本低得多。）
