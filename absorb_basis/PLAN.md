@@ -229,3 +229,43 @@ median forward 37.86 vs 38.04 ms（batch-2 CFG、1024px、RTX 5090）。
 transformer 輸出 QSNR vs bf16：ours 27.9 dB / svdq 轉換 27.3 dB。
 FID-ref 落後模式與 PixArt 相同（軟化機制），PLAN_ROUND2 的 S/G/C/R
 同樣適用於 SANA。
+
+---
+
+## 論文素材：統一的校準期自動配置程序（Algorithm 1）
+
+回應「每模型配置不同是否方法不統一」的疑慮：per-model 的是**配置輸出**，
+不是方法。三個模型執行完全相同的 pipeline 與決策規則，全部只用校準資料。
+
+### Algorithm 1: Calibration-Time Auto-Configuration
+
+```
+輸入: 預訓練權重 W、校準集 D_calib（與 SVDQuant 相同的 128 qdiff prompts）
+輸出: 部署配置 (λ*, S*) 與打包好的 kernel checkpoint
+固定選單: Λ = {0.003, 0.01, 0.1};  smoothing 門檻 τ = +0.3 dB
+判準 Rank(·): 在 D_calib 上端到端生成, 以 {PSNR, LPIPS, SSIM, FID-proxy}
+              對 bf16 參考的四判準多數決（皆為校準域, 測試 benchmark 不參與）
+
+1  H ← 校準 activation 的二階統計 E[xxᵀ]           # 直接讀 SVDQuant 的 caches
+2  λ* ← argmax_{λ∈Λ} Rank(Build(W, H, λ))           # H-SVD damping 選擇
+3  for 每個量化層 ℓ:                                  # smoothing 層選擇
+4      gain_ℓ ← act-quant SNR(Q(x/s_ℓ)·s_ℓW_res) − SNR(Q(x)·W_res)
+5      sel_ℓ ← [gain_ℓ > τ]                          # s_ℓ = SVDQuant 官方 smooth
+6  cand_S ← Build(W, H, λ*, smooth=sel)
+7  S* ← sel  if Rank(cand_S) ≻ Rank(Build(W, H, λ*))  else ∅   # 端到端守門
+8  return Pack(Build(W, H, λ*, smooth=S*))
+```
+
+三模型的輸出：FLUX → (0.01, S 108 層)；PixArt → (0.1, S 109/168 hooks)；
+SANA → (0.003, ∅ —— 第 7 行守門否決,如實報告)。
+
+### 審稿防禦對照表
+
+| 潛在質疑 | 防禦 |
+|---|---|
+| 配置是否看了測試集 | 所有選擇只用 qdiff-128 校準 prompts(SVDQuant 同款同量);測試集每配置只跑一次 |
+| 選單是否事後湊 | 選單/門檻固定,三模型跑同一 Algorithm;SANA 的 S 被守門規則否決也如實報告 |
+| smooth factors 來源 | SVDQuant 自家 GridSearch 的產物(同校準資料的副產品),論文明示;等價於把他們的校準成果當可重用資源 |
+| per-model 配置的先例 | SVDQuant 本身即 per-model 異質(每模型 smoothing 配方/skip 清單/dtype 皆不同,α 逐層網格搜尋);我們的選單更小且全自動 |
+| λ landscape 噪 | 附三模型 λ 敏感度數據;PixArt 上驗證過「校準域選擇 = 測試域贏家」的跨資料集一致性 |
+| 校準成本 | 遠低於 SVDQuant(單次 H-SVD+GPTQ + 小網格,無 100-iter lowrank/逐層 α 搜尋;SANA 上 6.3h vs 我們全選單 <1h) |
