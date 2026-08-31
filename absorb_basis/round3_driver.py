@@ -299,8 +299,10 @@ for src, dst, deref in CFG["fetch"]:
 # the vault's copy of the deepcompressor smooth cache by model name.
 if CFG.get("smooth") and not os.path.exists(CFG["smooth"]):
     hint = {"pixart": "pixart-sigma", "sana": "sana-1.6b"}.get(M, M)
+    # constrain to the smooth top-level cache dir — the branch tree's hashed
+    # config dirs also contain "smooth.proj..." components
     hits = subprocess.run(
-        f"find {VAULT}/deepcompressor/runs/diffusion/cache/quant -path '*smooth*' "
+        f"find {VAULT}/deepcompressor/runs/diffusion/cache/quant/qdiff.128/smooth "
         f"-name '*{hint}*.pt' -type f", shell=True, capture_output=True, text=True
     ).stdout.split()
     assert hits, f"no smooth cache for {hint} in vault"
