@@ -56,6 +56,18 @@ per-channel top 不進選單（round-3 三模型一致負結果）。
 - chains：`absorb_basis/sdxl/run_sdxl30_chain1.sh`（step 1–2）、
   `run_sdxl30_chain2.sh`（step 3–7）；log 在 `results/sdxlb_chain{1,2}.log`
 
+## 事件記錄：SVDQuant 校準 OOM（2026-08-31 16:00）
+
+首跑 `num_samples=128` 在 smoothing 的 `collecting acts`（down_blocks.2）
+被 OOM killer 終止（exit 137）：SDXL-base 1024px 每 cache 的 token 數是
+Turbo(512px) 的 4 倍，其活化收集 RAM 為 O(samples×tokens×d)，54G 主機
+記憶體不足（deepcompressor 無磁碟 offload 選項）。處置：
+`quant.calib.num_samples: 32` —— 32 檔 × 4 倍 token/檔 = 與已驗證的
+128 檔 @512px recipe **等量活化 token 預算**，RAM 回到 Turbo 實測安全
+曲線。prompts 仍為同一 qdiff-128 集。論文揭露點：我們的 cov 收集是
+串流 O(d²) 記憶體、可吃滿全部 7680 caches，SVDQuant 的校準記憶體隨
+樣本×解析度線性放大 —— 本事件即實例。
+
 ## 防護
 
 setsid 脫離、磁碟 guard（<50G 中止）、里程碑 vault 備份（calib 後、
