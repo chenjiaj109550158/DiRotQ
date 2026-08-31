@@ -269,3 +269,47 @@ SANA → (0.003, ∅ —— 第 7 行守門否決,如實報告)。
 | per-model 配置的先例 | SVDQuant 本身即 per-model 異質(每模型 smoothing 配方/skip 清單/dtype 皆不同,α 逐層網格搜尋);我們的選單更小且全自動 |
 | λ landscape 噪 | 附三模型 λ 敏感度數據;PixArt 上驗證過「校準域選擇 = 測試域贏家」的跨資料集一致性 |
 | 校準成本 | 遠低於 SVDQuant(單次 H-SVD+GPTQ + 小網格,無 100-iter lowrank/逐層 α 搜尋;SANA 上 6.3h vs 我們全選單 <1h) |
+
+## SDXL-Turbo 結果（2026-08-31，嚴格協定，真 kernel）
+
+`stabilityai/sdxl-turbo`（fp16，eulera 4 步 g0）。UNet 架構：560 個
+transformer linears 走真 SVDQW4A4Linear kernel（維度皆 128 倍數免
+padding；attn_add skip = cross-KV 留 fp16）；34 個 resnet conv 依 nunchaku
+SDXL 部署語意以 fp16 conv 執行「NVFP4 格點反量化 + rank-32 im2col H-SVD
+修正」的融合權重（SVDQuant 的 recipe 對 conv 無 branch/無 smooth，我們的
+conv rank-32 修正為零成本方法優勢；他們的 up-block concat conv 以
+ConcatConv 拆分儲存，轉換時沿 in-dim 併回）。SVDQuant 側由其 code 全程
+NVFP4 校準（smoothing 5h + lowrank 2.2h）經 save-model dump 轉至同一
+kernel。過程中修了兩個環境/上游問題：deepcompressor tree_collate 對
+「全 batch 相同張量」不 batch 導致 SDXL 常數 time_ids 崩潰（改永遠
+concat）；cleanfid 硬編碼 /tmp 在新 container 不可寫（EXDEV，改指向
+使用者目錄）。
+
+Algorithm 1（qdiff-128）：λ*=0.1（3/4 判準）；S 守門 3:4 通過
+（93/560 層 smooth，median 增益僅 +0.06 dB 但選擇性套用有效）→
+最終配置 = λ0.1+S。
+
+MJHQ-2500 正式賽（`results/sdxl_final_test2500.json`）—— **4:1 勝**：
+
+| 指標 | absorb λ0.1+S | SVDQuant |
+|---|---|---|
+| PSNR ↑ | **19.24** | 19.08 |
+| LPIPS ↓ | **0.2139** | 0.2201 |
+| SSIM ↑ | **0.6877** | 0.6769 |
+| FID vs ref ↓ | **12.08** | 12.22 |
+| FID vs GT ↓ | 35.37 | **35.21** |
+
+部署 parity：兩者 unet 2.449 GiB（fp16 4.782 GiB，1.95x）、median
+forward 90.2 vs 88.2 ms（同 kernel 路徑，差距 ~2%）。
+
+### 四模型總表（全部嚴格協定 + 真 kernel + 五指標）
+
+| 模型 | 最終配置 | vs SVDQuant |
+|---|---|---|
+| FLUX-schnell（1000） | λ0.01+S | **5:0** |
+| PixArt-Σ（2500） | λ0.1+S | **5:0** |
+| SDXL-Turbo（2500） | λ0.1+S | **4:1** |
+| SANA-1.6B（2500） | λ0.003 | 2:3（兩法皆近無損，飽和） |
+
+Algorithm 1 的輸出跨四模型各異（λ 與 S 選擇皆自動、只用校準資料），
+校準成本全面低於 SVDQuant（每模型他們 7h+ vs 我們全選單 <1.5h）。
