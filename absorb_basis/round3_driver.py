@@ -294,6 +294,19 @@ state = {}
 step(f"{M}-fetch")
 for src, dst, deref in CFG["fetch"]:
     fetch(src, dst, deref)
+# the vault dump's smooth.pt is a relative symlink whose target layout does
+# not exist inside the vault -> deref-copy silently skips it. Recover it from
+# the vault's copy of the deepcompressor smooth cache by model name.
+if CFG.get("smooth") and not os.path.exists(CFG["smooth"]):
+    hint = {"pixart": "pixart-sigma", "sana": "sana-1.6b"}.get(M, M)
+    hits = subprocess.run(
+        f"find {VAULT}/deepcompressor/runs/diffusion/cache/quant -path '*smooth*' "
+        f"-name '*{hint}*.pt' -type f", shell=True, capture_output=True, text=True
+    ).stdout.split()
+    assert hits, f"no smooth cache for {hint} in vault"
+    os.makedirs(os.path.dirname(CFG["smooth"]), exist_ok=True)
+    sh(f"cp -u '{hits[0]}' '{CFG['smooth']}'")
+    print(f"recovered smooth.pt from {hits[0]}", flush=True)
 print(f"STEP {M}-fetch exit 0", flush=True)
 
 # ---- Stage A: lambda 6-point grid -------------------------------------------
