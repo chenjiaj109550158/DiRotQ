@@ -69,7 +69,13 @@ def main():
                     help="PLAN_ROUND2 C: per-layer per-channel gain file from "
                          "fold_gain_correction.py; folds 1/k into lora_up "
                          "(pre-pack) and wcscales (post-pack)")
+    ap.add_argument("--per-channel-top", action="store_true",
+                    help="PLAN_ROUND3: per-output-channel top scale "
+                         "(wcscales) instead of per-tensor (wtscale)")
+    ap.add_argument("--smooth-alpha", type=float, default=1.0,
+                    help="PLAN_ROUND3: smoothing strength s^alpha")
     args = ap.parse_args()
+    assert not (args.per_channel_top and args.gain_k), "flags conflict on wcscales"
 
     from diffusers import PixArtTransformer2DModel
 
@@ -111,7 +117,7 @@ def main():
         W_res = W - lora_up @ D
         s = smoothed_hooks.get(ckey)
         if s is not None:
-            s = s.to("cuda", torch.float32)
+            s = s.to("cuda", torch.float32).pow(args.smooth_alpha)
             W_res = W_res * s.unsqueeze(0)
             if cov_g is not None:  # already collected in the Q(x/s) domain
                 Hg = cov_g[ckey].to("cuda", torch.float32)
@@ -124,8 +130,9 @@ def main():
             lo, hi, n = args.clip_grid
             clip_kw = {"hdiag": Hg.diagonal().clone(),
                        "clip_ratios": torch.linspace(lo, hi, int(n))}
+        kind = "qkv" if args.per_channel_top else "plain"
         W_q, top, micro = quantize_residual(
-            W_res, Hg, "plain", args.group_size, "cuda",
+            W_res, Hg, kind, args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
             **clip_kw,
         )
@@ -137,7 +144,7 @@ def main():
         lu_pack = lora_up * inv_k.unsqueeze(1) if inv_k is not None else lora_up
         packed = pack_layer(
             W_q.half(), top, micro, D.half(), lu_pack.half(),
-            s_pack.half(), "plain", "cuda",
+            s_pack.half(), kind, "cuda",
         )
         if inv_k is not None:
             from absorb_basis.build_checkpoint import pack_perm_vector
@@ -151,10 +158,19 @@ def main():
             "smooth_orig": packed["smooth_orig"].half(),
             "lora_down": packed["lora_down"].half(),
             "lora_up": packed["lora_up"].half(),
-            "wtscale": float(packed["wtscale"].float()),
+            "wtscale": (float(packed["wtscale"].float())
+                        if "wtscale" in packed else 1.0),
         }
-        if "wcscales" in packed:
-            out[wpath]["wcscales"] = packed["wcscales"]
+        if args.per_channel_top:
+            # fp16 wcscales underflow at raw top magnitudes (~1e-4): store the
+            # normalized split wcscales = top/mean(top), wtscale = mean(top)
+            from absorb_basis.build_checkpoint import pack_perm_vector
+            mean_top = float(top.mean())
+            out[wpath]["wcscales"] = (top / mean_top)[
+                pack_perm_vector(top.shape[0]).cuda()].half().cpu()
+            out[wpath]["wtscale"] = mean_top
+        elif "wcscales" in packed:
+            out[wpath]["wcscales"] = packed["wcscales"].half()
         W_hat = (W_q / s.unsqueeze(0) if s is not None else W_q) + lora_up @ D
         err = (W_hat - W).pow(2).sum()
         qsnrs[wpath] = (10.0 * torch.log10(W.pow(2).sum() / err.clamp(min=1e-20))).item()

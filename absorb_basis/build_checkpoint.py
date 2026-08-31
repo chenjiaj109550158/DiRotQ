@@ -554,6 +554,9 @@ def main():
                          "official-smooth domain (lora stays on raw x). "
                          "Only valid with --smooth none + --basis hsvd.")
     ap.add_argument("--select-threshold", type=float, default=0.3)
+    ap.add_argument("--select-smooth-alpha", type=float, default=1.0,
+                    help="PLAN_ROUND3: smoothing strength s^alpha for the "
+                         "selective-smoothing layers")
     args = ap.parse_args()
 
     if args.official is None:
@@ -658,7 +661,8 @@ def main():
             if select_gains is not None and \
                     select_gains.get(nk_prefix, -1e9) > args.select_threshold:
                 s_layer = unpack_scale_vector(
-                    tensors[f"{nk_prefix}.smooth"]).float()
+                    tensors[f"{nk_prefix}.smooth"]).float().pow(
+                        args.select_smooth_alpha)
             repl, qsnr, bias_delta = build_layer_v2(
                 Wg, H, D, lu0, kind, args.group_size, "cuda",
                 gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,

@@ -75,7 +75,12 @@ def main():
     ap.add_argument("--gain-k", default=None,
                     help="PLAN_ROUND2 C: per-layer per-channel gain file; "
                          "folds 1/k into lora_up (pre-pack) + wcscales")
+    ap.add_argument("--per-channel-top", action="store_true",
+                    help="PLAN_ROUND3: per-output-channel top scale")
+    ap.add_argument("--smooth-alpha", type=float, default=1.0,
+                    help="PLAN_ROUND3: smoothing strength s^alpha")
     args = ap.parse_args()
+    assert not (args.per_channel_top and args.gain_k), "flags conflict on wcscales"
 
     from diffusers import SanaTransformer2DModel
 
@@ -122,7 +127,7 @@ def main():
         W_res = W - lora_up @ D
         s = smoothed_hooks.get(ckey)
         if s is not None:
-            s = s.to("cuda", torch.float32)
+            s = s.to("cuda", torch.float32).pow(args.smooth_alpha)
             W_res = W_res * s.unsqueeze(0)
             if cov_g is not None:
                 Hq = cov_g[ckey].to("cuda", torch.float32)
@@ -135,8 +140,9 @@ def main():
         H_p = torch.zeros(ic_p, ic_p, dtype=torch.float32, device="cuda")
         H_p[:ic, :ic] = Hq
         H_p[range(ic, ic_p), range(ic, ic_p)] = float(Hq.diagonal().mean())
+        kind = "qkv" if args.per_channel_top else "plain"
         W_qp, top, micro = quantize_residual(
-            W_res_p, H_p, "plain", args.group_size, "cuda",
+            W_res_p, H_p, kind, args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
         )
         D_p = F.pad(D, (0, ic_p - ic))
@@ -151,7 +157,7 @@ def main():
         packed = pack_layer(
             W_qp.to(torch.bfloat16), top, micro,
             D_p.to(torch.bfloat16), lu_p.to(torch.bfloat16),
-            s_pack.to(torch.bfloat16), "plain", "cuda",
+            s_pack.to(torch.bfloat16), kind, "cuda",
         )
         if inv_k is not None:
             from absorb_basis.build_checkpoint import pack_perm_vector
@@ -163,10 +169,18 @@ def main():
             "smooth_orig": packed["smooth_orig"],
             "lora_down": packed["lora_down"],
             "lora_up": packed["lora_up"],
-            "wtscale": float(packed["wtscale"].float()),
+            "wtscale": (float(packed["wtscale"].float())
+                        if "wtscale" in packed else 1.0),
             "oc": oc, "ic": ic, "oc_p": oc_p, "ic_p": ic_p,
         }
-        if "wcscales" in packed:
+        if args.per_channel_top:
+            from absorb_basis.build_checkpoint import pack_perm_vector
+            real_top = top.clone()
+            mean_top = float(real_top[:oc].mean())  # exclude zero pad rows
+            out[wpath]["wcscales"] = (real_top / mean_top)[
+                pack_perm_vector(real_top.shape[0]).cuda()].to(torch.bfloat16).cpu()
+            out[wpath]["wtscale"] = mean_top
+        elif "wcscales" in packed:
             out[wpath]["wcscales"] = packed["wcscales"]
         Wq_raw = W_qp[:oc, :ic] / s.unsqueeze(0) if s is not None else W_qp[:oc, :ic]
         W_hat = Wq_raw + lora_up @ D

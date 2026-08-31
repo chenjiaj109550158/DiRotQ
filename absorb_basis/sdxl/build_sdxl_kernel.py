@@ -72,7 +72,12 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--gptq-cov", default=None)
     ap.add_argument("--gain-k", default=None)
+    ap.add_argument("--per-channel-top", action="store_true",
+                    help="PLAN_ROUND3: per-output-channel top scale")
+    ap.add_argument("--smooth-alpha", type=float, default=1.0,
+                    help="PLAN_ROUND3: smoothing strength s^alpha")
     args = ap.parse_args()
+    assert not (args.per_channel_top and args.gain_k), "flags conflict on wcscales"
 
     from diffusers import UNet2DConditionModel
 
@@ -113,14 +118,15 @@ def main():
         W_res = W - lora_up @ D
         s = smoothed.get(ckey)
         if s is not None:
-            s = s.to("cuda", torch.float32)
+            s = s.to("cuda", torch.float32).pow(args.smooth_alpha)
             W_res = W_res * s.unsqueeze(0)
             Hg = (cov_g[ckey].to("cuda", torch.float32) if cov_g is not None
                   else H.to("cuda", torch.float32) / (s.unsqueeze(1) * s.unsqueeze(0)))
         else:
             Hg = (cov_g[ckey] if cov_g is not None else H).to("cuda", torch.float32)
+        kind = "qkv" if args.per_channel_top else "plain"
         W_q, top, micro = quantize_residual(
-            W_res, Hg, "plain", args.group_size, "cuda",
+            W_res, Hg, kind, args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
         )
         s_pack = (s if s is not None
@@ -130,14 +136,23 @@ def main():
             inv_k = (1.0 / gain_k[wpath].to("cuda", torch.float32))
         lu_pack = lora_up * inv_k.unsqueeze(1) if inv_k is not None else lora_up
         packed = pack_layer(W_q.half(), top, micro, D.half(), lu_pack.half(),
-                            s_pack.half(), "plain", "cuda")
+                            s_pack.half(), kind, "cuda")
         out[wpath] = {
             "type": "linear",
             "qweight": packed["qweight"], "wscales": packed["wscales"],
             "smooth": packed["smooth"].half(), "smooth_orig": packed["smooth_orig"].half(),
             "lora_down": packed["lora_down"].half(), "lora_up": packed["lora_up"].half(),
-            "wtscale": float(packed["wtscale"].float()),
+            "wtscale": (float(packed["wtscale"].float())
+                        if "wtscale" in packed else 1.0),
         }
+        if args.per_channel_top:
+            from absorb_basis.build_checkpoint import pack_perm_vector
+            mean_top = float(top.mean())
+            out[wpath]["wcscales"] = (top / mean_top)[
+                pack_perm_vector(top.shape[0]).cuda()].half().cpu()
+            out[wpath]["wtscale"] = mean_top
+        elif "wcscales" in packed:
+            out[wpath]["wcscales"] = packed["wcscales"].half()
         if inv_k is not None:
             from absorb_basis.build_checkpoint import pack_perm_vector
             perm = pack_perm_vector(inv_k.shape[0]).cuda()
@@ -154,7 +169,8 @@ def main():
         D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
         W_q, top, micro = quantize_residual(
-            W_res, H.to("cuda", torch.float32), "plain", args.group_size, "cuda",
+            W_res, H.to("cuda", torch.float32),
+            "qkv" if args.per_channel_top else "plain", args.group_size, "cuda",
             gptq=True, damp_pct=args.damp, block_size=args.block_size,
         )
         W_hat = (W_q + lora_up @ D).reshape(oc, ic, kh, kw)
