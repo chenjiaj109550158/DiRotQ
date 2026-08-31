@@ -1,8 +1,15 @@
 """SDXL per-layer smoothing gain on the lambda* H-SVD residuals (PLAN_ROUND2
-S selection). Usage: python measure_smooth_gain_sdxl.py <lambda>"""
+S selection). Usage: python measure_smooth_gain_sdxl.py <lambda>
+
+Defaults target sdxl-turbo; override via env for other SDXL variants:
+  SDXL_MODEL_ID, SDXL_M_DIR (model artifact dir), SDXL_CACHES (cache glob).
+With SDXL_CACHES set, the 16 measurement caches are evenly strided over the
+whole cache set (turbo keeps its original [100:116] slice for reproducibility).
+"""
 import glob
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -17,15 +24,17 @@ from absorb_basis.pixart.run_pixart_sim_generate import act_fp4_sim
 from absorb_basis.sdxl.build_sdxl_kernel import linear_table
 
 LAM = float(sys.argv[1])
-unet = UNet2DConditionModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="unet",
+MODEL_ID = os.environ.get("SDXL_MODEL_ID", "stabilityai/sdxl-turbo")
+M_DIR = os.environ.get("SDXL_M_DIR", "/home/dev/DiRotQ/models/sdxl-turbo")
+unet = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet",
                                             torch_dtype=torch.float16, variant="fp16").to("cuda")
 unet.eval()
 unet.requires_grad_(False)
 lt = linear_table(unet)
 sd = {k: v for k, v in unet.state_dict().items()}
-cov = torch.load("/home/dev/DiRotQ/models/sdxl-turbo/basis/absorb_cov_sdxl_linear.pt",
+cov = torch.load(f"{M_DIR}/basis/absorb_cov_sdxl_linear.pt",
                  map_location="cpu", weights_only=False)
-sm = torch.load("/home/dev/DiRotQ/models/sdxl-turbo/svdq_model_dump/smooth.pt",
+sm = torch.load(f"{M_DIR}/svdq_model_dump/smooth.pt",
                 map_location="cpu", weights_only=False)
 
 
@@ -71,8 +80,13 @@ for lp, info in layers.items():
         return hook
     hooks.append(get(unet, lp).register_forward_pre_hook(mk(info)))
 
-files = sorted(glob.glob("/home/dev/deepcompressor/examples/diffusion/datasets/"
-                         "torch.float16/sdxl-turbo/eulera4-g0/qdiff/s128/caches/*.pt"))[100:116]
+_caches_glob = os.environ.get("SDXL_CACHES")
+if _caches_glob:
+    _all = sorted(glob.glob(_caches_glob))
+    files = _all[:: max(1, len(_all) // 16)][:16]
+else:
+    files = sorted(glob.glob("/home/dev/deepcompressor/examples/diffusion/datasets/"
+                             "torch.float16/sdxl-turbo/eulera4-g0/qdiff/s128/caches/*.pt"))[100:116]
 
 
 def to_dev(v):
@@ -91,7 +105,7 @@ gains = {}
 for lp, info in layers.items():
     y, e0, e1 = info["acc"]
     gains[lp] = 10 * math.log10(e0 / e1) if e0 > 0 and e1 > 0 else 0.0
-json.dump(gains, open("/home/dev/DiRotQ/models/sdxl-turbo/absorb_basis/smooth_gain.json", "w"),
+json.dump(gains, open(f"{M_DIR}/absorb_basis/smooth_gain.json", "w"),
           indent=2)
 import statistics
 v = sorted(gains.values())

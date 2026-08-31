@@ -1,8 +1,12 @@
 """End-to-end kernel validation: whole-unet forward QSNR vs fp16 on calib
-caches. Usage: python validate_sdxl_kernel.py <kernel.pt>"""
+caches. Usage: python validate_sdxl_kernel.py <kernel.pt>
+
+Defaults target sdxl-turbo; override via env SDXL_MODEL_ID / SDXL_CACHES
+(cache glob; 4 evenly-strided caches are used) for other SDXL variants."""
 import glob
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -17,16 +21,24 @@ from absorb_basis.sdxl.run_sdxl_kernel_generate import inject_kernel
 ckpt = sys.argv[1]
 
 
+MODEL_ID = os.environ.get("SDXL_MODEL_ID", "stabilityai/sdxl-turbo")
+
+
 def load_unet():
-    m = UNet2DConditionModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="unet",
+    m = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet",
                                              torch_dtype=torch.float16, variant="fp16").to("cuda")
     m.eval()
     m.requires_grad_(False)
     return m
 
 
-files = sorted(glob.glob("/home/dev/deepcompressor/examples/diffusion/datasets/"
-                         "torch.float16/sdxl-turbo/eulera4-g0/qdiff/s128/caches/*.pt"))[100:104]
+_caches_glob = os.environ.get("SDXL_CACHES")
+if _caches_glob:
+    _all = sorted(glob.glob(_caches_glob))
+    files = _all[:: max(1, len(_all) // 4)][:4]
+else:
+    files = sorted(glob.glob("/home/dev/deepcompressor/examples/diffusion/datasets/"
+                             "torch.float16/sdxl-turbo/eulera4-g0/qdiff/s128/caches/*.pt"))[100:104]
 
 
 def to_dev(v):
