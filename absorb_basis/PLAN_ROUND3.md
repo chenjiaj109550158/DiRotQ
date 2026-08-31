@@ -1,6 +1,6 @@
 # 第三輪品質優化（快速輪）：per-channel top + S 強度 α + λ 加密
 
-狀態：**執行中**（2026-08-31 起）。
+狀態：**已完成**（2026-08-31，結果見文末「執行結果」）。
 基準：四模型最終配置（見 PLAN.md 總表）——FLUX 5:0、PixArt 5:0、
 SDXL-Turbo 4:1、SANA 2:3。
 
@@ -63,3 +63,55 @@ s^α（α<1）可用較小的 weight 側代價收割 act 側增益——對 SANA
 本機是新 container：PixArt/SANA/FLUX 的 cov、舊 λ checkpoints、qdiff
 ref/gen 圖需自 vault `cp -au` 取回（dump 的 smooth.pt 是 symlink，取回
 須 `cp -Lu` 解參照）。預估取回 ~15G，磁碟餘裕充足（575G）。
+
+## 執行結果（2026-08-31，round3_driver.py，全程 Algorithm 1 嚴格協定）
+
+選擇 JSON：`results/{model}_round3_selection.json`；官方重跑：
+`results/{model}_round3_test.json`。逐項結論：
+
+### 項目 1（per-channel top）：**3/3 一致負結果，棄用**
+
+PixArt、SDXL、SANA 三者的 Stage B（λ* + `--per-channel-top`）在 qdiff-128
+四判準守門全數敗於 per-tensor 基底（FLUX 因 v1 C++ loader 未跑）。
+解讀：兩層 scale（per-tensor top × per-group-16 e4m3 micro）中的 micro
+已吸收逐行動態範圍，top 細化成 per-channel 反而稀釋 e4m3 micro 的表示
+精度。作為 negative result 寫入論文 ablation（含 fp16 underflow 的
+normalized-split 實作已驗證正確，非實作瑕疵——kernel-vs-sim 22–24 dB）。
+
+### 項目 5（λ 網格加密）：SDXL、SANA 換新贏家 λ=0.3
+
+| 模型 | λ*（六點 qdiff-128 排名） | 變化 |
+|---|---|---|
+| PixArt | 0.1 | 不變 |
+| SDXL-Turbo | **0.3** | 原 0.1 |
+| SANA | **0.3** | 原 0.003 |
+| FLUX | 0.01 | 不變 |
+
+### 項目 3（S 強度 s^α）：PixArt α=0.5、SANA α=0.25，SDXL/FLUX 不套/α=1
+
+- PixArt（λ0.1 上）：α=0.25/0.5 皆過門，0.5 勝 0.25（3:1）、0.75 全敗、
+  1.0 對 0.5 全敗 → **S@0.5**（原 S@1.0）。
+- SANA（λ0.3 上）：**S@0.25** 過門（原無 S）。
+- SDXL（λ0.3 上）：全部 α 未過門 → 純 λ0.3（原 λ0.1+S@1.0）。
+- FLUX：S@1.0 維持（配置不變，未重跑官方）。
+
+### 官方測試集重跑（配置有變的三模型，MJHQ-2500、五指標、真 kernel）
+
+| 模型 | 新配置 | ours | SVDQuant | 結果 |
+|---|---|---|---|---|
+| PixArt-Σ | λ0.1+S@0.5 | 18.44 / 0.2752 / 0.6890 / 19.47 / 28.27 | 17.88 / 0.2951 / 0.6727 / 20.22 / 28.42 | **5:0** |
+| SDXL-Turbo | λ0.3 | 19.23 / 0.2140 / 0.6869 / 12.13 / 35.01 | 19.08 / 0.2201 / 0.6769 / 12.22 / 35.21 | **5:0**（原 4:1，FID-GT 翻正） |
+| SANA-1.6B | λ0.3+S@0.25 | 19.92 / 0.1592 / 0.7471 / 10.50 / 27.01 | 19.76 / 0.1624 / 0.7426 / 10.41 / 27.22 | **4:1**（原 2:3；僅 FID-ref −0.09） |
+
+（指標序：PSNR↑ / LPIPS↓ / SSIM↑ / FID-vs-ref↓ / FID-vs-GT↓。）
+
+註：PixArt 舊配置 S@1.0 的官方值（18.57/0.2718/0.6919/19.57/28.09）與新
+配置互有增減，但 Algorithm 1 嚴格不回看測試集，qdiff-128 上 S@0.5 四項
+全勝 S@1.0，故依協定定案 S@0.5——兩配置對 SVDQuant 皆 5:0，結論不受影響。
+
+### 輪後總結
+
+四模型戰績：FLUX **5:0**、PixArt **5:0**、SDXL-Turbo **5:0**、SANA
+**4:1**（19/20 指標勝）。本輪淨效果：SDXL 4:1→5:0、SANA 2:3→4:1、
+PixArt/FLUX 持平。計畫 R（block 重建）依裁定保留為下一輪槓桿
+（SANA FID-ref 是唯一殘存負項）。
