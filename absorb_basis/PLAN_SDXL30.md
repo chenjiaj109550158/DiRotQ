@@ -1,4 +1,6 @@
-# SDXL-base（30 steps, CFG 5.0）部署計畫：ours vs SVDQuant，MJHQ-2500
+# SDXL-base（30 steps, CFG 5.0）部署計畫：ours vs SVDQuant，MJHQ-1000
+
+（2026-08-31 使用者裁定：官方測試先跑 **1000 筆**，之後視需要再補 2500。）
 
 狀態：**執行中**（2026-08-31 起）。模型 `stabilityai/stable-diffusion-xl-base-1.0`
 （fp16 variant），deepcompressor pipeline name `sdxl`（內建支援）。
@@ -34,11 +36,11 @@ per-channel top 不進選單（round-3 三模型一致負結果）。
 | 3 | bf16 ref qdiff-128 生成 | 1 min | ~15 min |
 | 4 | ours cov 收集（linear+conv，全 7680 caches 重放） | 9 min | **2–3h** |
 | 5 | Algorithm-1 選單：6λ×(build 5m + gen 13–20m) + S 4α | ~40 min | **3.5–5h** |
-| 6 | 官方 MJHQ-2500 ×3（bf16 ref / ours kernel / svdq kernel，30 步 CFG） | 21 min/組 | **4–5.5h/組 ≈ 12–16.5h** |
-| 7 | 五指標（PSNR/LPIPS/SSIM/FID-ref/FID-GT ×2 法） | ~20 min | ~1h |
+| 6 | 官方 MJHQ-1000 ×3（fp16 ref / ours kernel / svdq kernel，30 步 CFG） | — | **1.7–2.2h/組 ≈ 5–7h** |
+| 7 | 五指標（PSNR/LPIPS/SSIM/FID-ref/FID-GT ×2 法；GT=MJHQ-GT-1000） | ~20 min | ~0.5h |
 | 8 | 文件 + commit/push + vault 備份 | — | ~0.5h |
 
-**總計 ≈ 29–39h 連續 GPU（約 1.2–1.6 天）。**
+**總計 ≈ 21–29h 連續 GPU（1000 筆版）。**
 主要不確定度：step 1 的 smoothing gridsearch（活化量同 Turbo 應近 5h，
 但 30 步 cache 的 batch 組成不同）；step 6 的每張 30 步×CFG 生成速度
 （依 Turbo MJHQ 2.5 it/s @4 步換算 ≈ 6.3s/img）。
@@ -50,7 +52,7 @@ per-channel top 不進選單（round-3 三模型一致負結果）。
 - cov：`models/sdxl-base/basis/absorb_cov_sdxl_{linear,conv}.pt`
 - 我們 kernels：`models/sdxl-base/absorb_basis/sdxlb_*.pt`
 - 選擇/官方結果：`results/sdxlb_lambda_qdiff128.json`、
-  `results/sdxlb_S_qdiff128.json`、`results/sdxlb_final_test2500.json`
+  `results/sdxlb_S_qdiff128.json`、`results/sdxlb_final_test1000.json`
 - chains：`absorb_basis/sdxl/run_sdxl30_chain1.sh`（step 1–2）、
   `run_sdxl30_chain2.sh`（step 3–7）；log 在 `results/sdxlb_chain{1,2}.log`
 

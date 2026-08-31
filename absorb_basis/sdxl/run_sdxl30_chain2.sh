@@ -197,10 +197,11 @@ step backup-postmenu
 bash /vault/dirotq-absorb-backup/backup.sh >/dev/null 2>&1
 echo "STEP backup-postmenu exit $?"
 
-# ---- official MJHQ-2500 ----------------------------------------------------
-gen ref-mjhq2500 "$EMPTY" sdxlb-ref MJHQ 2500
-gen final-absorb "$FCKPT" sdxlb-absorb-final-kernel MJHQ 2500
-gen final-svdq "$M/absorb_basis/sdxlb_svdq_kernel.pt" sdxlb-svdq-final-kernel MJHQ 2500
+# ---- official MJHQ-1000 (user decision 2026-08-31: 1000 first; rerun at
+# ---- 2500 later only if needed) ---------------------------------------------
+gen ref-mjhq1000 "$EMPTY" sdxlb-ref MJHQ 1000
+gen final-absorb "$FCKPT" sdxlb-absorb-final-kernel MJHQ 1000
+gen final-svdq "$M/absorb_basis/sdxlb_svdq_kernel.pt" sdxlb-svdq-final-kernel MJHQ 1000
 
 step final-metrics
 $PY - "$FTAG" <<'PYEOF'
@@ -214,17 +215,17 @@ from cleanfid import fid
 from deepcompressor.app.diffusion.eval.metrics.similarity import compute_image_similarity_metrics
 ftag = sys.argv[1]
 DC = "/home/dev/deepcompressor/examples/diffusion"
-ref = f"{DC}/runs/sdxlb-ref/samples/MJHQ/MJHQ-2500"
-gt = f"{DC}/benchmarks/MJHQ-GT-2500"
+ref = f"{DC}/runs/sdxlb-ref/samples/MJHQ/MJHQ-1000"
+gt = f"{DC}/benchmarks/MJHQ-GT-1000"
 res = {}
-for tag, d in [(f"absorb-{ftag}", f"{DC}/runs/sdxlb-absorb-final-kernel/samples/MJHQ/MJHQ-2500"),
-               ("svdquant", f"{DC}/runs/sdxlb-svdq-final-kernel/samples/MJHQ/MJHQ-2500")]:
+for tag, d in [(f"absorb-{ftag}", f"{DC}/runs/sdxlb-absorb-final-kernel/samples/MJHQ/MJHQ-1000"),
+               ("svdquant", f"{DC}/runs/sdxlb-svdq-final-kernel/samples/MJHQ/MJHQ-1000")]:
     m = compute_image_similarity_metrics(ref, d, metrics=("psnr","lpips","ssim"), num_workers=0)
     res[tag] = {k: float(v) for k, v in m.items()}
     res[tag]["fid_vs_ref"] = fid.compute_fid(ref, d, verbose=False)
     res[tag]["fid_vs_gt"] = fid.compute_fid(gt, d, verbose=False)
     print(f"FINAL {tag}: " + json.dumps(res[tag]))
-json.dump(res, open("/home/dev/DiRotQ/absorb_basis/results/sdxlb_final_test2500.json", "w"), indent=2)
+json.dump(res, open("/home/dev/DiRotQ/absorb_basis/results/sdxlb_final_test1000.json", "w"), indent=2)
 PYEOF
 echo "STEP final-metrics exit $?"
 
