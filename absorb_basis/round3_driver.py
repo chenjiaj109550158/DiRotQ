@@ -101,6 +101,11 @@ def stats_vs_ref(ref, d):
         cm = cm.real
     r["fid_proxy_128"] = float(((mu - mu_r) ** 2).sum() + np.trace(S) + np.trace(S_r)
                                - 2 * np.trace(cm))
+    # metric internals accumulate GiBs in the caching allocator across calls,
+    # starving the gen subprocesses -> release after every ranking call
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     return r
 
 
