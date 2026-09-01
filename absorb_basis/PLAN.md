@@ -302,16 +302,17 @@ MJHQ-2500 正式賽（`results/sdxl_final_test2500.json`）—— **4:1 勝**：
 部署 parity：兩者 unet 2.449 GiB（fp16 4.782 GiB，1.95x）、median
 forward 90.2 vs 88.2 ms（同 kernel 路徑，差距 ~2%）。
 
-### 四模型總表（全部嚴格協定 + 真 kernel + 五指標；round-3 後，2026-08-31）
+### 五模型總表（全部嚴格協定 + 真 kernel + 五指標；2026-09-01）
 
 | 模型 | 最終配置 | vs SVDQuant |
 |---|---|---|
 | FLUX-schnell（1000） | λ0.01+S@1.0 | **5:0** |
 | PixArt-Σ（2500） | λ0.1+S@0.5 | **5:0** |
 | SDXL-Turbo（2500） | λ0.3 | **5:0** |
+| SDXL-base 30 步（1000） | λ0.001+S@0.5 | **5:0**（幅度最大：PSNR +0.87dB、FID-ref −3.17；見 PLAN_SDXL30.md） |
 | SANA-1.6B（2500） | λ0.3+S@0.25 | **4:1**（僅 FID-ref −0.09） |
 
-合計 19/20 指標勝。round-3（λ 網格加密 + S 強度 α 連續化 + per-channel
+合計 24/25 指標勝。round-3（λ 網格加密 + S 強度 α 連續化 + per-channel
 top 消融）細節與官方數字見 PLAN_ROUND3.md；per-channel top 為 3/3 一致
 負結果（寫入 ablation）。Algorithm 1 的輸出跨四模型各異（λ 與 α 選擇皆
 自動、只用校準資料），校準成本全面低於 SVDQuant（每模型他們 7h+ vs
