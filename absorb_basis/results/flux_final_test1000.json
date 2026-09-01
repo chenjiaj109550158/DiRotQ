@@ -1,0 +1,17 @@
+{
+  "absorb-damp0.01+S@1.0": {
+    "psnr": 19.096586227416992,
+    "lpips": 0.22312137484550476,
+    "ssim": 0.7497574090957642,
+    "fid_vs_ref": 27.551177348290935,
+    "fid_vs_gt": 59.929433181196316
+  },
+  "svdquant": {
+    "psnr": 18.824399948120117,
+    "lpips": 0.2318841964006424,
+    "ssim": 0.7429648041725159,
+    "fid_vs_ref": 28.274739705805814,
+    "fid_vs_gt": 60.39682573937074
+  },
+  "_note": "current official config lambda0.01+S@1.0 (flux_r2S_test1000.json); svdquant from flux_final_test1000_{similarity,fid}.json; MJHQ-1000, real nunchaku C++ kernel both sides"
+}
