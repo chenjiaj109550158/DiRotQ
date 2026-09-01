@@ -312,7 +312,23 @@ forward 90.2 vs 88.2 ms（同 kernel 路徑，差距 ~2%）。
 | SDXL-base 30 步（1000） | λ0.001+S@0.5 | **5:0**（幅度最大：PSNR +0.87dB、FID-ref −3.17；見 PLAN_SDXL30.md） |
 | SANA-1.6B（2500） | λ0.3+S@0.25 | **4:1**（僅 FID-ref −0.09） |
 
-合計 24/25 指標勝。round-3（λ 網格加密 + S 強度 α 連續化 + per-channel
+合計 24/25 指標勝。
+
+### 速度表（transformer/UNet forward 中位 ms，batch 1，RTX 5090；`results/speed_table.json`）
+
+| 模型 | fp16/bf16 ref | ours | SVDQuant | ours vs svdq |
+|---|---|---|---|---|
+| FLUX-schnell（nunchaku C++） | 455.4 | **159.0** | 159.1 | −0.1% |
+| PixArt-Σ | 92.7 | **66.6** | 66.2 | +0.6% |
+| SANA-1.6B | 44.7 | **36.7** | 38.0 | −3.4% |
+| SDXL-Turbo（512px） | 55.4 | **90.2** | 88.2 | +2.3% |
+| SDXL-base 30 步 | 86.6 | **98.0** | 98.6 | −0.6% |
+
+結論：(1) ours vs SVDQuant 全模型 parity（±3%）；(2) 量化 vs fp16 的加速
+取決於路徑與 GEMM 規模——真 C++ pipeline 的 FLUX 2.86×、python 注入的
+PixArt/SANA 1.2–1.4×、SDXL 系（同注入路徑、512px overhead-bound 或
+conv 佔比高）無加速。加速非本文 claim；表的作用是證明部署成本與
+SVDQuant 相同。round-3（λ 網格加密 + S 強度 α 連續化 + per-channel
 top 消融）細節與官方數字見 PLAN_ROUND3.md；per-channel top 為 3/3 一致
 負結果（寫入 ablation）。Algorithm 1 的輸出跨四模型各異（λ 與 α 選擇皆
 自動、只用校準資料），校準成本全面低於 SVDQuant（每模型他們 7h+ vs

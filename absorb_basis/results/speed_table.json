@@ -1,0 +1,8 @@
+{
+  "_note": "transformer/unet forward latency, median ms, batch 1, RTX 5090, cuda-event probes around the transformer forward, qdiff/MJHQ generation runs",
+  "flux-schnell":  {"ref_bf16": 455.4, "ours": 159.0, "svdquant": 159.1, "path": "nunchaku C++ pipeline (both quantized)", "ref_n": 128, "quant_n": 512},
+  "pixart-sigma":  {"ref_fp16": 92.7,  "ours": 66.6,  "svdquant": 66.2,  "path": "python SVDQW4A4Linear injection", "ref_n": 2560, "quant_n": 50000},
+  "sana-1.6b":     {"ref_bf16": 44.7,  "ours": 36.7,  "svdquant": 38.0,  "path": "python SVDQW4A4Linear injection", "ref_n": 2560, "quant_n": 50000},
+  "sdxl-turbo":    {"ref_fp16": 55.4,  "ours": 90.2,  "svdquant": 88.2,  "path": "python SVDQW4A4Linear injection (512px, overhead-bound)", "ref_n": 10000, "quant_n": 10000},
+  "sdxl-base-30":  {"ref_fp16": 86.6,  "ours": 98.0,  "svdquant": 98.6,  "path": "python SVDQW4A4Linear injection", "ref_n": 30000, "quant_n": 30000}
+}

@@ -68,35 +68,50 @@ def main():
     ap.add_argument("--stats-out", type=str, required=True)
     ap.add_argument("--benchmark", type=str, default="MJHQ",
                     help="benchmark name or a prompts .yaml path (e.g. prompts/qdiff.yaml)")
+    ap.add_argument("--bf16-ref", action="store_true",
+                    help="skip nunchaku: measure the stock bf16 transformer "
+                         "(model-cpu-offload; transformer stays resident "
+                         "during the denoise loop so lat_ms is comparable)")
     args = ap.parse_args()
 
     torch.cuda.init()
     dev_used_base = used_bytes()
     alloc_base = torch.cuda.memory_allocated()
 
-    if args.weight_path:
-        weight_path = args.weight_path
-        assert os.path.exists(weight_path), weight_path
+    if args.bf16_ref:
+        pipe = FluxPipeline.from_pretrained(args.base_model, torch_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+        transformer_mem = {
+            "transformer_bf16_gib": sum(
+                p.numel() * p.element_size() for p in pipe.transformer.parameters()
+            ) / 2**30,
+        }
+        print("transformer load memory:", json.dumps(transformer_mem))
+        pipe.enable_model_cpu_offload()
     else:
-        weight_path = hf_hub_download(args.weight_repo, args.weight_file)
-    from nunchaku import NunchakuFluxTransformer2dModel
+        if args.weight_path:
+            weight_path = args.weight_path
+            assert os.path.exists(weight_path), weight_path
+        else:
+            weight_path = hf_hub_download(args.weight_repo, args.weight_file)
+        from nunchaku import NunchakuFluxTransformer2dModel
 
-    transformer = NunchakuFluxTransformer2dModel.from_pretrained(
-        weight_path, device="cuda", torch_dtype=torch.bfloat16
-    )
-    torch.cuda.synchronize()
-    dev_used_after_tf = used_bytes()
-    alloc_after_tf = torch.cuda.memory_allocated()
-    transformer_mem = {
-        "device_used_delta_gib": (dev_used_after_tf - dev_used_base) / 2**30,
-        "torch_alloc_delta_gib": (alloc_after_tf - alloc_base) / 2**30,
-    }
-    print("transformer load memory:", json.dumps(transformer_mem))
+        transformer = NunchakuFluxTransformer2dModel.from_pretrained(
+            weight_path, device="cuda", torch_dtype=torch.bfloat16
+        )
+        torch.cuda.synchronize()
+        dev_used_after_tf = used_bytes()
+        alloc_after_tf = torch.cuda.memory_allocated()
+        transformer_mem = {
+            "device_used_delta_gib": (dev_used_after_tf - dev_used_base) / 2**30,
+            "torch_alloc_delta_gib": (alloc_after_tf - alloc_base) / 2**30,
+        }
+        print("transformer load memory:", json.dumps(transformer_mem))
 
-    pipe = FluxPipeline.from_pretrained(
-        args.base_model, transformer=transformer, torch_dtype=torch.bfloat16
-    )
-    pipe = pipe.to("cuda")
+        pipe = FluxPipeline.from_pretrained(
+            args.base_model, transformer=transformer, torch_dtype=torch.bfloat16
+        )
+        pipe = pipe.to("cuda")
     pipe.set_progress_bar_config(desc="Sampling", leave=False, dynamic_ncols=True, position=1)
     attach_probes(pipe.transformer)
 
