@@ -254,10 +254,10 @@ step backup-postmenu
 bash /vault/dirotq-absorb-backup/backup.sh >/dev/null 2>&1
 echo "STEP backup-postmenu exit $?"
 
-# ---- 7. official MJHQ-1000 -------------------------------------------------
-gen ref-mjhq1000 "--bf16-ref" fluxdev-ref MJHQ 1000
-gen final-absorb "--weight-path $FCKPT" fluxdev-absorb-final MJHQ 1000
-gen final-svdq "--weight-path $OFF" fluxdev-svdq-final MJHQ 1000
+# ---- 7. official MJHQ-500 (user decision 2026-09-01: 500 first) ------------
+gen ref-mjhq500 "--bf16-ref" fluxdev-ref MJHQ 500
+gen final-absorb "--weight-path $FCKPT" fluxdev-absorb-final MJHQ 500
+gen final-svdq "--weight-path $OFF" fluxdev-svdq-final MJHQ 500
 
 step final-metrics
 $PY - "$FTAG" <<'PYEOF'
@@ -271,17 +271,29 @@ from cleanfid import fid
 from deepcompressor.app.diffusion.eval.metrics.similarity import compute_image_similarity_metrics
 ftag = sys.argv[1]
 DC = "/home/dev/deepcompressor/examples/diffusion"
-ref = f"{DC}/runs/fluxdev-ref/samples/MJHQ/MJHQ-1000"
-gt = f"{DC}/benchmarks/MJHQ-GT-1000"
+ref = f"{DC}/runs/fluxdev-ref/samples/MJHQ/MJHQ-500"
+# GT-500: match the generated filenames against the GT-2500 superset
+# (MJHQ sampling is subset-consistent: GT-1000 is a subset of GT-2500)
+import os, shutil
+gt = f"{DC}/benchmarks/MJHQ-GT-500"
+if not os.path.isdir(gt) or len(os.listdir(gt)) != 500:
+    os.makedirs(gt, exist_ok=True)
+    names = set(os.listdir(ref))
+    n = 0
+    for f in names:
+        src = f"{DC}/benchmarks/MJHQ-GT-2500/{f}"
+        if os.path.exists(src):
+            shutil.copy2(src, f"{gt}/{f}"); n += 1
+    assert n == 500, f"GT-500 build: only {n}/500 matched"
 res = {}
-for tag, d in [(f"absorb-{ftag}", f"{DC}/runs/fluxdev-absorb-final/samples/MJHQ/MJHQ-1000"),
-               ("svdquant", f"{DC}/runs/fluxdev-svdq-final/samples/MJHQ/MJHQ-1000")]:
+for tag, d in [(f"absorb-{ftag}", f"{DC}/runs/fluxdev-absorb-final/samples/MJHQ/MJHQ-500"),
+               ("svdquant", f"{DC}/runs/fluxdev-svdq-final/samples/MJHQ/MJHQ-500")]:
     m = compute_image_similarity_metrics(ref, d, metrics=("psnr","lpips","ssim"), num_workers=0)
     res[tag] = {k: float(v) for k, v in m.items()}
     res[tag]["fid_vs_ref"] = fid.compute_fid(ref, d, verbose=False)
     res[tag]["fid_vs_gt"] = fid.compute_fid(gt, d, verbose=False)
     print(f"FINAL {tag}: " + json.dumps(res[tag]))
-json.dump(res, open("/home/dev/DiRotQ/absorb_basis/results/fluxdev_final_test1000.json", "w"), indent=2)
+json.dump(res, open("/home/dev/DiRotQ/absorb_basis/results/fluxdev_final_test500.json", "w"), indent=2)
 PYEOF
 echo "STEP final-metrics exit $?"
 

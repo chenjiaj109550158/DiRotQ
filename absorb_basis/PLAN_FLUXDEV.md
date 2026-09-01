@@ -18,8 +18,8 @@ nunchaku checkpoint 佈局相同）→ 全部沿用 schnell 的 build/gen 工具
 - Algorithm-1 選單（round-3 定版）：λ∈{0.001,0.003,0.01,0.03,0.1,0.3} 六點
   qdiff-128 四判準排名 → S（官方 smooth 因子 + 增益 τ=+0.3dB 層選擇）
   × α∈{0.25,0.5,0.75,1.0} 貪婪守門。per-channel top 不進選單。
-- 官方測試：MJHQ-1000（bf16 ref / ours / SVDQuant，皆 nunchaku C++ kernel
-  路徑），五指標，GT=MJHQ-GT-1000。
+- 官方測試：MJHQ-500（2026-09-01 使用者裁定，原計畫 1000）（bf16 ref / ours / SVDQuant，皆 nunchaku C++ kernel
+  路徑），五指標，GT=MJHQ-GT-500（自 GT-2500 依生成檔名對映建出）。
 
 ## S 增益量測（新腳本 measure_smooth_gain_flux.py）
 
@@ -43,7 +43,7 @@ build 時 s^α）。免整模型 forward，~10 分鐘。
 | 7 | λ 六點：build（12B GPTQ，~30–40m）+ gen（~20m）× 6 | ~5–6h |
 | 8 | rank-λ + 落選 checkpoint 清理（每檔 7.1G） | ~10 min |
 | 9 | S：gain 量測 + 4α ×（build+gen） | ~3.5–4h |
-| 10 | 官方 MJHQ-1000：bf16 ref ~6.5h + ours ~2.3h + svdq ~2.3h | ~11h |
+| 10 | 官方 MJHQ-500：bf16 ref ~5.3h + ours ~1.3h + svdq ~1.3h | ~8h |
 | 11 | 五指標 + 文件 + 備份 | ~1h |
 
 **總計 ≈ 26–29h。** 磁碟增量峰值 ~90G（dev 模型 23.8G + caches ~20G +
@@ -57,5 +57,5 @@ build 時 s^α）。免整模型 forward，~10 分鐘。
 - 官方權重：`models/flux-dev/svdq-fp4_r32-flux.1-dev.safetensors`
 - 我們 checkpoints：`models/flux-dev/absorb_basis/fluxdev_*.safetensors`
 - 結果：`results/fluxdev_lambda_qdiff128.json`、`fluxdev_S_qdiff128.json`、
-  `fluxdev_final_test1000.json`
+  `fluxdev_final_test500.json`
 - chain：`absorb_basis/run_fluxdev_chain.sh`，log `results/fluxdev_chain.log`
