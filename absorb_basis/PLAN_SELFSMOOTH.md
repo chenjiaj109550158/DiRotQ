@@ -165,3 +165,27 @@ JSON，不重跑）→ (5) 最終配置 ≠ 現行官方配置的模型重跑官
 **預估**：caches 重生 ~1.5–2h；向量+增益 ~2h；試點 ~40m；α 網格
 六模型 ~12h；官方重跑（預計 4 模型：schnell/pixart/sana/sdxl-base）
 ~6h。合計 ~22–26h GPU。磁碟峰值 +~30G（guard 45G）。
+
+## 稽核發現：adanorm 隱藏依賴（2026-09-02 執行中）
+
+容器稽核在 flux 首建即中止：**76 層 adaLN modulation linears
+（double norm1/norm1_context、single norm.linear）的
+qweight/wscales/wzeros 一直沿用官方容器值**——SVDQuant 的 W4A16
+（對稱 int4、zp=7、g64；wzeros=−7·wscales 逐位驗證）。其 scale
+無法以純 min/max 或 absmax RTN 逐位重現（可能含 scale search），
+無法證明 data-free → 依嚴格原則必須替換。另一類標記
+（down-proj smooth 全 1）為假陽性：官方不 smooth 12288 維層、
+我們亦寫 1，單位元素不含校準資訊，稽核放行。
+
+**修復**（已實作）：
+- `build_checkpoint.py` 新增 `requant_adanorm`（預設啟用，
+  `--keep-official-adanorm` 保留舊行為）：對稱 int4 zp=7、每組 64
+  的 MSE grid scale search（只用 bf16 權重，決定性 data-free），
+  以 deepcompressor 官方打包函數輸出。單元驗證：形狀/dtype 全合、
+  **重建 MSE 低於官方**（1.01e-5 vs 1.25e-5 / 6.7e-6 vs 8.4e-6）。
+- flux/fluxdev 選單改以自足基底（重建無S base + 重生基底 qdiff 圖），
+  且無論守門結果**一律重跑官方**（adanorm 位元已變，發表數字不可沿用）。
+- 稽核規則：smooth/smooth_orig 相等且全 1 → 放行；其餘任何
+  校準後綴 tensor 與容器相等 → 中止。
+- pixart/sana/sdxl 部署不經 nunchaku 容器（自建 kernel .pt +
+  原始 fp16 模型，adaLN 保持 fp16 原權重），無此問題。

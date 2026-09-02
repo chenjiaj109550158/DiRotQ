@@ -207,18 +207,23 @@ CFGS = {
     ),
     "flux": dict(
         lam="0.01", current_final="damp0.01+S@1.0", is_flux=True,
+        # the published base checkpoint carries the container's
+        # SVDQuant-quantized adanorm linears -> rebuild the no-S base with
+        # the data-free adanorm requant and fresh qdiff images, and always
+        # rerun the official benchmark (adanorm bits changed)
+        base_build=True, always_official=True,
         vec_dir=f"{REPO}/models/flux-schnell/absorb_basis",
         ck=lambda tag: (f"{REPO}/models/flux-schnell/absorb_basis/"
                         f"dirotq-selfsmooth-{tag}-fp4_r32-flux.1-schnell.safetensors"),
         base_ck=(f"{REPO}/models/flux-schnell/absorb_basis/"
-                 "dirotq-absorb-hsvd-down-fp4_r32-flux.1-schnell.safetensors"),
+                 "dirotq-selfsmooth-base-fp4_r32-flux.1-schnell.safetensors"),
         build=lambda out, lam, extra: (
             f"{PY} absorb_basis/build_checkpoint.py --basis hsvd --down-absorb "
             f"--hsvd-damping {lam} --out {out} {extra}"),
         gen_extra="",
         official_file=None,  # resolved from HF cache at audit time
         qref=f"{DC}/baselines/torch.bfloat16/flux.1-schnell/fmeuler4-g0/samples/YAML/qdiff-128",
-        base_qdiff=f"{DC}/runs/dirotq-absorb-hsvd-down-flux.1-schnell/samples/YAML/qdiff-128",
+        base_qdiff=f"{DC}/runs/flux-selfsmooth-qdiff-base/samples/YAML/qdiff-128",
         official=dict(n=1000,
                       ref=f"{DC}/baselines/torch.bfloat16/flux.1-schnell/fmeuler4-g0/samples/MJHQ/MJHQ-1000",
                       ref_vault=f"{VAULT}/deepcompressor/baselines/torch.bfloat16",
@@ -226,13 +231,14 @@ CFGS = {
                       gt=f"{DC}/benchmarks/MJHQ-GT-1000",
                       svdq=f"{DC}/runs/nvfp4-nunchaku-flux.1-schnell/samples/MJHQ/MJHQ-1000",
                       svdq_vault=f"{VAULT}/deepcompressor/runs/nvfp4-nunchaku-flux.1-schnell",
-                      base_dir=f"{DC}/runs/dirotq-absorb-hsvd-down-flux.1-schnell/samples/MJHQ/MJHQ-1000"),
+                      base_dir=None),
     ),
     "fluxdev": dict(
         lam="0.3", current_final="damp0.3", is_flux=True,
+        base_build=True, always_official=True,
         vec_dir=f"{MDEV}/absorb_basis",
         ck=lambda tag: f"{MDEV}/absorb_basis/fluxdev_selfsmooth_{tag}.safetensors",
-        base_ck=f"{MDEV}/absorb_basis/fluxdev_damp0.3.safetensors",
+        base_ck=f"{MDEV}/absorb_basis/fluxdev_selfsmooth_base.safetensors",
         build=lambda out, lam, extra: (
             f"{PY} absorb_basis/build_checkpoint.py "
             f"--model-id {DEV_ID} --official {MDEV}/svdq-fp4_r32-flux.1-dev.safetensors "
@@ -242,7 +248,7 @@ CFGS = {
         gen_extra=(f"--base-model {DEV_ID} --num-steps 50 --guidance-scale 3.5 "),
         official_file=f"{MDEV}/svdq-fp4_r32-flux.1-dev.safetensors",
         qref=f"{DC}/runs/fluxdev-qdiff-ref/samples/YAML/qdiff-128",
-        base_qdiff=f"{DC}/runs/fluxdev-qdiff-damp0.3/samples/YAML/qdiff-128",
+        base_qdiff=f"{DC}/runs/fluxdev-selfsmooth-qdiff-base/samples/YAML/qdiff-128",
         official=dict(n=500,
                       ref=f"{DC}/runs/fluxdev-ref/samples/MJHQ/MJHQ-500",
                       gt=f"{DC}/benchmarks/MJHQ-GT-500",
@@ -287,6 +293,12 @@ def audit_flux_container(built, official):
             n_checked += 1
             tb, to = fb.get_tensor(k), fo.get_tensor(k)
             if tb.shape == to.shape and torch.equal(tb, to):
+                # identity smoothing (all ones) carries no calibration info —
+                # SVDQuant leaves the 12288-dim down projections unsmoothed
+                # and so do we, so equality there is benign
+                if k.endswith((".smooth", ".smooth_orig")) and \
+                        bool((tb.float() == 1).all()):
+                    continue
                 same.append(k)
     assert not same, f"container audit FAILED, unreplaced calibration tensors: {same[:10]}"
     print(f"container audit OK: {n_checked} calibration-derived tensors all replaced",
@@ -314,16 +326,38 @@ def main():
         cmd = CFG["build"]("/dev/null", lam, "")
         assert "svdq_model_dump" not in cmd and "cov_actq" not in cmd, cmd
     assert count_png(CFG["qref"]) == 128, f"missing qref {CFG['qref']}"
-    assert count_png(CFG["base_qdiff"]) == 128, f"missing base qdiff {CFG['base_qdiff']}"
-    assert os.path.exists(CFG["base_ck"]), f"missing base ckpt {CFG['base_ck']}"
+    if not CFG.get("base_build"):
+        assert count_png(CFG["base_qdiff"]) == 128, f"missing base qdiff {CFG['base_qdiff']}"
+        assert os.path.exists(CFG["base_ck"]), f"missing base ckpt {CFG['base_ck']}"
     print(f"STEP {M}-prereq exit 0", flush=True)
 
     step(f"{M}-menu")
+    audited = False
+
+    def audit(ck):
+        nonlocal audited
+        if not CFG["is_flux"] or audited:
+            return
+        off = CFG["official_file"]
+        if off is None:
+            from huggingface_hub import hf_hub_download
+            off = hf_hub_download("mit-han-lab/nunchaku-flux.1-schnell",
+                                  "svdq-fp4_r32-flux.1-schnell.safetensors")
+        audit_flux_container(ck, off)
+        audited = True
+
+    if CFG.get("base_build"):
+        # self-contained no-S base (data-free adanorm requant included)
+        if not os.path.exists(CFG["base_ck"]):
+            disk_guard()
+            rc = sh(CFG["build"](CFG["base_ck"], lam, ""), cwd=REPO)
+            assert rc == 0 and os.path.exists(CFG["base_ck"]), "base build failed"
+        audit(CFG["base_ck"])
+        gen_qdiff(M, CFG, CFG["base_ck"], f"{M}-selfsmooth-qdiff-base")
     base_stats = stats_vs_ref(CFG["qref"], CFG["base_qdiff"])
     print(f"METRICS {M}-base(damp{lam}): " + json.dumps(base_stats), flush=True)
     cur_tag, cur_ck, cur_stats = f"damp{lam}", CFG["base_ck"], base_stats
     results = {"base": base_stats, "candidates": {}}
-    audited = False
     for fam in families:
         vec = f"{CFG['vec_dir']}/selfsmooth_{fam}.pt"
         gains = f"{CFG['vec_dir']}/selfsmooth_gain_{fam}.json"
@@ -341,14 +375,7 @@ def main():
                 disk_guard()
                 rc = sh(CFG["build"](ck, lam, extra), cwd=REPO)
                 assert rc == 0 and os.path.exists(ck), f"build {ck} failed"
-            if CFG["is_flux"] and not audited:
-                off = CFG["official_file"]
-                if off is None:
-                    from huggingface_hub import hf_hub_download
-                    off = hf_hub_download("mit-han-lab/nunchaku-flux.1-schnell",
-                                          "svdq-fp4_r32-flux.1-schnell.safetensors")
-                audit_flux_container(ck, off)
-                audited = True
+            audit(ck)
             d = gen_qdiff(M, CFG, ck, f"{M}-selfsmooth-qdiff-{tag}")
             s = stats_vs_ref(CFG["qref"], d)
             results["candidates"][f"S_{fam}@{a}"] = s
@@ -375,7 +402,7 @@ def main():
     if args.skip_official:
         print(f"{M}: official stage skipped by flag", flush=True)
         return
-    if cur_tag == CFG["current_final"]:
+    if cur_tag == CFG["current_final"] and not CFG.get("always_official"):
         print(f"{M}: config unchanged ({cur_tag}), official numbers stand; "
               f"pipeline is already self-contained", flush=True)
         return

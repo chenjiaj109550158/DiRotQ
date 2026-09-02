@@ -368,6 +368,54 @@ def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
     return out, qsnr.item(), bias_delta
 
 
+def adanorm_layers(num_double: int, num_single: int):
+    """The 76 adaLN modulation linears the fused-block table does not cover
+    (W4A16 symmetric int4 zp=7, group 64 in the nunchaku container)."""
+    t = [(f"transformer_blocks.{i}.norm1.linear", 6) for i in range(num_double)]
+    t += [(f"transformer_blocks.{i}.norm1_context.linear", 6) for i in range(num_double)]
+    t += [(f"single_transformer_blocks.{i}.norm.linear", 3) for i in range(num_single)]
+    return t
+
+
+@torch.no_grad()
+def requant_adanorm(W: torch.Tensor, bias: torch.Tensor, splits: int,
+                    group: int = 64) -> dict[str, torch.Tensor]:
+    """PLAN_SELFSMOOTH: data-free requantization of an adaLN modulation
+    linear, replacing the SVDQuant-produced qweight/wscales/wzeros in the
+    container. Symmetric int4 (zero point 7, codes -7..8) with a per-group
+    MSE grid search over the scale — uses only the bf16 weight, so the
+    result is a deterministic function of the original model."""
+    from deepcompressor.backend.nunchaku.convert import (
+        convert_to_nunchaku_w4x16_adanorm_single_state_dict,
+        convert_to_nunchaku_w4x16_adanorm_zero_state_dict,
+    )
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    Wf = W.to(dev, torch.float32)
+    oc, ic = Wf.shape
+    ng = ic // group
+    g = Wf.view(oc, ng, group)
+    # margins keep round(W/s + 7) inside [0, 15] even after bf16-rounding s
+    smin = torch.maximum(g.amax(-1) / 8.4, g.amin(-1) / -7.4).clamp(min=1e-8)
+    best_s, best_e = None, None
+    for r in torch.linspace(1.0, 1.3, 31):
+        s = (smin * r).to(torch.bfloat16).float()
+        s = torch.maximum(s, smin)
+        q = (g / s.unsqueeze(-1)).round().clamp(-7, 8)
+        e = (q * s.unsqueeze(-1) - g).pow(2).sum(-1)
+        if best_s is None:
+            best_s, best_e = s, e
+        else:
+            m = e < best_e
+            best_s = torch.where(m, s, best_s)
+            best_e = torch.where(m, e, best_e)
+    fn = (convert_to_nunchaku_w4x16_adanorm_single_state_dict if splits == 3
+          else convert_to_nunchaku_w4x16_adanorm_zero_state_dict)
+    rep = fn(weight=W.to(dev, torch.bfloat16),
+             scale=best_s.view(oc, 1, ng, 1),
+             bias=bias.to(dev, torch.bfloat16))
+    return {k: v.cpu() for k, v in rep.items()}
+
+
 @torch.no_grad()
 def hsvd_basis(W: torch.Tensor, H: torch.Tensor, rank: int, device: str,
                damping: float = 0.01):
@@ -562,6 +610,10 @@ def main():
                          "the selective-smoothing factors from our own "
                          "calibration (instead of unpacking the official "
                          "checkpoint's smooth tensors)")
+    ap.add_argument("--keep-official-adanorm", action="store_true",
+                    help="keep the container's SVDQuant-quantized adaLN "
+                         "modulation linears instead of the default data-free "
+                         "requantization (PLAN_SELFSMOOTH container audit)")
     args = ap.parse_args()
 
     if args.official is None:
@@ -582,6 +634,19 @@ def main():
 
     print("loading covariances/basis:", args.cov)
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
+
+    if not args.keep_official_adanorm:
+        print("requantizing adanorm modulation linears (data-free, "
+              "PLAN_SELFSMOOTH container audit)")
+        for prefix, splits in adanorm_layers(args.num_double, args.num_single):
+            rep = requant_adanorm(sd[f"{prefix}.weight"], sd[f"{prefix}.bias"],
+                                  splits)
+            for name, t in rep.items():
+                full = f"{prefix}.{name}"
+                assert full in tensors, f"unexpected adanorm key {full}"
+                assert tensors[full].shape == t.shape and \
+                    tensors[full].dtype == t.dtype, full
+                tensors[full] = t
 
     VALREF_LAYERS = {
         "transformer_blocks.0.qkv_proj",
