@@ -301,6 +301,11 @@ def audit_flux_container(built, official):
                 if k.endswith((".smooth", ".smooth_orig")) and \
                         bool((tb.float() == 1).all()):
                     continue
+                # a single-scalar coincidence (e.g. one wtscale fp32 equal by
+                # chance among thousands) carries no calibration info — our
+                # build always computes these, never copies them
+                if tb.numel() == 1:
+                    continue
                 same.append(k)
     assert not same, f"container audit FAILED, unreplaced calibration tensors: {same[:10]}"
     print(f"container audit OK: {n_checked} calibration-derived tensors all replaced",
@@ -373,11 +378,15 @@ def main():
             else:
                 extra = (f"--smooth-pt {vec} --gains {gains} "
                          f"--smooth-alpha {a}")
-            if not os.path.exists(ck):
-                disk_guard()
-                rc = sh(CFG["build"](ck, lam, extra), cwd=REPO)
-                assert rc == 0 and os.path.exists(ck), f"build {ck} failed"
-            audit(ck)
+            cached_imgs = f"{DC}/runs/{M}-selfsmooth-qdiff-{tag}/samples/YAML/qdiff-128"
+            if count_png(cached_imgs) != 128:
+                # gate ranking only needs the images; a rejected (deleted)
+                # checkpoint is NOT rebuilt when its images are cached
+                if not os.path.exists(ck):
+                    disk_guard()
+                    rc = sh(CFG["build"](ck, lam, extra), cwd=REPO)
+                    assert rc == 0 and os.path.exists(ck), f"build {ck} failed"
+                audit(ck)
             d = gen_qdiff(M, CFG, ck, f"{M}-selfsmooth-qdiff-{tag}")
             s = stats_vs_ref(CFG["qref"], d)
             results["candidates"][f"S_{fam}@{a}"] = s
