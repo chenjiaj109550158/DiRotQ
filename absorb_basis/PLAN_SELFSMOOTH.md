@@ -1,8 +1,7 @@
 # 去除 SVDQuant checkpoint 依賴：自足式 smoothing / 品質提升方案
 
-狀態：**執行中**（2026-09-02 使用者下令啟動；六模型全部實作與測試，
-校準資料範圍維持 qdiff-128 嚴格協定，完成後回報校準成本）。
-執行定版見文末「執行計畫定版」。
+狀態：**完成**（2026-09-02 全鏈執行完畢；六模型零依賴版 29/30 保持，
+校準成本與消融見文末「執行結果」）。
 
 ## 背景與動機
 
@@ -189,3 +188,62 @@ qweight/wscales/wzeros 一直沿用官方容器值**——SVDQuant 的 W4A16
   校準後綴 tensor 與容器相等 → 中止。
 - pixart/sana/sdxl 部署不經 nunchaku 容器（自建 kernel .pt +
   原始 fp16 模型，adaLN 保持 fp16 原權重），無此問題。
+
+**temb 感知修復（同日）**：純權重-MSE 重量化讓 flux 基底 qdiff 掉
+−0.49dB（權重誤差更低、端到端更差 → 官方 scale 為活化感知）。改為
+`collect_temb_flux.py`（qdiff-128 prompts 的 CLIP-L pooled × 32 點
+timestep 網格 → silu(temb) 4096 樣本，~2 分鐘/模型，零 SVDQuant）+
+活化能量對角加權的非對稱 (min,max) 收縮網格搜尋，打包與
+deepcompressor 轉換器 oracle 逐位對拍。實測：temb 樣本上輸出誤差比
+官方好 15×；基底 qdiff 收復至 −0.12dB（官方測試集上 adanorm 差異
+僅 −0.029dB，見 schnell 分解）。另兩個稽核規則修正：全 1 smooth
+（單位元素）與單元素純量巧合豁免。
+
+## 執行結果（2026-09-02，全鏈 05:31–18:47，~13.3h GPU）
+
+### 六模型零依賴定案與官方戰績——**29/30 保持**
+
+| 模型 | 定案（零依賴） | 發表配置 | 官方（vs SVDQuant） |
+|---|---|---|---|
+| SANA | damp0.3+**S_rms@0.25** | +S_svdq@0.25 | **4:1** 保持；與借用版差小數第三位（`sana_selfsmooth_test2500.json`） |
+| PixArt | damp0.1+**S_rms@0.5** | +S_svdq@0.5 | **5:0** 保持（`pixart_selfsmooth_test2500.json`） |
+| SDXL-Turbo | damp0.3（S 全拒） | damp0.3 | 配置未變，免重跑 |
+| SDXL-base | damp0.001（S 全拒） | +S_svdq@0.5 | **5:0** 保持且**五項全優於發表版**——svdq-S 在官方集根本沒賺（`sdxlb_selfsmooth_test1000.json`） |
+| FLUX-schnell | damp0.01（S 全拒） | +S_svdq@1.0 | **5:0** 保持（PSNR 邊際 +0.06dB；分解：少 S_svdq −0.184dB、adanorm 差異 −0.029dB）（`flux_selfsmooth_test1000.json`） |
+| FLUX.1-dev | damp0.3+**S_rms@0.25**（守門 4:0） | damp0.3（無 S） | **5:0** 保持（PSNR +0.40、FID-ref −1.56）（`fluxdev_selfsmooth_test500.json`） |
+
+### 科學觀察
+
+1. **閉式 S 與 svdq-S 的互補翻轉**：dev 上 svdq-S 四點全拒、
+   S_rms@0.25 卻 4:0 過門；schnell 相反（svdq-S@1.0 有效、閉式全拒）。
+   sana/pixart 閉式在與 svdq 版相同的 α 過門且官方幾乎同分。
+   α=0.25 甜蜜點（sana/dev）與 0.5（pixart）再現「軟化強度 + 守門」
+   的核心機制價值。
+2. **sdxl-base 的 svdq-S 是守門的偽陽性**：qdiff-128 過門但官方
+   1000 張五項全輸無 S 版——零依賴版反而修正了這點。
+3. **schnell 是唯一有實質代價的模型**（−0.21dB，86% 來自 S）；
+   borrowed-S 以「可選增強」呈現。
+
+### 校準成本（實測；SVDQuant 對照為我們代跑 deepcompressor 的實測）
+
+| 成分 | 成本 |
+|---|---|
+| caches（兩法共同前置） | pixart 5m40s / sana 20m / sdxl 系 ~0.5–1h / schnell ~40m / dev 2h04m |
+| cov 串流收集（ours） | 小模型 ~1–2h；dev 4h59m；記憶體 O(d²) 無 OOM（svdq 側 O(樣本×token×d)，sdxl-base 實測 OOM） |
+| **閉式 s + 增益量測（本輪新增）** | **3.5–13 分鐘/模型**；flux temb 收集 +2 分鐘 |
+| dev act-amax（caches_sub） | 11m |
+| S×α 選單（4 點守門） | sana 17m / pixart 25m / turbo 28m / sdxlb 56m / schnell ~1h10m / dev 2h22m |
+| 官方重跑（配置變更 5 模型） | sana 58m / pixart 1h28m / sdxlb 1h04m / schnell 24m（基圖快取）/ dev 1h16m |
+| SVDQuant 對照 | **5–7h/模型產 1 配置**（smoothing gridsearch 為大宗）；借因子路線需先付這筆 |
+
+結論：去依賴把「借用 SVDQuant 5–7h smoothing 產物」換成「自己
+~10 分鐘閉式計算」，品質 4 模型持平、1 模型（sdxl-base）更好、
+1 模型（schnell）−0.21dB。使用者部署 ours 全程接觸的校準產物 =
+qdiff-128 caches + 我們的 cov/amax/temb/s，零 SVDQuant。
+
+### 事件記錄
+
+執行中兩次守門級中止皆為容器稽核正確觸發：(1) adanorm 隱藏依賴
+（見上節，修復後品質更好）；(2) fluxdev 單一 wtscale 純量巧合
+（豁免規則）。另修 driver 重放時勿重建已刪落選檔（圖在即排名）。
+磁碟壓力時釋放 pixart/sana caches 27G（vault 5120/5120 驗證後）。

@@ -334,3 +334,17 @@ top 消融）細節與官方數字見 PLAN_ROUND3.md；per-channel top 為 3/3 �
 負結果（寫入 ablation）。Algorithm 1 的輸出跨四模型各異（λ 與 α 選擇皆
 自動、只用校準資料），校準成本全面低於 SVDQuant（每模型他們 7h+ vs
 我們全選單 <1.5h）。
+
+## 零依賴版（PLAN_SELFSMOOTH，2026-09-02 完成）
+
+六模型全 pipeline 去除 SVDQuant 一切校準產物（svdq smoothing dump、
+官方 smooth 解包、cov_actq_smooth、FLUX 容器的 adanorm W4A16 位元
+全數替換為自有校準/data-free 計算），**官方戰績 29/30 完整保持**：
+SANA damp0.3+S_rms@0.25（4:1）、PixArt damp0.1+S_rms@0.5（5:0）、
+SDXL-Turbo damp0.3（不變）、SDXL-base damp0.001（5:0 且五項優於
+發表版）、FLUX-schnell damp0.01（5:0）、FLUX.1-dev damp0.3+S_rms@0.25
+（5:0；閉式 S 在 svdq-S 全拒的 dev 上 4:0 過門）。閉式 s 成本
+3.5–13 分鐘/模型（取代借用因子路線的 5–7h smoothing 前置）。
+容器稽核抓到 adanorm 隱藏依賴 → temb 感知重量化修復（輸出誤差比
+官方好 15×）。細節、消融與校準成本表：PLAN_SELFSMOOTH.md；結果檔
+`results/{model}_selfsmooth_{qdiff128,test*}.json`。
