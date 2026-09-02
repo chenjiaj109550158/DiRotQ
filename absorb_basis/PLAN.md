@@ -302,17 +302,18 @@ MJHQ-2500 正式賽（`results/sdxl_final_test2500.json`）—— **4:1 勝**：
 部署 parity：兩者 unet 2.449 GiB（fp16 4.782 GiB，1.95x）、median
 forward 90.2 vs 88.2 ms（同 kernel 路徑，差距 ~2%）。
 
-### 五模型總表（全部嚴格協定 + 真 kernel + 五指標；2026-09-01）
+### 六模型總表（全部嚴格協定 + 真 kernel + 五指標；2026-09-02）
 
 | 模型 | 最終配置 | vs SVDQuant |
 |---|---|---|
 | FLUX-schnell（1000） | λ0.01+S@1.0 | **5:0** |
+| FLUX.1-dev 50 步（500） | λ0.3 | **5:0**（PSNR +0.51dB、FID-ref −2.94；對官方 nunchaku dev NVFP4；見 PLAN_FLUXDEV.md） |
 | PixArt-Σ（2500） | λ0.1+S@0.5 | **5:0** |
 | SDXL-Turbo（2500） | λ0.3 | **5:0** |
-| SDXL-base 30 步（1000） | λ0.001+S@0.5 | **5:0**（幅度最大：PSNR +0.87dB、FID-ref −3.17；見 PLAN_SDXL30.md） |
+| SDXL-base 30 步（1000） | λ0.001+S@0.5 | **5:0**（PSNR +0.87dB、FID-ref −3.17；見 PLAN_SDXL30.md） |
 | SANA-1.6B（2500） | λ0.3+S@0.25 | **4:1**（僅 FID-ref −0.09） |
 
-合計 24/25 指標勝。
+合計 **29/30 指標勝**。
 
 ### 速度表（transformer/UNet forward 中位 ms，batch 1，RTX 5090；`results/speed_table.json`）
 

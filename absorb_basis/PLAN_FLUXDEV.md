@@ -59,3 +59,37 @@ build 時 s^α）。免整模型 forward，~10 分鐘。
 - 結果：`results/fluxdev_lambda_qdiff128.json`、`fluxdev_S_qdiff128.json`、
   `fluxdev_final_test500.json`
 - chain：`absorb_basis/run_fluxdev_chain.sh`，log `results/fluxdev_chain.log`
+
+## 執行結果（2026-09-02，全程 Algorithm 1 嚴格協定 + nunchaku C++ kernel）
+
+### Algorithm-1 選擇（qdiff-128）
+
+- λ 六點排名 → **λ\*=0.3**（總積分勝 0.1；round-3 加密的網格點再次得分）。
+- S 守門：逐層增益量測強（228 層 median +0.42dB、138 層過門、零負層），
+  但端到端四判準 α=0.25/0.5/0.75/1.0 全部未過（1:3/1:3/2:2/2:2）
+  → **最終配置 = 純 damp0.3（無 S）**。dev 與 schnell（S@1.0 過門）相反
+  —— 展示了「逐層增益 ≠ 端到端增益」與守門機制的價值。
+- 選擇 JSON：`fluxdev_lambda_qdiff128.json`、`fluxdev_S_qdiff128.json`。
+
+### 官方 MJHQ-500（50 步 g3.5，`fluxdev_final_test500.json`）— **5:0 全勝**
+
+| 指標 | ours damp0.3 | SVDQuant（官方 dev NVFP4） | 差距 |
+|---|---|---|---|
+| PSNR ↑ | **21.57** | 21.06 | +0.51 dB |
+| LPIPS ↓ | **0.1929** | 0.2111 | −0.018 |
+| SSIM ↑ | **0.8196** | 0.8047 | +0.015 |
+| FID vs ref ↓ | **36.45** | 39.39 | −2.94 |
+| FID vs GT ↓ | **93.96** | 94.95 | −0.99 |
+
+### 實測時間（RTX 5090）
+
+collect 2h04m；cov-main 2h10m + cov-down 2h38m + act-samples 11m；
+bf16 qdiff-ref 1h22m；λ 選單 6×~30m + rank ≈ 3h；S 量測 3m + 4α ≈ 2h；
+官方：bf16 ref 500 5h42m + ours 1h13m + svdq 1h13m + 指標 ~25m。
+全程 ~22.5h。SVDQuant 側零校準（官方權重）。
+
+### 事件
+
+官方段執行中改 1000→500 時，執行中 bash 使用改檔前緩衝內容開跑 1000 版
+→ 殺鏈、以獨立續跑腳本 `run_fluxdev_official500.sh` 完成（教訓：
+執行中腳本不可改，改未達段落須停鏈或用續跑腳本）。
