@@ -379,41 +379,63 @@ def adanorm_layers(num_double: int, num_single: int):
 
 @torch.no_grad()
 def requant_adanorm(W: torch.Tensor, bias: torch.Tensor, splits: int,
-                    group: int = 64) -> dict[str, torch.Tensor]:
-    """PLAN_SELFSMOOTH: data-free requantization of an adaLN modulation
-    linear, replacing the SVDQuant-produced qweight/wscales/wzeros in the
-    container. Symmetric int4 (zero point 7, codes -7..8) with a per-group
-    MSE grid search over the scale — uses only the bf16 weight, so the
-    result is a deterministic function of the original model."""
-    from deepcompressor.backend.nunchaku.convert import (
-        convert_to_nunchaku_w4x16_adanorm_single_state_dict,
-        convert_to_nunchaku_w4x16_adanorm_zero_state_dict,
-    )
+                    group: int = 64,
+                    act_diag: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    """PLAN_SELFSMOOTH: requantize an adaLN modulation linear from the
+    original bf16 weight, replacing the SVDQuant-produced
+    qweight/wscales/wzeros in the container. Asymmetric int4 (group 64)
+    with a per-group min/max shrink grid minimizing the
+    activation-weighted error sum_k diag_k * dW_k^2 — diag comes from OUR
+    silu(temb) calibration samples (collect_temb_flux.py); uniform weights
+    if act_diag is None. Packed in the exact tinychat W4X16 layout the
+    nunchaku loader expects (bit-verified against deepcompressor's
+    converter on the symmetric path)."""
+    from deepcompressor.backend.tinychat.utils import ceil_num_groups, pack_w4
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     Wf = W.to(dev, torch.float32)
     oc, ic = Wf.shape
     ng = ic // group
     g = Wf.view(oc, ng, group)
-    # margins keep round(W/s + 7) inside [0, 15] even after bf16-rounding s
-    smin = torch.maximum(g.amax(-1) / 8.4, g.amin(-1) / -7.4).clamp(min=1e-8)
-    best_s, best_e = None, None
-    for r in torch.linspace(1.0, 1.3, 31):
-        s = (smin * r).to(torch.bfloat16).float()
-        s = torch.maximum(s, smin)
-        q = (g / s.unsqueeze(-1)).round().clamp(-7, 8)
-        e = (q * s.unsqueeze(-1) - g).pow(2).sum(-1)
-        if best_s is None:
-            best_s, best_e = s, e
+    wgt = (torch.ones(ic, device=dev) if act_diag is None
+           else act_diag.to(dev, torch.float32).clamp(min=0))
+    wgt = wgt.view(ng, group).unsqueeze(0)  # [1, ng, group]
+    mx, mn = g.amax(-1), g.amin(-1)
+    mn = torch.minimum(mn, torch.zeros_like(mn))  # zero must be representable
+    mx = torch.maximum(mx, torch.zeros_like(mx))
+    best = None
+    for r in torch.linspace(0.70, 1.00, 31):
+        # bf16-exact zero and scale so the search sees exactly what the
+        # runtime dequantizes with
+        mn_r = (mn * r).to(torch.bfloat16).float()
+        mx_r = mx * r
+        s = ((mx_r - mn_r) / 15).to(torch.bfloat16).float().clamp(min=1e-8)
+        q = ((g - mn_r.unsqueeze(-1)) / s.unsqueeze(-1)).round().clamp(0, 15)
+        e = ((q * s.unsqueeze(-1) + mn_r.unsqueeze(-1) - g).pow(2) * wgt).sum(-1)
+        if best is None:
+            best = (s, mn_r, e)
         else:
-            m = e < best_e
-            best_s = torch.where(m, s, best_s)
-            best_e = torch.where(m, e, best_e)
-    fn = (convert_to_nunchaku_w4x16_adanorm_single_state_dict if splits == 3
-          else convert_to_nunchaku_w4x16_adanorm_zero_state_dict)
-    rep = fn(weight=W.to(dev, torch.bfloat16),
-             scale=best_s.view(oc, 1, ng, 1),
-             bias=bias.to(dev, torch.bfloat16))
-    return {k: v.cpu() for k, v in rep.items()}
+            m = e < best[2]
+            best = (torch.where(m, s, best[0]), torch.where(m, mn_r, best[1]),
+                    torch.where(m, e, best[2]))
+    s, mn_r, _ = best
+    q = ((g - mn_r.unsqueeze(-1)) / s.unsqueeze(-1)).round().clamp(0, 15)
+    q = q.view(oc, ic).to(torch.int32)
+    # interleave the shift/scale/gate chunks exactly like deepcompressor's
+    # convert_to_nunchaku_w4x16_adanorm_* (weight rows, scales, zeros, bias)
+    perm = torch.arange(oc, device=dev).view(splits, oc // splits).t().reshape(-1)
+    delta = [0.0] * splits
+    delta[1] = delta[-2] = 1.0
+    qweight = pack_w4(q[perm].contiguous()).view(torch.int32)
+    ng_pad = ceil_num_groups(ic, group, weight_bits=4)
+    wscales = torch.zeros(ng_pad, oc, dtype=torch.bfloat16, device=dev)
+    wzeros = torch.zeros(ng_pad, oc, dtype=torch.bfloat16, device=dev)
+    wscales[:ng] = s[perm].t().to(torch.bfloat16)
+    # runtime dequant is q*scale + wzeros -> store the (shrunk) group min
+    wzeros[:ng] = mn_r[perm].t().to(torch.bfloat16)
+    b = bias.to(dev, torch.float32)[perm] + torch.tensor(
+        delta, device=dev).repeat(oc // splits)
+    return {"qweight": qweight.cpu(), "wscales": wscales.cpu(),
+            "wzeros": wzeros.cpu(), "bias": b.to(torch.bfloat16).cpu()}
 
 
 @torch.no_grad()
@@ -612,8 +634,13 @@ def main():
                          "checkpoint's smooth tensors)")
     ap.add_argument("--keep-official-adanorm", action="store_true",
                     help="keep the container's SVDQuant-quantized adaLN "
-                         "modulation linears instead of the default data-free "
-                         "requantization (PLAN_SELFSMOOTH container audit)")
+                         "modulation linears instead of the default "
+                         "self-calibrated requantization (PLAN_SELFSMOOTH "
+                         "container audit)")
+    ap.add_argument("--adanorm-temb", default=None,
+                    help="silu(temb) samples pt from collect_temb_flux.py; "
+                         "enables activation-weighted adanorm requant "
+                         "(uniform weights if omitted)")
     args = ap.parse_args()
 
     if args.official is None:
@@ -636,11 +663,16 @@ def main():
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
 
     if not args.keep_official_adanorm:
-        print("requantizing adanorm modulation linears (data-free, "
+        adiag = None
+        if args.adanorm_temb:
+            adiag = torch.load(args.adanorm_temb, map_location="cpu",
+                               weights_only=False)["diag"]
+        print("requantizing adanorm modulation linears "
+              f"({'temb-weighted' if adiag is not None else 'uniform'}, "
               "PLAN_SELFSMOOTH container audit)")
         for prefix, splits in adanorm_layers(args.num_double, args.num_single):
             rep = requant_adanorm(sd[f"{prefix}.weight"], sd[f"{prefix}.bias"],
-                                  splits)
+                                  splits, act_diag=adiag)
             for name, t in rep.items():
                 full = f"{prefix}.{name}"
                 assert full in tensors, f"unexpected adanorm key {full}"

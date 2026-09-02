@@ -19,6 +19,28 @@ guard() {
   if [ "$avail_g" -lt 45 ]; then echo "SELFSMOOTH_FAILED disk-low ${avail_g}G"; exit 1; fi
 }
 echo "SELFSMOOTH_FAMILY $FAM (continuation)"
+
+# temb samples for the activation-weighted adanorm requant (our qdiff-128
+# prompts + CLIP-L pooled + timestep grid; zero SVDQuant inputs)
+if [ ! -f "$REPO/models/flux-schnell/basis/adanorm_temb.pt" ]; then
+  step temb-flux
+  (cd "$REPO" && $PY absorb_basis/collect_temb_flux.py \
+      --model-id black-forest-labs/FLUX.1-schnell \
+      --prompts models/flux-schnell/calib_prompts.yaml \
+      --out models/flux-schnell/basis/adanorm_temb.pt)
+  echo "STEP temb-flux exit $?"
+fi
+if [ ! -f "$REPO/models/flux-dev/basis/adanorm_temb.pt" ]; then
+  step temb-fluxdev
+  (cd "$REPO" && $PY absorb_basis/collect_temb_flux.py \
+      --model-id black-forest-labs/FLUX.1-dev --guidance 3.5 \
+      --prompts models/flux-schnell/calib_prompts.yaml \
+      --out models/flux-dev/basis/adanorm_temb.pt)
+  echo "STEP temb-fluxdev exit $?"
+fi
+[ -f "$REPO/models/flux-schnell/basis/adanorm_temb.pt" ] && \
+  [ -f "$REPO/models/flux-dev/basis/adanorm_temb.pt" ] || { echo "SELFSMOOTH_FAILED temb"; exit 1; }
+
 for m in flux fluxdev; do
   guard
   step rollout-$m

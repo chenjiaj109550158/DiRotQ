@@ -219,6 +219,7 @@ CFGS = {
                  "dirotq-selfsmooth-base-fp4_r32-flux.1-schnell.safetensors"),
         build=lambda out, lam, extra: (
             f"{PY} absorb_basis/build_checkpoint.py --basis hsvd --down-absorb "
+            f"--adanorm-temb {REPO}/models/flux-schnell/basis/adanorm_temb.pt "
             f"--hsvd-damping {lam} --out {out} {extra}"),
         gen_extra="",
         official_file=None,  # resolved from HF cache at audit time
@@ -244,6 +245,7 @@ CFGS = {
             f"--model-id {DEV_ID} --official {MDEV}/svdq-fp4_r32-flux.1-dev.safetensors "
             f"--cov {MDEV}/basis/absorb_cov_basis.pt "
             f"--cov-down-dir {MDEV}/basis/absorb_cov_down "
+            f"--adanorm-temb {MDEV}/basis/adanorm_temb.pt "
             f"--basis hsvd --down-absorb --hsvd-damping {lam} --out {out} {extra}"),
         gen_extra=(f"--base-model {DEV_ID} --num-steps 50 --guidance-scale 3.5 "),
         official_file=f"{MDEV}/svdq-fp4_r32-flux.1-dev.safetensors",
