@@ -212,14 +212,30 @@ selection criterion.
    model's approximation error — which is precisely why the α grid and
    the gate exist.
 
-## Experimental closure
+## Experimental closure（2026-09-02 完成，`results/svdbasis_qdiff128.json`）
 
-- **λ→∞ row** (`svdbasis_ablation.py` → `results/svdbasis_qdiff128.json`):
-  plain-SVD basis inside our otherwise-identical pipeline (same NVFP4
-  GPTQ, same kernels, no S) vs. the λ* member, four calibration
-  criteria per model — the direct end-to-end instantiation of
-  Corollary 2.1 / Prop 3.1.
-- Anisotropy evidence: eigen/diag spectra of the collected `H` per
-  hook (orders of magnitude), justifying strictness in Corollary 2.1.
+λ→∞（plain-SVD basis，即 SVDQuant 的分解）放進我們其餘完全相同的
+pipeline（同 NVFP4 GPTQ on H、同 kernel、無 S、flux 同 adanorm），
+qdiff-128 四判準對決各模型 λ\* 基底：
+
+| 模型（λ\*） | λ\* vs λ→∞ | ΔPSNR(λ\*−∞) |
+|---|---|---|
+| PixArt（0.1） | **4:0** | +1.13 dB |
+| SANA（0.3） | **4:0** | +0.35 dB |
+| SDXL-base（0.001） | **4:0** | +0.29 dB |
+| FLUX-schnell（0.01） | **3:1** | +0.11 dB |
+| SDXL-Turbo（0.3，網格上緣） | 1:3 | −0.26 dB |
+| FLUX.1-dev（0.3，網格上緣） | 0:4 | −0.58 dB |
+
+**判讀**：(i) 4/6 模型 H 加權基底明確勝出（PixArt 差距達 1.1dB），
+Corollary 2.1 的端到端體現；(ii) 兩個 λ\* 已頂到網格上緣（0.3）的
+模型，最優點在網格之外、甚至趨向 SVD 端——**支持 T3 的家族觀點而非
+「H-SVD 恆勝」的教條**：沒有固定基底全贏，正確主張是「阻尼族
+⊇ {SVDQuant 端點}，由校準資料逐模型選擇」。論文寫法：λ 網格應延伸
+大 λ 端（含 ∞ 端點），Algorithm 1 自動落點；per-model λ\* 分布
+（0.001→∞）本身就是 anisotropy 重要性隨模型變化的量化證據。
+- Anisotropy evidence: per-hook `H` diag/eigen spectra span orders of
+  magnitude（cov 檔可直接出圖），justifying strictness in Cor 2.1
+  where it wins.
 - Grand results: `PLAN.md`（六模型 29/30）、`PLAN_SELFSMOOTH.md`
   （零依賴消融與成本）。
