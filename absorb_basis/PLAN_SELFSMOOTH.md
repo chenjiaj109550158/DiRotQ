@@ -1,7 +1,8 @@
 # 去除 SVDQuant checkpoint 依賴：自足式 smoothing / 品質提升方案
 
-狀態：**規劃中，未開始實作**（2026-09-01 撰寫；使用者指示先存檔，
-之後再啟動實作測試）。
+狀態：**執行中**（2026-09-02 使用者下令啟動；六模型全部實作與測試，
+校準資料範圍維持 qdiff-128 嚴格協定，完成後回報校準成本）。
+執行定版見文末「執行計畫定版」。
 
 ## 背景與動機
 
@@ -101,3 +102,66 @@ self-contained / borrowed-factors 兩版數字，依賴降級為可選增強。
   `--official` 解包 s；需加 `--select-smooth-vectors` 讓 s 改讀外部檔。
 - 守門與 α 網格完全沿用 round-3 定版流程，結果檔命名
   `{model}_selfsmooth_qdiff128.json`。
+
+## 執行計畫定版（2026-09-02，動工）
+
+**範圍**：六模型（flux-schnell λ0.01、flux-dev λ0.3、pixart λ0.1、
+sana λ0.3、sdxl-turbo λ0.3、sdxl-base λ0.001）。λ\* 固定沿用
+（λ 選擇本就零依賴）；本輪只重做 S 階段，menu = {無S 基底,
+S_closed(rms)@α, S_closed(amax)@α}，**不含任何 SVDQuant 產物**。
+
+**強化原則（2026-09-02 使用者裁定）**：不只官方 checkpoint 的 smooth
+因子，**連我們自己代跑 deepcompressor smoothing 產生的
+`svdq_model_dump/`（smooth.pt/scale.pt/model.pt）與
+`cov_actq_smooth.pt`（在 svdq-s 域收的 cov）也全面禁用**。判準：
+使用者要把 ours 部署到一個新模型時，全程不需要執行或讀取 SVDQuant
+的任何 calibration 結果。builder 對 smoothed 層一律走解析
+`H/(s⊗s)`，不傳 `--gptq-cov`。消融表中的 S_svdq 欄位僅沿用既有
+round3 JSON 作對照呈現，不作任何新 pipeline 輸入。FLUX pilot build
+後加稽核步：逐 key 驗證輸出檔中所有校準衍生 tensors
+（qweight/wscales/smooth/smooth_orig/lora_down/lora_up/wtscale）
+與官方容器不同（全數被我們覆寫）。
+
+**基礎設施盤點**（2026-09-02 實測）：
+- 三個 kernel builder（pixart/sana/sdxl）已吃通用 `--smooth-pt
+  {skey: s}` + `--gains` json → 零改動，只換輸入檔。
+- FLUX `build_checkpoint.py` 需加 `--select-smooth-vectors <pt>`
+  （s 改讀外部檔，取代官方 checkpoint 解包；其餘 gate/α 機制不動）。
+- qdiff-128 基底圖與 ref 圖六模型皆在 runs/（λ\* 基底免重生）。
+- caches 現況：sdxl-turbo/sdxl-base/flux-dev 在；**pixart/sana 已因
+  磁碟清理刪除 → 用各自 collect_calibration_dataset.py 重生**
+  （defaults = 20 步 g4.5 1024px qdiff-128，與原始 cov 收集同協定）；
+  flux-schnell caches 亦刪但離線量測只需 act samples/amax（皆在）。
+
+**s 定義（存全強度 s，builder 套 s^α）**：
+- rms 族：`s_k = rms_x,k / rms_w,k`；rms_x=sqrt(diag H)（cov 免費），
+  rms_w = W_res(λ*) hook-併排的每輸入通道 RMS。α=0.5 即理論閉式解。
+- amax 族：`s_k = amax_x,k / amax_w,k`；amax_x 全流收集
+  （schnell 用既有 absorb_act_amax.pt；dev 對 caches 跑 collect_act_amax；
+  pixart/sana/sdxl 於 hook pass 全 caches 累積），amax_w=W_res 每通道絕對最大。
+- 兩族皆做幾何平均=1 正規化（全域尺度對 NVFP4 兩級 scale 近乎不變，
+  正規化讓 α 旋鈕語意乾淨）；smoothing 範圍與現行 S 完全相同
+  （flux down-proj、sdxl conv、cross-KV 不 smooth）。
+
+**增益量測**（gate 層選擇，τ=+0.3dB 不變，s 取 α=1）：
+- flux 系：離線（act samples + cov），同 measure_smooth_gain_flux 法。
+- pixart/sana/sdxl 系：hook 式 16 檔 strided forward（sdxl 先例），
+  兩族 s 同 pass 各算 e1。
+
+**新增/修改檔案**：`selfsmooth_vectors_flux.py`（s+增益，schnell/dev）、
+`selfsmooth_vectors_hook.py`（pixart/sana/sdxl 系：pass1 全 caches amax
+→ s 兩族 → pass2 增益）、`build_checkpoint.py`（--select-smooth-vectors）、
+`selfsmooth_driver.py`（round3_driver 同款 4 判準 wins/stats + 貪婪守門）、
+`run_selfsmooth_all.sh`（setsid 鏈）。
+
+**流程**：(0) pixart/sana caches 重生 + dev act_amax →
+(1) 六模型 s 向量 + 增益 → (2) SANA 試點：rms@0.5 vs amax@0.5 vs
+基底（qdiff-128 四判準）→ 決定族別鋪開 → (3) 六模型勝族 α 網格
+{0.25,0.5,0.75,1.0} 貪婪守門（flux 落選 safetensors 即刪控磁碟）→
+(4) 消融三方表（closed vs svdq-S vs 無S；svdq 側全部沿用既有 round3
+JSON，不重跑）→ (5) 最終配置 ≠ 現行官方配置的模型重跑官方 benchmark
+（僅 ours 側生成；ref/svdq/GT 圖皆在）→ (6) 校準成本回報。
+
+**預估**：caches 重生 ~1.5–2h；向量+增益 ~2h；試點 ~40m；α 網格
+六模型 ~12h；官方重跑（預計 4 模型：schnell/pixart/sana/sdxl-base）
+~6h。合計 ~22–26h GPU。磁碟峰值 +~30G（guard 45G）。

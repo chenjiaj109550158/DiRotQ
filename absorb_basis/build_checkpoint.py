@@ -557,6 +557,11 @@ def main():
     ap.add_argument("--select-smooth-alpha", type=float, default=1.0,
                     help="PLAN_ROUND3: smoothing strength s^alpha for the "
                          "selective-smoothing layers")
+    ap.add_argument("--select-smooth-vectors", default=None,
+                    help="PLAN_SELFSMOOTH: pt file {nk_prefix: s} providing "
+                         "the selective-smoothing factors from our own "
+                         "calibration (instead of unpacking the official "
+                         "checkpoint's smooth tensors)")
     args = ap.parse_args()
 
     if args.official is None:
@@ -613,6 +618,14 @@ def main():
         select_gains = json.load(open(args.select_smooth_gains))
         n_sel = sum(1 for v in select_gains.values() if v > args.select_threshold)
         print(f"selective smoothing: {n_sel}/{len(select_gains)} measured layers")
+    select_vectors = None
+    if args.select_smooth_vectors:
+        assert select_gains is not None, \
+            "--select-smooth-vectors requires --select-smooth-gains"
+        select_vectors = torch.load(args.select_smooth_vectors,
+                                    map_location="cpu", weights_only=False)
+        print(f"selective smoothing vectors: {len(select_vectors)} layers "
+              f"from {args.select_smooth_vectors}")
 
     act_amax = None
     if args.smooth in ("a05", "main-a05", "main-search"):
@@ -660,9 +673,13 @@ def main():
             s_layer = None
             if select_gains is not None and \
                     select_gains.get(nk_prefix, -1e9) > args.select_threshold:
-                s_layer = unpack_scale_vector(
-                    tensors[f"{nk_prefix}.smooth"]).float().pow(
+                if select_vectors is not None:
+                    s_layer = select_vectors[nk_prefix].float().pow(
                         args.select_smooth_alpha)
+                else:
+                    s_layer = unpack_scale_vector(
+                        tensors[f"{nk_prefix}.smooth"]).float().pow(
+                            args.select_smooth_alpha)
             repl, qsnr, bias_delta = build_layer_v2(
                 Wg, H, D, lu0, kind, args.group_size, "cuda",
                 gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
