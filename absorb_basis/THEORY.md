@@ -136,6 +136,37 @@ under a Gaussian-type regularity). **They minimize the right-hand
 side; we minimize the left-hand side directly** — at the basis stage
 exactly (T2), and at the quantization stage as follows.
 
+**Proposition 4′ (smooth-then-SVD = diagonal-metric approximation).**
+SVDQuant's actual rank-r stage operates AFTER smoothing: with factors
+`λ ∈ R^n_{>0}`, `x̂ = x·diag(λ)⁻¹`, `Ŵ = W·diag(λ)`, they take the
+truncated SVD `L̂ = (Ŵ)_r` and deploy the lora on `x̂`. In raw
+coordinates the deployed low-rank branch is `L_λ = L̂·diag(λ)⁻¹`, and
+
+    L_λ = argmin_{rank ≤ r} ‖(W−L)·diag(λ)‖_F
+        = argmin_{rank ≤ r} ‖W−L‖_{diag(λ²)} ,
+
+i.e. smooth-then-SVD is exactly the weighted low-rank problem with the
+**diagonal** metric `diag(λ²)` (proof: right-multiplication by the
+invertible `diag(λ)` is a rank-preserving bijection; Eckart–Young).
+The basis hierarchy is therefore: metric `I` (plain SVD of raw W) →
+`diag(λ²)` (SVDQuant) → `H_λ` (ours, full second moment). By Theorem 2,
+
+    ‖W − L*‖_{H_λ} ≤ ‖W − L_λ‖_{H_λ}   for every λ,
+
+so the dominance claim holds against SVDQuant's *actual*
+smooth-then-SVD stage, not merely against plain SVD; the remaining gap
+they cannot close with any diagonal has two sources: (i) the
+off-diagonal correlations of `H` (a diagonal metric cannot rotate the
+subspace toward correlated directions), and (ii) their `λ` is an
+amax-mix with a weight-side exponent (SmoothQuant heritage), so one
+diagonal simultaneously serves basis weighting *and* residual-quantizer
+conditioning — objectives our pipeline decouples (full-`H` basis;
+separate post-split `s` for the quantizer, T5). Note the λ→∞ ablation
+row instantiates metric `I`; the main tables compare against their
+complete pipeline (smoothing included); the intermediate
+`diag(diag(H_λ))`-metric row is a proposed ablation to separate the
+value of the diagonal from the value of the correlations.
+
 **Quantizer alignment.** Our residual quantizer is GPTQ on the exact
 NVFP4 two-level kernel grid (per-tensor/-channel top scale ×
 per-group-16 e4m3 micro-scale, act-order): per coordinate it performs
