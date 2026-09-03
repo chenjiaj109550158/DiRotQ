@@ -1,0 +1,104 @@
+{
+  "p3_pixart": {
+    "final": {
+      "psnr": 17.485422134399414,
+      "lpips": 0.3067469596862793,
+      "ssim": 0.6757756471633911,
+      "fid_proxy_128": 76.59195041240389
+    },
+    "clip": {
+      "psnr": 17.491376876831055,
+      "lpips": 0.3056592345237732,
+      "ssim": 0.6751284599304199,
+      "fid_proxy_128": 76.17747502389966
+    },
+    "wins_clip_vs_final": 3,
+    "wins_final_vs_clip": 1,
+    "accepted": true
+  },
+  "p3_flux": {
+    "final": {
+      "psnr": 18.337200164794922,
+      "lpips": 0.23133538663387299,
+      "ssim": 0.7420568466186523,
+      "fid_proxy_128": 48.9424823661077
+    },
+    "clip": {
+      "psnr": 18.258766174316406,
+      "lpips": 0.22851935029029846,
+      "ssim": 0.7431093454360962,
+      "fid_proxy_128": 48.671183773319
+    },
+    "wins_clip_vs_final": 3,
+    "wins_final_vs_clip": 1,
+    "accepted": true
+  },
+  "p2_flux_downS0.5": {
+    "final": {
+      "psnr": 18.337200164794922,
+      "lpips": 0.23133538663387299,
+      "ssim": 0.7420568466186523,
+      "fid_proxy_128": 48.9424823661077
+    },
+    "downS": {
+      "psnr": 18.317363739013672,
+      "lpips": 0.22739341855049133,
+      "ssim": 0.7446233034133911,
+      "fid_proxy_128": 50.270453001514625
+    },
+    "wins_downS_vs_final": 2,
+    "wins_final_vs_downS": 2,
+    "accepted": false
+  },
+  "p2_flux_downS0.25": {
+    "final": {
+      "psnr": 18.337200164794922,
+      "lpips": 0.23133538663387299,
+      "ssim": 0.7420568466186523,
+      "fid_proxy_128": 48.9424823661077
+    },
+    "downS": {
+      "psnr": 18.18825340270996,
+      "lpips": 0.23125749826431274,
+      "ssim": 0.7415646910667419,
+      "fid_proxy_128": 50.117527714075266
+    },
+    "wins_downS_vs_final": 1,
+    "wins_final_vs_downS": 3,
+    "accepted": false
+  },
+  "p2_fluxdev_downS0.5": {
+    "final": {
+      "psnr": 21.107925415039062,
+      "lpips": 0.20041796565055847,
+      "ssim": 0.8163790702819824,
+      "fid_proxy_128": 45.46302885986853
+    },
+    "downS": {
+      "psnr": 21.10002899169922,
+      "lpips": 0.2041957676410675,
+      "ssim": 0.8134827613830566,
+      "fid_proxy_128": 45.31885726479203
+    },
+    "wins_downS_vs_final": 1,
+    "wins_final_vs_downS": 3,
+    "accepted": false
+  },
+  "p2_fluxdev_downS0.25": {
+    "final": {
+      "psnr": 21.107925415039062,
+      "lpips": 0.20041796565055847,
+      "ssim": 0.8163790702819824,
+      "fid_proxy_128": 45.46302885986853
+    },
+    "downS": {
+      "psnr": 21.13018035888672,
+      "lpips": 0.19680730998516083,
+      "ssim": 0.81873619556427,
+      "fid_proxy_128": 44.67875213178229
+    },
+    "wins_downS_vs_final": 4,
+    "wins_final_vs_downS": 0,
+    "accepted": true
+  }
+}

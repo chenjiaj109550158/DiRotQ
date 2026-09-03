@@ -27,3 +27,47 @@ lambdaext 泛化縫隙觀察。
 守門原則：一律 Algorithm-1 端到端四判準 ≥3/4（A 教訓：不信離線代理）。
 官方重跑僅配置變更模型。預估：P1 試點 ~1.5h；P1 全鋪 ~8h；
 P2 ~3h；P3 ~4h；P4 ~3h。
+
+## 執行結果（2026-09-03；P3+P2 完成，P1/P5 未動）
+
+### 精確等價加速（先行落地，全部逐位驗證）
+
+`--reuse-from`（增量重建：dev S 候選 build 35 分→1 分 45 秒，整檔
+逐位同歷史）、`gptq_prepare`+`--factor-cache`（per-hook 置換+逆
+Hessian Cholesky 快取，單元逐位同）、`--adanorm-cache`。本輪 P2 四個
+候選 build 合計 <20 分（原 ~2.5h）。
+
+### P3 clip-search 重審 — **兩模型皆「守門過、官方翻車」→ 不採納**
+
+- pixart：qdiff 3:1 過門；官方 2500 對 SVDQuant 仍 5:0，但對現行
+  配置 **1:4**（PSNR −0.09）。
+- schnell：qdiff 3:1 過門；官方 1000 **對現行配置 0:5、對 SVDQuant
+  1:4（PSNR 18.62 vs 18.82）**——若採納會直接輸掉記分板。
+- 結論：clip 在 hsvd 配方下維持負結果（與 round-1 一致，這次含
+  完整官方證據）；`{model}_p23_test*.json` 留檔。
+
+### P2 down-proj 閉式 S — **乾淨的方法性負結果**
+
+- 逐層增益：schnell 2/76 過 τ（median −0.19dB）、dev 2/76
+  （median −0.17dB）——H-SVD lora 已吸收 GELU 輸出的 outlier 結構，
+  SVDQuant 不 smooth down 層被證明合理。
+- 守門：schnell α 兩點全拒；dev α=0.25 以小邊際 4:0 過門，但官方
+  對現行配置 **2:3**（PSNR −0.065）→ 不採納。
+- 使用者校準成本結論：down act 收集+增益 ~15 分/FLUX 模型，
+  但既然負結果，正式 pipeline 不納入（零增量維持）。
+
+### 系統性發現：qdiff-128 守門的解析度下限（四案定論）
+
+λext-turbo（FID-proxy 反對票應驗）、λext-dev（4:0 不轉移）、
+P3-clip×2（3:1 全翻車）、P2-dev（小邊際 4:0 不轉移）——
+**小邊際（~±0.05dB 級）的守門通過不具官方轉移力**；歷史上轉移成功
+的接受案例（S_rms於 sana/pixart、λ 選擇）皆為大邊際。論文寫法：
+(1) 發表配置凍結於 selfsmooth 定版；(2) 守門政策建議升級為
+「≥3/4 且邊際高於雜訊底」或 bootstrap 顯著性；(3) 本輪全部官方
+數字作為守門極限的消融證據（對 SVDQuant 的 5:0/4:1 在所有變體下
+從未破壞——方法魯棒性的側面證據）。
+
+### 狀態
+
+P3/P2 關閉（documented negatives）；P1（waterfill）與 P5（block
+重建）依使用者指示待啟動；bootstrap CI 由「建議」升級為「必需」。
