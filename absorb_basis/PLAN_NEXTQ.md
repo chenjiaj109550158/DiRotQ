@@ -89,3 +89,16 @@ P3/P2 關閉（documented negatives）；P1（waterfill）與 P5（block
   重分組皆不可及。論文結語素材：「pipeline 運行於 NVFP4 格式的
   有效天花板」。P1/P5 的期望值因 +1.27dB floor 大幅下修，建議
   降級或僅作消融行。
+
+## 補充分析 2（2026-09-03 深夜）：rotation 全家族判定——關閉且有害
+
+block-16 {Hadamard, RHT, Haar}、DuQuant 式 zigzag+RHT、以及**全維
+Haar oracle（不可部署上界）**在 act 樣本上全數為負
+（`rot16_headroom.log`）：main median −0.18~−0.29dB、down
+−1.5~−2.6dB（act 項；權重 RTN 項亦全負）。機制：incoherence 收益
+屬於粗 scale 格式（per-channel INT4 / MXFP4 group-32 二冪）；
+NVFP4 動態 per-group-16 e4m3 已領走稀疏紅利，旋轉抹平尖峰反而
+拉高總誤差。定位句：「rotation 修補粗格式；細格式 + outlier 吸收
+分解使其多餘且有害」——同時解釋 DiRotQ 論文（INT4）與 KroQuant
+（MXFP4）在其格式上有收益的原因。act 項 75% 的不可約性證據鏈
+完整：S → 置換 → block 旋轉 → 全維 oracle 全數排除。
