@@ -71,3 +71,21 @@ P3-clip×2（3:1 全翻車）、P2-dev（小邊際 4:0 不轉移）——
 
 P3/P2 關閉（documented negatives）；P1（waterfill）與 P5（block
 重建）依使用者指示待啟動；bootstrap CI 由「建議」升級為「必需」。
+
+## 補充分析（2026-09-03 晚）：低精度分支誤差分解與置換判定
+
+- **分解（lowbranch_headroom.log，schnell 24 層）**：4-bit 分支誤差
+  中位 **75% 來自活化量化、25% 來自權重**；GPTQ 已對權重項貢獻
+  +4.57dB（vs RTN），oracle-H 再擠僅 +2.12dB（權重項）；
+  **權重誤差歸零的層 QSNR 天花板 = +1.27dB**。所有權重側方法
+  （P1/P5/clip/bias）合計不可能穿過此 floor——P2/P3/λext 不轉移
+  的機制級解釋。
+- **置換（rotation 家族唯一 kernel-free 成員）判定
+  （perm_headroom.log）**：量級排序分組 main 層噪聲級（median
+  +0.04dB）、down 層**有害**（act 項 median −1.9dB、個別 −8dB）——
+  動態逐 token act 量化下「同量級分組」直覺失效（大通道共享粗
+  scale 互傷）。方向關閉。
+- **蓋棺**：剩餘誤差鎖在部署格式的活化量化器內稟誤差；對角縮放與
+  重分組皆不可及。論文結語素材：「pipeline 運行於 NVFP4 格式的
+  有效天花板」。P1/P5 的期望值因 +1.27dB floor 大幅下修，建議
+  降級或僅作消融行。
