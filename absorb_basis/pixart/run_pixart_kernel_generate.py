@@ -68,6 +68,23 @@ def inject_kernel(transformer, packed_dict):
             parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
         old = getattr(parent, parts[-1]) if not parts[-1].isdigit() else parent[int(parts[-1])]
         assert isinstance(old, nn.Linear), wpath
+        if "codes" in t:  # PLAN_MX: MXFP4e2 Triton runtime
+            from absorb_basis.mx_kernel import MXW4A4Linear
+            lin = MXW4A4Linear(
+                t["codes"].to("cuda"), t["exps"].to("cuda"),
+                t["lora_down"].to("cuda", torch.float16),
+                t["lora_up"].to("cuda", torch.float16),
+                bias=(old.bias.detach().to("cuda", torch.float16)
+                      if old.bias is not None else None),
+                smooth=(t["smooth"].to("cuda", torch.float16)
+                        if not torch.all(t["smooth"] == 1) else None),
+            )
+            if parts[-1].isdigit():
+                parent[int(parts[-1])] = lin
+            else:
+                setattr(parent, parts[-1], lin)
+            n_replaced += 1
+            continue
         ic, oc = old.in_features, old.out_features
         lin = SVDQW4A4Linear(
             ic, oc, rank=t["lora_down"].shape[1], bias=old.bias is not None,

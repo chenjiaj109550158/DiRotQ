@@ -88,6 +88,30 @@ def mx_unpack_weight(codes: torch.Tensor, exps: torch.Tensor,
     return val * s
 
 
+@torch.no_grad()
+def quantize_residual_mx(W_res: torch.Tensor, H: torch.Tensor, device: str,
+                         gptq: bool = True, damp_pct: float = 0.01,
+                         block_size: int = 128, prepared=None) -> torch.Tensor:
+    """GPTQ (or RTN) on the exact MXFP4e2 grid: per-group-32 E8M0 scales
+    passed as scales_override so the GPTQ grid equals the deployed decode.
+    Returns the dequantized weight (on-grid values)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from utils.gptq_utils import _gptq_quantize_layer
+    eff = mx_weight_scales(W_res)  # [oc, ic/32]
+    if gptq:
+        W_q = _gptq_quantize_layer(
+            W_res, H.to(device=device, dtype=torch.float32),
+            bits=4, groupsize=BLOCK, sym=True, damp_pct=damp_pct,
+            block_size=block_size, num_inv_tries=8, device=device,
+            nvfp4=True, scales_override=eff, prepared=prepared)
+        if W_q is not None:
+            return W_q
+        print("[warn] GPTQ failed; falling back to MX RTN")
+    return mx_weight_sim(W_res)
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     # OCP spec checks

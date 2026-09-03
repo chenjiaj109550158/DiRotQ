@@ -77,6 +77,10 @@ def main():
     ap.add_argument("--basis-diag", action="store_true",
                     help="THEORY Prop 4' ablation: diagonal basis metric "
                          "(GPTQ keeps the full H)")
+    ap.add_argument("--grid", choices=["nvfp4", "mx"], default="nvfp4",
+                    help="PLAN_MX: quantization grid. 'mx' = OCP MXFP4e2 "
+                         "(group-32 E8M0), packed for the Triton "
+                         "MXW4A4Linear runtime")
     args = ap.parse_args()
     assert not (args.per_channel_top and args.gain_k), "flags conflict on wcscales"
 
@@ -134,6 +138,26 @@ def main():
             lo, hi, n = args.clip_grid
             clip_kw = {"hdiag": Hg.diagonal().clone(),
                        "clip_ratios": torch.linspace(lo, hi, int(n))}
+        if args.grid == "mx":
+            from absorb_basis.mx_quant import mx_pack_weight, quantize_residual_mx
+            W_q = quantize_residual_mx(W_res, Hg, "cuda", gptq=True,
+                                       damp_pct=args.damp,
+                                       block_size=args.block_size)
+            codes, exps = mx_pack_weight(W_q)
+            s_pack = (s if s is not None
+                      else torch.ones(W.shape[1], device="cuda",
+                                      dtype=torch.float32))
+            out[wpath] = {
+                "codes": codes.cpu(), "exps": exps.cpu(),
+                "lora_down": D.t().half().cpu(),   # [ic, r]
+                "lora_up": lora_up.half().cpu(),   # [oc, r]
+                "smooth": s_pack.half().cpu(),
+            }
+            W_hat = (W_q / s.unsqueeze(0) if s is not None else W_q) + lora_up @ D
+            err = (W_hat - W).pow(2).sum()
+            qsnrs[wpath] = (10.0 * torch.log10(
+                W.pow(2).sum() / err.clamp(min=1e-20))).item()
+            continue
         kind = "qkv" if args.per_channel_top else "plain"
         W_q, top, micro = quantize_residual(
             W_res, Hg, kind, args.group_size, "cuda",
