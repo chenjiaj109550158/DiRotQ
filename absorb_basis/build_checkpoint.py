@@ -645,10 +645,16 @@ def main():
                     help="silu(temb) samples pt from collect_temb_flux.py; "
                          "enables activation-weighted adanorm requant "
                          "(uniform weights if omitted)")
-    ap.add_argument("--basis-metric", choices=["full", "diag"], default="full",
-                    help="THEORY Prop 4' ablation: basis metric = full H "
-                         "(default) or its diagonal (the smooth-then-SVD / "
-                         "ASVD class). GPTQ always uses the full H.")
+    ap.add_argument("--basis-metric", choices=["full", "diag", "noise-diag"],
+                    default="full",
+                    help="basis metric: full H (default), its diagonal "
+                         "(Prop 4' ablation), or the act-quant NOISE power "
+                         "diagonal diag(G_E) (noise-aware basis: the lora "
+                         "shields noise-sensitive directions; GPTQ always "
+                         "uses the full H)")
+    ap.add_argument("--noise-diag-file", default=None,
+                    help="pt file {cov_key: per-channel act-quant noise "
+                         "power vector} for --basis-metric noise-diag")
     ap.add_argument("--reuse-from", default=None,
                     help="PLAN_NEXTQ accel 1: base build (same lambda, plain "
                          "hsvd) whose un-smoothed layers are copied verbatim "
@@ -776,6 +782,13 @@ def main():
         return torch.load(os.path.join(args.cov_down_dir, f"{cov_key}.pt"),
                           map_location="cpu", weights_only=False)
 
+    noise_diag = None
+    if args.basis_metric == "noise-diag":
+        assert args.noise_diag_file, "--basis-metric noise-diag needs --noise-diag-file"
+        noise_diag = torch.load(args.noise_diag_file, map_location="cpu",
+                                weights_only=False)
+        print(f"noise-diag basis metric: {len(noise_diag)} hooks")
+
     reuse_f, reuse_keys_by_prefix = None, {}
     if args.reuse_from:
         assert args.smooth == "none" and not args.bias_correct and \
@@ -820,8 +833,12 @@ def main():
                     continue
             Wg = W.to("cuda", torch.float32)
             if args.basis == "hsvd":
-                Hb = torch.diag(H.diagonal()) if args.basis_metric == "diag" \
-                    else H
+                if args.basis_metric == "diag":
+                    Hb = torch.diag(H.diagonal())
+                elif args.basis_metric == "noise-diag":
+                    Hb = torch.diag(noise_diag[cov_key].float())
+                else:
+                    Hb = H
                 D, lu0 = hsvd_basis(Wg, Hb, args.rank, "cuda",
                                     damping=args.hsvd_damping)
             else:

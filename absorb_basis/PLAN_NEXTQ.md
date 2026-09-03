@@ -102,3 +102,19 @@ NVFP4 動態 per-group-16 e4m3 已領走稀疏紅利，旋轉抹平尖峰反而
 分解使其多餘且有害」——同時解釋 DiRotQ 論文（INT4）與 KroQuant
 （MXFP4）在其格式上有收益的原因。act 項 75% 的不可約性證據鏈
 完整：S → 置換 → block 旋轉 → 全維 oracle 全數排除。
+
+## 補充分析 3（2026-09-04 凌晨）：噪聲感知基底——完整弧線後關閉
+
+思路：殘差分支在權重精確時的誤差恆等於 tr(W_res·G_E·W_resᵀ)
+（G_E=act 噪聲 Gram）→ 基底度量應為噪聲而非訊號（H 只是其代理，
+λ 阻尼是粗修正——順帶解釋 turbo/dev 的 λ→∞ 傾向）。驗證弧線：
+(1) 同樣本 oracle：main +0.19 / down +0.63dB（`noiseaware_oracle.log`）；
+(2) split-half：全 G_E 塌到 +0.06（過擬合），**diag(G_E)/收縮版存活
++0.14~0.22dB、18 層全正**（`ge_splithalf.log`/`ge_shrink.log`）——
+且與 Prop 4′ 對照鮮明：diag(H) 有害、diag(G_E) 全正，關鍵是度量
+「量什麼」而非對角與否；(3) 端到端（`--basis-metric noise-diag` 已
+實作入 builder）：schnell qdiff 候選對基底 **1:3 落敗**。結論：
+逐層 ~0.15dB 級增益不轉移（與本週全部案例一致），方向關閉；
+理論觀點（lora 遮噪聲/GPTQ 管訊號的解耦、H 作為 G_E 代理）保留為
+論文討論素材。**品質優化戰役至此收官：方法在 NVFP4 格式有效天花板
+確立，剩餘工作全屬論文支撐類。**
