@@ -135,8 +135,19 @@ def main():
     ap.add_argument("--amax-files", type=int, default=-1,
                     help="cap the amax pass (-1 = all caches, full-stream)")
     ap.add_argument("--gain-files", type=int, default=16)
+    ap.add_argument("--mx", action="store_true",
+                    help="PLAN_MX: measure gains under the MXFP4e2 act "
+                         "quantizer; outputs get an _mx suffix")
+    ap.add_argument("--caches", default=None,
+                    help="override the cache glob (e.g. the restored "
+                         "deepcompressor dataset path)")
     args = ap.parse_args()
     cfg = FAMILIES[args.family]
+    if args.caches:
+        cfg = dict(cfg, caches=args.caches)
+    if args.mx:
+        global act_fp4_sim
+        from absorb_basis.mx_quant import mx_act_sim as act_fp4_sim
 
     model, table = cfg["load"]()
     model.eval()
@@ -233,14 +244,15 @@ def main():
 
     out = Path(cfg["out"])
     out.mkdir(parents=True, exist_ok=True)
+    sfx = "_mx" if args.mx else ""
     for i, fam in enumerate(("rms", "amax")):
         gains = {}
         for lp, _ in table:
             e0, *e1 = acc[lp]
             gains[lp] = (10 * math.log10(e0 / e1[i])
                          if e0 > 0 and e1[i] > 0 else 0.0)
-        torch.save(vecs[fam], out / f"selfsmooth_{fam}.pt")
-        with open(out / f"selfsmooth_gain_{fam}.json", "w") as f:
+        torch.save(vecs[fam], out / f"selfsmooth_{fam}{sfx}.pt")
+        with open(out / f"selfsmooth_gain_{fam}{sfx}.json", "w") as f:
             json.dump(gains, f, indent=2)
         v = sorted(gains.values())
         print(f"{fam}: {len(v)} layers, median {statistics.median(v):+.2f} dB, "
