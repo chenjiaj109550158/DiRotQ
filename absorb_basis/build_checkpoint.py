@@ -50,7 +50,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from speedup.nunchaku_pack import NunchakuWeightPacker, convert_to_nunchaku_w4x4y16
-from utils.gptq_utils import _gptq_quantize_layer
+from utils.gptq_utils import _gptq_quantize_layer, gptq_prepare
 
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
@@ -244,7 +244,8 @@ def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
                       group_size: int, device: str, gptq: bool,
                       damp_pct: float, block_size: int,
                       hdiag: torch.Tensor | None = None,
-                      clip_ratios: torch.Tensor | None = None):
+                      clip_ratios: torch.Tensor | None = None,
+                      prepared=None):
     """NVFP4-quantize a residual weight (in its final/smoothed domain) on the
     exact two-level kernel grid. Returns (W_q dequantized, top, micro)."""
     oc, ic = W_res.shape
@@ -256,6 +257,7 @@ def quantize_residual(W_res: torch.Tensor, H: torch.Tensor, kind: str,
             bits=4, groupsize=group_size, sym=True,
             damp_pct=damp_pct, block_size=block_size, num_inv_tries=8,
             device=device, nvfp4=True, scales_override=eff,
+            prepared=prepared,
         )
         if W_q is None:
             # ill-conditioned Hessian (e.g. near-zero-variance cross-attn
@@ -310,7 +312,8 @@ def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
                    clip_ratios: torch.Tensor | None = None,
                    mu: torch.Tensor | None = None,
                    valref: dict | None = None, valref_key: str = "",
-                   smooth: torch.Tensor | None = None):
+                   smooth: torch.Tensor | None = None,
+                   gptq_prepared=None):
     """Raw-domain layer build with optional clip search, alternating lora
     refit, bias correction, and selective smoothing (PLAN_ROUND2 S: the
     residual is quantized in the smoothed domain W_res*diag(s) with
@@ -340,6 +343,7 @@ def build_layer_v2(W: torch.Tensor, H: torch.Tensor, D: torch.Tensor,
         W_q, top, micro = quantize_residual(
             W_res, Hg, kind, group_size, device, gptq, damp_pct, block_size,
             hdiag=hdiag, clip_ratios=clip_ratios,
+            prepared=gptq_prepared if smooth is None else None,
         )
         if refit:
             assert smooth is None, "refit not supported with smoothing"
@@ -645,6 +649,18 @@ def main():
                     help="THEORY Prop 4' ablation: basis metric = full H "
                          "(default) or its diagonal (the smooth-then-SVD / "
                          "ASVD class). GPTQ always uses the full H.")
+    ap.add_argument("--reuse-from", default=None,
+                    help="PLAN_NEXTQ accel 1: base build (same lambda, plain "
+                         "hsvd) whose un-smoothed layers are copied verbatim "
+                         "instead of recomputed (bit-identical by GPTQ/H-SVD "
+                         "determinism). Caller must pass a matching base.")
+    ap.add_argument("--factor-cache", default=None,
+                    help="PLAN_NEXTQ accel 2: directory caching per-hook GPTQ "
+                         "(perm, damped H_inv) factors across builds "
+                         "(lambda-independent; main hooks only)")
+    ap.add_argument("--adanorm-cache", default=None,
+                    help="pt file caching the (deterministic) adanorm requant "
+                         "tensors across builds")
     args = ap.parse_args()
 
     if args.official is None:
@@ -667,16 +683,28 @@ def main():
     cov = torch.load(args.cov, map_location="cpu", weights_only=False)
 
     if not args.keep_official_adanorm:
-        adiag = None
-        if args.adanorm_temb:
-            adiag = torch.load(args.adanorm_temb, map_location="cpu",
-                               weights_only=False)["diag"]
-        print("requantizing adanorm modulation linears "
-              f"({'temb-weighted' if adiag is not None else 'uniform'}, "
-              "PLAN_SELFSMOOTH container audit)")
-        for prefix, splits in adanorm_layers(args.num_double, args.num_single):
-            rep = requant_adanorm(sd[f"{prefix}.weight"], sd[f"{prefix}.bias"],
-                                  splits, act_diag=adiag)
+        acache = None
+        if args.adanorm_cache and os.path.exists(args.adanorm_cache):
+            acache = torch.load(args.adanorm_cache, map_location="cpu",
+                                weights_only=False)
+            print(f"adanorm requant loaded from cache: {args.adanorm_cache}")
+        if acache is None:
+            adiag = None
+            if args.adanorm_temb:
+                adiag = torch.load(args.adanorm_temb, map_location="cpu",
+                                   weights_only=False)["diag"]
+            print("requantizing adanorm modulation linears "
+                  f"({'temb-weighted' if adiag is not None else 'uniform'}, "
+                  "PLAN_SELFSMOOTH container audit)")
+            acache = {}
+            for prefix, splits in adanorm_layers(args.num_double,
+                                                 args.num_single):
+                acache[prefix] = requant_adanorm(
+                    sd[f"{prefix}.weight"], sd[f"{prefix}.bias"], splits,
+                    act_diag=adiag)
+            if args.adanorm_cache:
+                torch.save(acache, args.adanorm_cache)
+        for prefix, rep in acache.items():
             for name, t in rep.items():
                 full = f"{prefix}.{name}"
                 assert full in tensors, f"unexpected adanorm key {full}"
@@ -748,6 +776,19 @@ def main():
         return torch.load(os.path.join(args.cov_down_dir, f"{cov_key}.pt"),
                           map_location="cpu", weights_only=False)
 
+    reuse_f, reuse_keys_by_prefix = None, {}
+    if args.reuse_from:
+        assert args.smooth == "none" and not args.bias_correct and \
+            not args.refit_lora and args.alt_iters == 1 and \
+            not args.clip_search, \
+            "--reuse-from only valid for plain hsvd builds matching the base"
+        reuse_f = safe_open(args.reuse_from, framework="pt")
+        for k in reuse_f.keys():
+            if "." in k:
+                reuse_keys_by_prefix.setdefault(k.rsplit(".", 1)[0], []).append(k)
+        print(f"reuse-from base: {args.reuse_from}")
+    prep_cache, n_reused = {}, 0
+
     table = layer_table(args.num_double, args.num_single, down_proj=args.down_absorb)
     qsnrs = {}
     alphas = {}
@@ -761,6 +802,22 @@ def main():
         decouple = args.smooth in ("main-a05", "main-search")
 
         if args.smooth == "none":
+            selected = select_gains is not None and \
+                select_gains.get(nk_prefix, -1e9) > args.select_threshold
+            if reuse_f is not None and not selected:
+                # PLAN_NEXTQ acceleration 1: this layer's tensors are
+                # bit-identical to the base build (same lambda, no smoothing,
+                # deterministic H-SVD/GPTQ) — copy instead of recomputing
+                copied = 0
+                for name in reuse_keys_by_prefix.get(nk_prefix, ()):
+                    t = reuse_f.get_tensor(name)
+                    if name in tensors and tensors[name].shape == t.shape \
+                            and tensors[name].dtype == t.dtype:
+                        tensors[name] = t
+                        copied += 1
+                if copied:
+                    n_reused += 1
+                    continue
             Wg = W.to("cuda", torch.float32)
             if args.basis == "hsvd":
                 Hb = torch.diag(H.diagonal()) if args.basis_metric == "diag" \
@@ -774,8 +831,7 @@ def main():
             if args.bias_correct and cov_key in act_samples:
                 mu = act_samples[cov_key].float().mean(dim=0)
             s_layer = None
-            if select_gains is not None and \
-                    select_gains.get(nk_prefix, -1e9) > args.select_threshold:
+            if selected:
                 if select_vectors is not None:
                     s_layer = select_vectors[nk_prefix].float().pow(
                         args.select_smooth_alpha)
@@ -783,6 +839,27 @@ def main():
                     s_layer = unpack_scale_vector(
                         tensors[f"{nk_prefix}.smooth"]).float().pow(
                             args.select_smooth_alpha)
+            prepared = None
+            if not args.rtn and s_layer is None and H.shape[0] <= 4096:
+                # PLAN_NEXTQ acceleration 2: the act-order permutation and
+                # damped inverse-Hessian Cholesky depend only on H — reuse
+                # across layers sharing a hook and (via --factor-cache)
+                # across lambda/alpha builds
+                prepared = prep_cache.get(cov_key)
+                if prepared is None and args.factor_cache:
+                    fpp = os.path.join(args.factor_cache, f"{cov_key}.pt")
+                    if os.path.exists(fpp):
+                        prepared = torch.load(fpp, map_location="cpu",
+                                              weights_only=False)
+                        prep_cache[cov_key] = prepared
+                if prepared is None:
+                    prepared = gptq_prepare(H, args.damp, 8, "cuda")
+                    if prepared is not None:
+                        prep_cache[cov_key] = prepared
+                        if args.factor_cache:
+                            os.makedirs(args.factor_cache, exist_ok=True)
+                            torch.save(prepared, os.path.join(
+                                args.factor_cache, f"{cov_key}.pt"))
             repl, qsnr, bias_delta = build_layer_v2(
                 Wg, H, D, lu0, kind, args.group_size, "cuda",
                 gptq=not args.rtn, damp_pct=args.damp, block_size=args.block_size,
@@ -790,6 +867,7 @@ def main():
                 clip_ratios=clip_ratios, mu=mu,
                 valref=valrefs if nk_prefix in VALREF_LAYERS else None,
                 valref_key=nk_prefix, smooth=s_layer,
+                gptq_prepared=prepared,
             )
             if bias_delta is not None:
                 bkey = f"{nk_prefix}.bias"
@@ -883,6 +961,9 @@ def main():
       + (f"-alt{args.alt_iters}" if args.alt_iters > 1 else "") \
       + ("-bc" if args.bias_correct else "") \
       + ("-down" if args.down_absorb else "")
+    if reuse_f is not None:
+        print(f"reused {n_reused} un-smoothed layers from base "
+              f"(computed {len(qsnrs)})")
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     save_file(tensors, args.out, metadata=metadata)
     print("saved:", args.out)

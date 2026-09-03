@@ -272,9 +272,42 @@ def collect_hessians(transformer, calib_dir, device, num_calib_files=5120, batch
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def gptq_prepare(H, damp_pct, num_inv_tries, device):
+    """Precompute the W-independent part of _gptq_quantize_layer: dead-column
+    mask, act-order permutation and the damped inverse-Hessian Cholesky.
+    Replicates the original retry escalation for the two H-only failure
+    modes (Cholesky failure, near-zero H_inv diagonal); the NaN-in-output
+    mode depends on W and is handled by the caller's fallback.
+
+    Returns (dead, perm, inv_perm, H_inv) on CPU (float32), or None."""
+    H = H.clone().float().to(device)
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1.0
+    importance = torch.diag(H)
+    perm = torch.argsort(importance, descending=True)
+    inv_perm = torch.argsort(perm)
+    H = H[perm][:, perm]
+    H_diag = H.diagonal()
+    H_diag += damp_pct * H_diag.mean()
+    for _attempt in range(num_inv_tries):
+        try:
+            L = torch.linalg.cholesky(H)
+            H_inv = torch.cholesky_inverse(L)
+            H_inv = torch.linalg.cholesky(H_inv, upper=True)
+        except RuntimeError:
+            H_diag += (damp_pct * 0.1) * H_diag.mean()
+            continue
+        diag = H_inv.diagonal()
+        if diag.min() < 1e-4 * diag.mean():
+            H_diag += damp_pct * H_diag.mean()
+            continue
+        return (dead.cpu(), perm.cpu(), inv_perm.cpu(), H_inv.cpu())
+    return None
+
+
 def _gptq_quantize_layer(W, H, bits, groupsize, sym,
                           damp_pct, block_size, num_inv_tries, device,
-                          nvfp4=False, scales_override=None):
+                          nvfp4=False, scales_override=None, prepared=None):
     """
     Apply GPTQ to a single weight matrix.
 
@@ -362,6 +395,42 @@ def _gptq_quantize_layer(W, H, bits, groupsize, sym,
         else:
             q = torch.clamp(torch.round(w_col / s) + z, 0, maxq)
             return s * (q - z)
+
+    if prepared is not None:
+        # Fast path with cached (dead, perm, inv_perm, H_inv) from
+        # gptq_prepare: single sweep, identical math. On the (rare, W-
+        # dependent) NaN outcome fall through to the original retry loop,
+        # which reproduces the uncached behavior exactly.
+        p_dead, p_perm, p_inv_perm, p_H_inv = prepared
+        p_perm = p_perm.to(device)
+        p_inv_perm = p_inv_perm.to(device)
+        Hi = p_H_inv.to(device=device, dtype=torch.float32)
+        W_proc_run = W.clone()
+        W_proc_run[:, p_dead.to(device)] = 0.0
+        W_proc_run = W_proc_run[:, p_perm]
+        W_q_run = torch.zeros_like(W_proc_run)
+        for c_start in range(0, in_features, block_size):
+            c_end = min(c_start + block_size, in_features)
+            W_block = W_proc_run[:, c_start:c_end].clone()
+            H_block = Hi[c_start:c_end, c_start:c_end]
+            Err = torch.zeros_like(W_block)
+            for _c in range(c_end - c_start):
+                c_abs = c_start + _c
+                w_col = W_block[:, _c]
+                d = H_block[_c, _c]
+                orig_col = p_perm[c_abs].item()
+                w_q_col = _quant_col(w_col, orig_col)
+                W_q_run[:, c_abs] = w_q_col
+                err_col = (w_col - w_q_col) / d
+                Err[:, _c] = err_col
+                W_block[:, _c + 1:] -= (
+                    err_col.unsqueeze(1) * H_block[_c, _c + 1:].unsqueeze(0)
+                )
+            W_proc_run[:, c_end:] -= Err @ Hi[c_start:c_end, c_end:]
+        W_q_run = W_q_run[:, p_inv_perm]
+        if not W_q_run.isnan().any():
+            return W_q_run
+        # NaN with cached factors: fall through to the original path below
 
     # Handle dead (zero-diagonal) columns
     dead = torch.diag(H) == 0
