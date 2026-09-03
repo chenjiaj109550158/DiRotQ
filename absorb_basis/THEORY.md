@@ -282,6 +282,14 @@ Corollary 2.1 的端到端體現；(ii) 兩個 λ\* 已頂到網格上緣（0.3�
 ⊇ {SVDQuant 端點}，由校準資料逐模型選擇」。論文寫法：λ 網格應延伸
 大 λ 端（含 ∞ 端點），Algorithm 1 自動落點；per-model λ\* 分布
 （0.001→∞）本身就是 anisotropy 重要性隨模型變化的量化證據。
+- **diag 度量中間級**（`diagmetric_qdiff128.json`，Prop 4′ 階梯）：
+  基底度量 ∈ {I, diag(H_λ), H_λ}（其餘 pipeline 全同）。
+  pixart：I 16.05 → diag 16.97 → full 17.18 dB（單調；diag 對 I 4:0、
+  full 對 diag 4:0）。schnell：diag 18.09 **輸給 I** 18.23（0:4），
+  full 18.34 對兩者皆 4:0。結論：**對角近似（smooth-then-SVD/ASVD/
+  LQER 級）並不可靠——沒有相關性導正的對角拉伸可能比不拉伸更差；
+  唯一跨模型穩定支配的是完整 H 度量**，與 Theorem 2「對所有 rank-r
+  競爭者最優」一致。
 - Anisotropy evidence: per-hook `H` diag/eigen spectra span orders of
   magnitude（cov 檔可直接出圖），justifying strictness in Cor 2.1
   where it wins.
