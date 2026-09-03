@@ -225,6 +225,23 @@ selection criterion.
 
 ---
 
+## Prior art for the basis construction（novelty 定位，防超額主張）
+
+活化白化 SVD（= 我們的 H-SVD 構造）在 LLM 壓縮已確立：
+**SVD-LLM**（ICLR'25, 2403.07378；chol 白化 + 截斷損失定理，構造與
+`hsvd_basis` 幾乎相同）、**DRONE**（NeurIPS'21；data-aware 低秩閉式
+解）、**QERA**（ICLR'25, 2410.06040；量化誤差的白化低秩閉式解，順序
+與我們相反）、**LQER**（ICML'24）/ASVD/FWSVD（對角縮放級 =
+Prop 4′ 的 diag 度量）、**CALDERA**（NeurIPS'24；W≈Q+LR 交替）、
+**LASER**（rank allocation 先例，關聯 PLAN_NEXTQ P1）。加權
+Eckart–Young 為教科書結果。**論文的主張界定**：不主張基底數學新穎；
+主張 (1) full-H 基底首入 W4A4 雙側量化、kernel 可部署的 diffusion
+設定（先行工作皆 LLM weight-only），Prop 4′ 度量階梯統一分類
+SVDQuant/diag 級/full-H 級；(2) λ 阻尼族的穩健定理+端點包含+逐模型
+選擇與泛化縫隙實證；(3) basis-first + 分解後閉式 S 守門的順序與解耦
+（vs quantize-first / 交替；本 repo 交替精修僅 +0.03dB 的對照證據）；
+(4) 零依賴 pipeline 與真 kernel 29/30。
+
 ## Scope and honest limitations
 
 1. No end-to-end dominance theorem (either direction) is claimed once
