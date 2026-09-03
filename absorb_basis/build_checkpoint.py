@@ -641,6 +641,10 @@ def main():
                     help="silu(temb) samples pt from collect_temb_flux.py; "
                          "enables activation-weighted adanorm requant "
                          "(uniform weights if omitted)")
+    ap.add_argument("--basis-metric", choices=["full", "diag"], default="full",
+                    help="THEORY Prop 4' ablation: basis metric = full H "
+                         "(default) or its diagonal (the smooth-then-SVD / "
+                         "ASVD class). GPTQ always uses the full H.")
     args = ap.parse_args()
 
     if args.official is None:
@@ -759,7 +763,9 @@ def main():
         if args.smooth == "none":
             Wg = W.to("cuda", torch.float32)
             if args.basis == "hsvd":
-                D, lu0 = hsvd_basis(Wg, H, args.rank, "cuda",
+                Hb = torch.diag(H.diagonal()) if args.basis_metric == "diag" \
+                    else H
+                D, lu0 = hsvd_basis(Wg, Hb, args.rank, "cuda",
                                     damping=args.hsvd_damping)
             else:
                 Ug = cov[cov_key][:, -args.rank:].to("cuda", torch.float32)

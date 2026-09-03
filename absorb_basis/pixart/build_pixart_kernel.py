@@ -74,6 +74,9 @@ def main():
                          "(wcscales) instead of per-tensor (wtscale)")
     ap.add_argument("--smooth-alpha", type=float, default=1.0,
                     help="PLAN_ROUND3: smoothing strength s^alpha")
+    ap.add_argument("--basis-diag", action="store_true",
+                    help="THEORY Prop 4' ablation: diagonal basis metric "
+                         "(GPTQ keeps the full H)")
     args = ap.parse_args()
     assert not (args.per_channel_top and args.gain_k), "flags conflict on wcscales"
 
@@ -113,7 +116,8 @@ def main():
     for wpath, ckey in tqdm(table, dynamic_ncols=True):
         W = sd[f"{wpath}.weight"].to("cuda", torch.float32)
         H = cov[ckey]
-        D, lora_up = hsvd_basis(W, H, args.rank, "cuda", damping=args.hsvd_damping)
+        Hb = torch.diag(H.diagonal()) if args.basis_diag else H
+        D, lora_up = hsvd_basis(W, Hb, args.rank, "cuda", damping=args.hsvd_damping)
         W_res = W - lora_up @ D
         s = smoothed_hooks.get(ckey)
         if s is not None:
