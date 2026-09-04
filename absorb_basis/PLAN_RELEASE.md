@@ -104,3 +104,13 @@ AbsorbQuant/
     出自我們收集器（vault 有 5120/5120 驗證備份）。
 - pixart 全量 Path A（caches 重生→cov→vectors→build→verify）執行中。
 - AbsorbQuant repo git 初始 commit `be2488c`。
+- **pixart 全量 Path A 收官（26 分 wall）**：caches 重生→cov（196 條
+  bit-identical）→vectors（168 條）→build→final `VERIFY_OK: 1568 條`，
+  content digest 與 configs 記錄值一致（0b3c2b2f…）。防造假鏈完整：
+  「基模型 + 128 prompts → 位級等於 release 權重」在公開 repo 成立。
+- 六權重 + MX 已 staging（hf_staging/，硬連結 + model card），全檔
+  file_sha256/content_digest 已入 configs。AbsorbQuant repo 乾淨單根
+  歷史 `c5d2f1d` + reproducibility commit `caa6c51`（.git 760K）。
+- 待辦：其餘五模型 Path A 復驗（sana/sdxl 短、flux 長）、HF repo 建立
+  後回填 repo id 與 `<ABSORBQUANT_REPO_URL>`、select.py（Algorithm-1
+  一鍵重推導）後續補。
