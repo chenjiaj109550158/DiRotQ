@@ -91,3 +91,19 @@ Pareto 曲線。）
 `results/pixart_mx_{qdiff128,test2500}.json`、
 `pixart_mx_svdq_kernel.pt`、`svdq_mx_dump/`、MXW4A4Linear（Triton，
 act 量化位級=參考、記憶體 0.49 vs fp16 1.16 GiB）。
+
+### 協定註記（FID 絕對值與論文不可互引）
+
+SVDQuant/LoRaQ/KroQuant 的 FID 為 MJHQ-30K 全量賽制（FP16≈16.6）；
+本輪為 2500 子集（小樣本正偏差 + 子集參考統計），絕對值系統性偏高，
+**協定內對比有效、跨論文引用無效**。補救選項：(a) 30K 版（每
+config 模擬/kernel 生成 ~3h×N）；(b) 現有 2500 生成對 GT-30K 全量
+統計重算（去參考側偏差）。IR（ImageReward，其表另一主指標）以
+repo 自帶 metadata 對五圖庫補測（`pixart_image_reward.json`）。
+
+### IR 補測（ImageReward-v1.0，隔離 venv，`pixart_image_reward.json`）
+
+fp16 錨 0.9496；NVFP4：ours 0.9265 / svdq 0.9349（噪聲級差，待 CI）；
+**MX：ours 0.8573 / svdq 0.8407 → ours 勝**。MX 記分板含 IR 為
+4:2——FID 翻輸未延伸至人類偏好對齊；IR 絕對值可跨論文粗略對照
+（無 FID 小樣本偏差），svdq-NVFP4 0.935 與其論文區間一致。
