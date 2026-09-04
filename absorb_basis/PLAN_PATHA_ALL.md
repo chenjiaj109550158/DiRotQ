@@ -57,3 +57,23 @@ wtscale）；lora/基底 2697 條全數一致 → 污染範圍精確限定在 se
 的無後綴向量檔已復原為 lam0.3 原件、λext 殘留改名 `_lam1e6`；
 AbsorbQuant Path A 不受影響（configs 向量步驟寫死 --lam 0.3 重算）。
 quickcheck 至此 **6/6**；佇列（指標噪聲 + 五模型全量 Path A）已解鎖。
+
+## Path A 執行結果與第二事件：機損前產物（2026-09-04 晚）
+
+Path A 鏈實跑結果：**sdxl-turbo、sdxl-base 全鏈金標準通過**（含 cov
+位級全同、GATE_OK）；sana GATE_FAIL、flux-schnell collector 對拍不合。
+診斷定案（根因=08-30 機器損失事件）：
+- schnell：vault caches（08-27）為**前一台機器**產物——同種子的 CUDA
+  RNG 在不同 GPU/env 給不同初始 latent（step0 latent maxabs 6.5）、
+  bf16 T5 嵌入整體不同（2.66）。今日 collector 兩次獨立跑位級全同
+  （自身決定性無誤），但**任何程式碼都無法位級重現前機產物**。
+- sana：caches 是機損後重生的（collector 對拍 vs vault 全同 ✓），但
+  **stored cov 來自機損前的 DC dataset**（已刪）→ cov/向量微偏
+  （多數 key maxabs ≤1e-2）→ ckpt 位級不合。
+- 對照組：pixart/sdxl 的 DC dataset 與 dev 的 caches 均為機損後本機
+  產物 → 全數位級通過，分界完全吻合。
+處置（政策執行中，rebuild_chain）：sana 乾淨重建檔已建
+（workdir patha.pt）→ 官方 2500 重跑；schnell 全 Path A 重建（今日
+乾淨統計）→ 官方 1000 重跑；dev 全 Path A + release gate（統計為
+機損後產物，預期位級通過）。舊 release 檔保留至數字確認後由使用者
+裁定替換。
