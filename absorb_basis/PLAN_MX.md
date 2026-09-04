@@ -92,14 +92,18 @@ Pareto 曲線。）
 `pixart_mx_svdq_kernel.pt`、`svdq_mx_dump/`、MXW4A4Linear（Triton，
 act 量化位級=參考、記憶體 0.49 vs fp16 1.16 GiB）。
 
-### 協定註記（FID 絕對值與論文不可互引）
+### 協定註記（更正 2026-09-04：原文是 5K 子集，非 30K 全量）
 
-SVDQuant/LoRaQ/KroQuant 的 FID 為 MJHQ-30K 全量賽制（FP16≈16.6）；
-本輪為 2500 子集（小樣本正偏差 + 子集參考統計），絕對值系統性偏高，
-**協定內對比有效、跨論文引用無效**。補救選項：(a) 30K 版（每
-config 模擬/kernel 生成 ~3h×N）；(b) 現有 2500 生成對 GT-30K 全量
-統計重算（去參考側偏差）。IR（ImageReward，其表另一主指標）以
-repo 自帶 metadata 對五圖庫補測（`pixart_image_reward.json`）。
+讀原文（arXiv 2411.05007 §exp）確認：SVDQuant 的賽制是 **從
+MJHQ-30K 抽 5K prompts**（另 sDCI 5K），非 30K 全量——先前註記有誤。
+且其 5K 完全決定性（deepcompressor MJHQ.py：`random.Random(0).shuffle`
+→ 取前 N → sorted），已三重驗證：規則重算 == 本地
+`mjhq_5000_samples.json` == 其子集規則；**我們的 MJHQ-2500 正是同一
+shuffle 的前 2500 → 是論文 5K 的嚴格子集**。因此補到論文精確賽制只需
+每 config 再生成缺的 2500 張（非 30K/80h）：五圖庫（ours/svdq ×
+NVFP4/MX + fp16 ref）× 2500 + GT-5K 統計 ≈ ~6h GPU，FID/IR 絕對值即
+可直接與 SVDQuant/KroQuant 表格互引。2500 版數值作為協定內對比仍
+有效。IR 補測見上節（`pixart_image_reward.json`）。
 
 ### IR 補測（ImageReward-v1.0，隔離 venv，`pixart_image_reward.json`）
 
