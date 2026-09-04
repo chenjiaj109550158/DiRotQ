@@ -43,3 +43,17 @@ pixart 已過金標準（cov 196 / vectors 168 / ckpt 1568 條全位級）。
 任何一級位級不合 = 找到混用點：回報差異層級與內容，**以乾淨 Path A
 產物重建該模型 release + 重跑其官方基準**（數字以乾淨版為準），
 不掩蓋。
+
+## 事件記錄：flux-dev quickcheck 揪出 λext 殘留覆寫（2026-09-04）
+
+quickcheck 六座 5 過 1 不合：flux-dev 2908 條中 211 條不合，**全部**
+集中在 S 守門 hook 的 smooth/smooth_orig 及其下游（qweight/wscales/
+wtscale）；lora/基底 2697 條全數一致 → 污染範圍精確限定在 selfsmooth
+向量。時間線：release 建於 09-02 15:29；λext 06:11 先備份原始向量為
+`_lam0.3` 後綴，23:20 以 λ=1e6 實驗向量覆寫無後綴檔。以 `_lam0.3`
+備份重建 → **VERIFY_OK 2908 條、digest == release**。結論：release
+本身乾淨（cov + lam0.3 向量 + 凍結 flags 的決定性產物），不合源自
+研究磁碟的實驗殘留佔用正名。處置：flux-dev 與 sdxl-turbo（同輪同害）
+的無後綴向量檔已復原為 lam0.3 原件、λext 殘留改名 `_lam1e6`；
+AbsorbQuant Path A 不受影響（configs 向量步驟寫死 --lam 0.3 重算）。
+quickcheck 至此 **6/6**；佇列（指標噪聲 + 五模型全量 Path A）已解鎖。
