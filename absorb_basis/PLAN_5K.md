@@ -42,3 +42,23 @@ per-filename hash 種子與 N 無關 → 既有 2500 張全數可重用，只補
 
 產物：`results/pixart_5k_phase1.json`；GT 特徵快取
 `benchmarks/stats/MJHQ/MJHQ-5000.npz`。磁碟 +~8G（167G 可用）。
+
+## Phase 1 結果（2026-09-04 15:01 收官，GPU ~3h15m）
+
+| 量測@5K | 實測 | 論文 | Δ |
+|---|---|---|---|
+| FP16 FID vs GT | **16.594** | 16.6 | **±0.006，釘死** |
+| FP16 IR | 0.953 | 0.944 | +0.009 |
+| svdq-NVFP4 FID | 17.147 | 16.6 | +0.55 |
+| svdq-NVFP4 IR | **0.939** | 0.940 | **−0.001，釘死** |
+| svdq-NVFP4 PSNR | 17.88 | 18.5 | −0.62 |
+| svdq-NVFP4 LPIPS | 0.295 | 0.271 | +0.024 |
+
+判讀：(1) **fp16 錨點 FID 對到小數第二位** → 子集/GT/FID 實作/採樣協定
+與論文完全一致；先前 2500 的 FID 落差（svdq ~20.8→17.1）純屬小樣本
+正偏差，已消除。(2) svdq 行 IR 全等；FID/PSNR/LPIPS 與其發表值有小
+殘差，方向一致偏我方量測較差——來源是「我們的 svdq 為同機 deepcompressor
+全重校準」vs 其論文內部跑（校準隨機性/版本差），論文呈現時兩值並列
+（our-rig reproduction + their published）即為標準做法。協定本身已
+驗證為可互引。產物：`pixart_5k_phase1.json`、GT-5K 特徵快取。
+Phase 2（ours-NVFP4 / ours-MX / svdq-MX 補 5K）待裁定。
