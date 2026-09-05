@@ -112,3 +112,10 @@ fe811bd1…），主表採其官方數字（兩座各 4:1，大表 28/30）。�
 release 全數為本機從零產物、Path A 位級可重現（兩座之收集/統計/build
 決定性皆已實證）。configs digests、README/REPRODUCIBILITY、hf_staging
 已同步；HF 上傳以新檔重啟。
+
+## 跨機交叉印證（2026-09-05）
+
+第二台獨立 RTX 5090（driver 595.71.05 ≠ 本機 595.84）以公開 repo 全
+Path A 從零（自收 caches/cov/cov_down/act/向量/build）→ flux-dev
+digest **657643a8… 與 release byte 全等**。跨機位級重現成立；
+外殼實證可容忍小版本驅動差（釘 torch + 同 GPU 世代為要件）。
