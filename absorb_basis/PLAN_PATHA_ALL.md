@@ -119,3 +119,11 @@ release 全數為本機從零產物、Path A 位級可重現（兩座之收集/�
 Path A 從零（自收 caches/cov/cov_down/act/向量/build）→ flux-dev
 digest **657643a8… 與 release byte 全等**。跨機位級重現成立；
 外殼實證可容忍小版本驅動差（釘 torch + 同 GPU 世代為要件）。
+
+## 終驗收官（2026-09-05）：金標準 6/6 獨立實測
+
+sana、flux-schnell 各做完全獨立 Path A 重跑（workdir 清空、caches 從
+128 prompts 重收、統計/向量重算、重 build）→ digest 皆與 release 全等
+（sana f6adf74c… / schnell fe811bd1…，schnell 容器稽核通過）。合併
+先前四座與 flux-dev 跨機印證：**六 release 全數「從零→位級」獨立實測
+成立**。驗證戰役就此收官。
