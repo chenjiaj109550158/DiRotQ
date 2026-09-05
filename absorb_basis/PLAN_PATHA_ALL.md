@@ -94,3 +94,12 @@ temb→向量→build）金標準成立，無需重 evaluation。
 **Path A 記分板：pixart ✓ / sdxl-turbo ✓ / sdxl-base ✓ / flux-dev ✓
 （4/6 位級金標準）；sana、flux-schnell = 機損前統計，乾淨重建+官方
 數字已備，等 A/B 裁定。**
+
+## 裁定（2026-09-05，使用者）：B——保留原 release
+
+sana/flux-schnell 維持原權重與主表數字（29/30）；乾淨重建版
+（sana_clean 4:1 / fluxs_clean 4:1）作為魯棒性佐證存檔
+（results/{sana_clean_test2500,fluxs_clean_test1000}.json + vault 權重）。
+公開文件（README + REPRODUCIBILITY）如實註記兩模型統計出生於機損前
+機器（vault 存檔）、本機從零為數值等價、其餘四模型全鏈位級。
+HF 上傳沿用現 staging（即原 release），無需重傳。
