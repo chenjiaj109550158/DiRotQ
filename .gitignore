@@ -16,3 +16,4 @@ logs/*
 models/*/calibration_dataset/
 models/*/basis/
 models/*/absorb_basis/
+models/flux-dev/svdq-fp4_r32-flux.1-dev.safetensors

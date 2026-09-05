@@ -103,3 +103,12 @@ sana/flux-schnell 維持原權重與主表數字（29/30）；乾淨重建版
 公開文件（README + REPRODUCIBILITY）如實註記兩模型統計出生於機損前
 機器（vault 存檔）、本機從零為數值等價、其餘四模型全鏈位級。
 HF 上傳沿用現 staging（即原 release），無需重傳。
+
+## 更正（2026-09-05，使用者）：裁定改為 A——採用新權重
+
+上一節 B 為口誤，最終裁定 **A**：sana/flux-schnell release 換用本機
+乾淨重建版（sana patha.pt digest f6adf74c…；schnell_clean digest
+fe811bd1…），主表採其官方數字（兩座各 4:1，大表 28/30）。至此六
+release 全數為本機從零產物、Path A 位級可重現（兩座之收集/統計/build
+決定性皆已實證）。configs digests、README/REPRODUCIBILITY、hf_staging
+已同步；HF 上傳以新檔重啟。
