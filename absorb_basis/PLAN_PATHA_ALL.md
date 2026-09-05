@@ -77,3 +77,20 @@ Path A 鏈實跑結果：**sdxl-turbo、sdxl-base 全鏈金標準通過**（含 
 乾淨統計）→ 官方 1000 重跑；dev 全 Path A + release gate（統計為
 機損後產物，預期位級通過）。舊 release 檔保留至數字確認後由使用者
 裁定替換。
+
+## flux-dev 金標準收官 + vectors config bug（2026-09-05）
+
+遠端機器交叉驗證揪出第二個同類 config bug：`configs/flux-dev.yaml` 的
+vectors 區塊漏傳 --model-id → 預設 schnell → **混模向量**（dev 統計 ÷
+schnell 權重；架構同形不報錯、輸出貌似合理——log 掃錯誤訊息抓不到，
+唯位級比對可辨）。連鎖澄清：本機稍早的「向量非決定性」判讀**撤回**
+——當時比的是混模 fresh#1 vs 正版 fresh#2。仲裁：dev 權重從零向量
+== 存檔 release 向量 **228 條位級全同**（向量計算實為決定性；原始
+run_selfsmooth_all 有傳 --model-id）。修復 config 後重 build →
+**gate 位級通過：2908 條全同、digest == release（657643a8…）、
+容器稽核 2280 條全替換**。dev 全 Path A（caches→cov/cov_down/act/
+temb→向量→build）金標準成立，無需重 evaluation。
+
+**Path A 記分板：pixart ✓ / sdxl-turbo ✓ / sdxl-base ✓ / flux-dev ✓
+（4/6 位級金標準）；sana、flux-schnell = 機損前統計，乾淨重建+官方
+數字已備，等 A/B 裁定。**
