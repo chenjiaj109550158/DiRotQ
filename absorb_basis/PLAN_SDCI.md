@@ -34,3 +34,10 @@
 合計 ~22h GPU。產物：`workdir/<m>/eval/{ref,quant,svdq}/sDCI-<n>`；
 指標 → `results/sdci/<m>_{ours,svdq}.json`。SVDQuant 側權重：pixart/sana/
 sdxl 為本機重校準 kernel 檔，flux 為官方 nunchaku 權重（與主表一致）。
+
+## 驗證（2026-09-06）
+
+- 子集規則 vs DC `get_dataset("DCI", N)`：N=500/1000/2500 檔名**逐一同序**。
+- GT：sDCI.gz 10.8 GB，解壓 11186 張（8028 條 prompt 為其子集），workdir
+  `gt/sDCI` 以 symlink 指向 DC 解壓目錄（磁碟單一副本）。
+- 冒煙：pixart sDCI-3 ref/ours/svdq 三庫生成 OK。鏈 07:51 起跑（turbo 首座）。
