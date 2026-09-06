@@ -56,3 +56,16 @@ sdxl 為本機重校準 kernel 檔，flux 為官方 nunchaku 權重（與主表�
 - 兩階段駐留閘門：schnell 3/3 BIT（8.6 s/張）、dev 3/3 BIT（28.6 s/張，
   峰值 24.7 GB）→ 採用。dev ref 500 張 ≈ 4h（非 35h）、schnell ref 1000 ≈ 2.4h。
   修正後全鏈 ETA：base ~22:30 → schnell ~03:30 → dev ~10:30（明早）。
+
+## 中途結果（2026-09-06 20:46）
+
+| 模型 | ours vs svdq | 備註 |
+|---|---|---|
+| sdxl-turbo 2500 | 5:0 | |
+| pixart 2500 | 4:1 | FID-GT 輸 0.26 |
+| sana 2500 | 5:0 | MJHQ 輸的 FID-ref 在 sDCI 反勝 |
+| sdxl-base 1000 | 4:1 | FID-GT 輸 0.06 |
+| **flux-schnell 1000** | **0:5** | 全五項小幅落後（PSNR −0.16、LPIPS +0.005、SSIM −0.005、FID-ref +0.17、FID-GT +0.24）；svdq 側為官方 nunchaku 權重；ours 定案配置無 S（qdiff-128 守門拒絕）、λ=0.01 |
+| flux-dev 500 | 跑步中 | ref 20:38 起（兩階段 ~28 s/張），預計 ~04:40 收 |
+
+兩階段駐留實測：schnell ref 1000 張 41 分（~2.5 s/張，offload 版 ~20 s）。
