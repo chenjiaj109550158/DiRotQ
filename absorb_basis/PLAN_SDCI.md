@@ -41,3 +41,15 @@ sdxl 為本機重校準 kernel 檔，flux 為官方 nunchaku 權重（與主表�
 - GT：sDCI.gz 10.8 GB，解壓 11186 張（8028 條 prompt 為其子集），workdir
   `gt/sDCI` 以 symlink 指向 DC 解壓目錄（磁碟單一副本）。
 - 冒煙：pixart sDCI-3 ref/ours/svdq 三庫生成 OK。鏈 07:51 起跑（turbo 首座）。
+
+## 每張耗時實測與 ETA 修正（2026-09-06 15:40）
+
+- schnell ours（NVFP4 kernel）：**0.851 s/張**（1000 張，forward 中位 163.7 ms×4）。
+- schnell ref（bf16，cpu-offload）：**~20 s/張**（本機探針 19.98；08-27 前機
+  1000 張 5h38m ≈ 20.3）。23× 差主要是 offload 串流 22 GB transformer，
+  kernel 級對比為 per-forward 455 vs 164 ms ≈ 2.8×。
+- 推論 dev ref（50 步 offload）≈ 250 s/張 → 500 張 ≈ 35h，原估錯 ~10×。
+  修法：eval_mjhq flux ref 改「兩階段駐留」（先全 prompt 編碼→卸編碼器→
+  transformer 駐留），預期 dev ~23 s/張、schnell ~1.8 s/張；以 3+3 張位級
+  閘門（vs 今日 DC 原生 / stored）把關，失敗自動還原 offload 版。
+- 實測生成速率（sDCI）：pixart ref 1h40m、ours 1h18m（~2.4 s/張，非原估 1.6）。
