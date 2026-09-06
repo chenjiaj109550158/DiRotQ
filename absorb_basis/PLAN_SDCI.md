@@ -53,3 +53,6 @@ sdxl 為本機重校準 kernel 檔，flux 為官方 nunchaku 權重（與主表�
   transformer 駐留），預期 dev ~23 s/張、schnell ~1.8 s/張；以 3+3 張位級
   閘門（vs 今日 DC 原生 / stored）把關，失敗自動還原 offload 版。
 - 實測生成速率（sDCI）：pixart ref 1h40m、ours 1h18m（~2.4 s/張，非原估 1.6）。
+- 兩階段駐留閘門：schnell 3/3 BIT（8.6 s/張）、dev 3/3 BIT（28.6 s/張，
+  峰值 24.7 GB）→ 採用。dev ref 500 張 ≈ 4h（非 35h）、schnell ref 1000 ≈ 2.4h。
+  修正後全鏈 ETA：base ~22:30 → schnell ~03:30 → dev ~10:30（明早）。
