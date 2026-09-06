@@ -127,3 +127,16 @@ sana、flux-schnell 各做完全獨立 Path A 重跑（workdir 清空、caches �
 （sana f6adf74c… / schnell fe811bd1…，schnell 容器稽核通過）。合併
 先前四座與 flux-dev 跨機印證：**六 release 全數「從零→位級」獨立實測
 成立**。驗證戰役就此收官。
+
+## ref 一致性稽核（2026-09-06）：eval_mjhq --ref vs SVDQuant 生成器，六家族位級全同
+
+使用者要求確認 AbsorbQuant 的 ref 與 SVDQuant 的 ref 輸出相同（DiRotQ 舊碼曾有
+ref 微差）。逐家族 3 張位級對拍：pixart/flux-dev 原生全同；sana 抓到 dtype bug
+（DC factory 對 bf16 模型額外 vae/text_encoder.to(bf16)，eval 漏抄）→ 修後全同；
+sdxl 兩座抓到 ConcatConv 範圍 bug（改寫只屬校準收集協定，三個 runner 生成時
+均 monkey-patch 為 no-op；eval 誤套 → ancestral 放大成 psnr10）→ 移除後全同；
+schnell eval vs 今日 DC 生成全同，stored 為 08-27 機損前產物（DC 自身今日亦無法
+重現）。**校準、release、主表皆不受影響**（collector 的 ConcatConv 早經 4/4
+位級背書；sdxl 三庫同 runner 同 plain UNet 生成，公平）。
+待裁定：schnell 主表 ref 為前機產物（ours/svdq 皆對同一 ref 算，勝負公平但
+絕對值含跨機 bf16 漂移）——可本機重生 ref-1000（~1.5h）並重算 schnell 五指標。
