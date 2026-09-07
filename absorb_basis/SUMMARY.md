@@ -67,6 +67,10 @@ W_res = W − L·D，s 僅作用於殘差、逐 hook 守門（未選層 s=1）
 
 （三庫 ref/ours/svdq 皆由 AbsorbQuant eval_mjhq 同協定生成；ref 路徑六家族
 位級對齊 DC。schnell 為唯一全負：其 svdq 基線為官方權重、ours 定案無 S。）
+IR（ours / svdq，ref 錨）：turbo 0.697/0.708（0.704）、pixart 0.948/0.959
+（0.962）、sana 1.055/1.049（1.061）、base 0.440/0.391（0.466）、schnell
+0.965/0.955（0.953）、dev 0.974/0.992（0.993）→ IR 3:3；schnell 保真全負但
+IR 反勝、dev 相反。
 
 ## 3. 部署成本 parity（速度表，ms/forward，RTX 5090）
 

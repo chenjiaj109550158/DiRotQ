@@ -83,3 +83,17 @@ sdxl 為本機重校準 kernel 檔，flux 為官方 nunchaku 權重（與主表�
 
 **sDCI 合計 23/30**。schnell 為唯一全負（官方 nunchaku 基線最強 + ours 定案
 無 S 的分佈外情境）；dev（有 S）五項全勝。
+
+## IR（ImageReward-v1.0，ir_env，2026-09-07）
+
+| 模型 | ref | ours | svdq | Δ(ours−svdq) |
+|---|---|---|---|---|
+| sdxl-turbo | 0.704 | 0.697 | **0.708** | −0.011 |
+| pixart | 0.962 | 0.948 | **0.959** | −0.011 |
+| sana | 1.061 | **1.055** | 1.049 | +0.005 |
+| sdxl-base | 0.466 | **0.440** | 0.391 | **+0.049** |
+| flux-schnell | 0.953 | **0.965** | 0.955 | +0.010（ours 高於 ref） |
+| flux-dev | 0.993 | 0.974 | **0.992** | −0.018 |
+
+IR 3:3 平分；schnell 保真 0:5 但 IR 反勝、dev 保真 5:0 但 IR 落後——
+fidelity/realism 與人類偏好代理再次分歧（與 MX 客場輪同類）。
